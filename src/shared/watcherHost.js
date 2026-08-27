@@ -35,12 +35,8 @@ function inProcessRequested(env = process.env) {
 function createInProcessWatcherHost(config = {}, handlers = {}) {
   // Required lazily so a worker-hosted run never loads chokidar on the owning
   // thread, and so the collector's tests can still swap chokidar.watch.
-  const chokidar = require('chokidar');
-  const { watcherOptions, watchIgnoreMatcher } = require('./collector');
-  const watcher = chokidar.watch(
-    config.dirs,
-    watcherOptions(config.usePolling === true, watchIgnoreMatcher(config.clients))
-  );
+  const { createCompositeWatcher } = require('./compositeWatcher');
+  const watcher = createCompositeWatcher(config.dirs, config.clients, config.usePolling === true);
   watcher.on('all', (event, filePath) => handlers.onEvent?.(event, filePath));
   watcher.on('error', (error) => handlers.onError?.(error));
   watcher.on('ready', () => handlers.onReady?.());

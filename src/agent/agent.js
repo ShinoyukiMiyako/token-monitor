@@ -31,6 +31,10 @@ const deviceId = String(args.device || args.deviceId || process.env.TOKEN_MONITO
 const intervalMs = Number(args.interval || args.intervalMs || process.env.TOKEN_MONITOR_INTERVAL_MS || 5 * 60 * 1000);
 const watchEnabled = String(args.watch ?? process.env.TOKEN_MONITOR_WATCH ?? '1') !== '0';
 const watchDebounceMs = Number(args.watchDebounceMs || process.env.TOKEN_MONITOR_WATCH_DEBOUNCE_MS || 1500);
+// `||` would swallow an explicit 0 (the documented "never throttle" value),
+// while `??` alone would read an empty env var as 0 instead of "unset".
+const minScanIntervalRaw = args.minScanIntervalMs ?? process.env.TOKEN_MONITOR_MIN_SCAN_INTERVAL_MS ?? '';
+const minScanIntervalMs = String(minScanIntervalRaw).trim() === '' ? 15 * 1000 : Number(minScanIntervalRaw);
 const clients = clientsCsvForSetting(args.clients ?? process.env.TOKEN_MONITOR_CLIENTS);
 const allTimeSince = String(args.since || args.allTimeSince || process.env.TOKEN_MONITOR_ALL_TIME_SINCE || '2024-01-01');
 const commandTimeoutMs = Number(args.timeoutMs || process.env.TOKEN_MONITOR_TOKSCALE_TIMEOUT_MS || 120 * 1000);
@@ -80,6 +84,7 @@ const usageOptions = {
   intervalMs,
   watchEnabled,
   watchDebounceMs,
+  minScanIntervalMs,
   wslScanEnabled,
   onError: (error, reason) => console.error(`[${new Date().toISOString()}] (${reason}) ${error.message}`),
   logger: (message) => (dryRun ? console.error(message) : console.log(message))

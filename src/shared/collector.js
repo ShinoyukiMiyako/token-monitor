@@ -31,6 +31,7 @@ const {
 const { collectWslUsage: collectWslUsageImpl, emptyWslBundle, probeWslState: probeWslStateImpl } = require('./wslUsage');
 const { hermesProfileWatchDirs, resolveHermesHome } = require('./hermesProfiles');
 const { createWatcherHost } = require('./watcherHost');
+const { supportsNativeRecursiveWatch } = require('./recursiveWatcher');
 const { localDayKey, mergeHistories, parseGraphResult, normalizeHistory } = require('./history');
 const { retainDailyHistory, retainLiveDailyHistory } = require('./dailyHistoryArchive');
 const {
@@ -904,6 +905,30 @@ const jsonlTimestampCache = new Map();
 // projectPathCache already rely on being module-level rather than deps-held.
 const dshSessionFileCache = new Map();
 
+// Keyed by `home\0client\0sessionId` -> transcript path, for the clients whose
+// files are located by walking a tree (claude, codex).
+//
+// Same problem dshSessionFileCache solves, and it applies far more widely than
+// the DSH comment above suggests: metadataCache/resolvedSessionKeys/
+// attemptedSessionKeys are rebuilt fresh on every collectUsageOnce call, so
+// nothing they remember survives a tick, and both callers pass retryMisses
+// anyway. Every tick therefore re-walked ~/.claude/projects from scratch —
+// measured at 56ms of synchronous readdirSync over 943 dirs / 10.5k files on a
+// real tree, on whichever thread owns the collector. A transcript's path never
+// changes once found, so keeping it is enough to turn that walk into a stat of a
+// known path.
+//
+// Module-level for the same reason as dshSessionFileCache: it must outlive the
+// per-call deps object. `home` heads the key because one collector decorates
+// both the native home and every running WSL distro's home, and the same id can
+// exist under more than one of them.
+const sessionFileCache = new Map();
+// A byte that cannot occur in a path or a session id, so the three parts of the
+// key above can never run together into a colliding string. Built rather than
+// written as a literal to keep the source file free of a raw NUL byte, which
+// makes git treat it as binary.
+const SESSION_CACHE_KEY_SEPARATOR = String.fromCharCode(0);
+
 function lastJsonlTimestamp(filePath) {
   let stat;
   try { stat = fs.statSync(filePath); } catch (_) { return ''; }
@@ -950,13 +975,41 @@ function sessionTimestampMap(periods, home = os.homedir(), deps = {}) {
     byClient.get(ref.client).add(ref.sessionId);
   }
 
+  // Returns whether the file was actually readable, so a cached path that has
+  // since been deleted can be dropped and looked up again instead of silently
+  // decaying to the session-id timestamp forever.
   const applyFile = (client, sessionId, filePath) => {
     const startedAt = timestampFromSessionId(sessionId);
-    const lastUsedAt = lastJsonlTimestamp(filePath) || startedAt;
+    const tailTimestamp = lastJsonlTimestamp(filePath);
+    const lastUsedAt = tailTimestamp || startedAt;
     const identity = resolveProjects ? projectIdentity(projectPathFromJsonl(filePath)) : {};
     const key = `${client}:${sessionId}`;
     metadata.set(key, { startedAt, lastUsedAt, ...identity });
     if (identity.projectId) resolvedSessionKeys.add(key);
+    return tailTimestamp !== '';
+  };
+
+  const fileCache = deps.sessionFileCache || sessionFileCache;
+  const fileCacheKey = (client, sessionId) => [home, client, sessionId].join(SESSION_CACHE_KEY_SEPARATOR);
+  // Decorate every id whose path is already known, and hand back only the ones
+  // that still need a walk. A cached path that no longer reads rejoins that set.
+  const applyCachedFiles = (client, ids) => {
+    const unresolved = new Set();
+    for (const sessionId of ids) {
+      const cached = fileCache.get(fileCacheKey(client, sessionId));
+      if (!cached) { unresolved.add(sessionId); continue; }
+      if (!applyFile(client, sessionId, cached)) {
+        fileCache.delete(fileCacheKey(client, sessionId));
+        unresolved.add(sessionId);
+      }
+    }
+    return unresolved;
+  };
+  const rememberFiles = (client, found) => {
+    for (const [sessionId, filePath] of found) {
+      applyFile(client, sessionId, filePath);
+      fileCache.set(fileCacheKey(client, sessionId), filePath);
+    }
   };
 
   // OpenCode has no transcript file — its timestamps come from the opencode.db `session` table.
@@ -981,21 +1034,27 @@ function sessionTimestampMap(periods, home = os.homedir(), deps = {}) {
     useEnvRoots: !deps.scopedHome
   });
   const claudeIds = byClient.get('claude') || new Set();
-  const projectFiles = findSessionFiles(claudeRoots.projects, claudeIds);
-  for (const [sessionId, filePath] of projectFiles) applyFile('claude', sessionId, filePath);
-  const missingClaudeIds = new Set([...claudeIds].filter((sessionId) => !projectFiles.has(sessionId)));
+  // Only ids with no remembered path reach findSessionFiles, which is what keeps
+  // a steady-state tick off the projects tree entirely.
+  const claudeLookupIds = applyCachedFiles('claude', claudeIds);
+  const projectFiles = findSessionFiles(claudeRoots.projects, claudeLookupIds);
+  rememberFiles('claude', projectFiles);
+  const missingClaudeIds = new Set([...claudeLookupIds].filter((sessionId) => !projectFiles.has(sessionId)));
   const transcriptFiles = findSessionFiles(claudeRoots.transcripts, missingClaudeIds);
-  for (const [sessionId, filePath] of transcriptFiles) applyFile('claude', sessionId, filePath);
+  rememberFiles('claude', transcriptFiles);
 
   const codexIds = byClient.get('codex') || new Set();
+  const codexLookupIds = applyCachedFiles('codex', codexIds);
   const missingCodexIds = new Set();
-  for (const sessionId of codexIds) {
+  for (const sessionId of codexLookupIds) {
+    // Codex ids carry their own date, so this builds the path directly and only
+    // an id that does not resolve that way falls through to a walk.
     const filePath = codexSessionFile(home, sessionId);
-    if (filePath) applyFile('codex', sessionId, filePath);
+    if (filePath) rememberFiles('codex', [[sessionId, filePath]]);
     else missingCodexIds.add(sessionId);
   }
   const codexFiles = findSessionFiles(path.join(home, '.codex', 'sessions'), missingCodexIds);
-  for (const [sessionId, filePath] of codexFiles) applyFile('codex', sessionId, filePath);
+  rememberFiles('codex', codexFiles);
 
   const kimiIds = byClient.get('kimi') || new Set();
   if (kimiIds.size > 0) {
@@ -2791,6 +2850,65 @@ function watchPolicyEntries(clientsCsv) {
   return { entries, boundedCount };
 }
 
+// Split watch roots into the ones the kernel can watch recursively and the ones
+// that must keep chokidar's per-directory walk.
+//
+// The dividing line is pruning, not size. A recursive watch cannot decline to
+// descend, so any root whose policy prunes something — Hermes' 150k-file runtime
+// (issue #38), MiMo's rotated log tree, Copilot's workspaceStorage — would turn
+// every unrelated background write under it into a scan trigger. Those keep
+// chokidar, which never recurses into an ignored directory. Roots with nothing
+// to prune are exactly the session trees that dominate the handle count, and
+// they go to the kernel: ~/.claude/projects alone is 11,526 chokidar handles
+// against 1 recursive one, and that number grows with every session ever
+// recorded.
+//
+// Containment is tested in both directions on purpose. A recursive watch over a
+// parent silently re-covers a bounded root nested inside it, undoing that root's
+// pruning; and a root nested inside a bounded one inherits the reason its parent
+// was bounded. Either overlap keeps the walk.
+//
+// Polling is left entirely to chokidar: the recursive watch has no polling mode,
+// and the descriptor-exhaustion fallback that turns polling on is precisely the
+// situation where handing out more native watches is wrong.
+// Tri-state, like TOKEN_MONITOR_WATCH_POLLING: unset means "use the platform
+// default", so an explicit 0 can force every root back onto the per-directory
+// walk without the caller having to know what that default is. The collector's
+// own watch-behaviour tests set it, because they stub `chokidar.watch` and a
+// root that went to the kernel instead would escape the stub onto the real
+// filesystem.
+function recursiveWatchEnvOverride(env = process.env) {
+  const raw = String(env.TOKEN_MONITOR_WATCH_RECURSIVE ?? '').trim().toLowerCase();
+  if (!raw) return undefined;
+  return !['0', 'false', 'no', 'off'].includes(raw);
+}
+
+function recursiveWatchCandidates(dirs, clientsCsv, options = {}) {
+  const platform = options.platform || process.platform;
+  const all = [...new Set(dirs || [])];
+  const override = recursiveWatchEnvOverride(options.env || process.env);
+  const enabled = override === undefined ? supportsNativeRecursiveWatch(platform) : override;
+  if (options.usePolling === true || !enabled) {
+    return { recursive: [], walked: all };
+  }
+  const { entries } = watchPolicyEntries(clientsCsv);
+  const boundedRoots = entries
+    .filter((entry) => entry.policy !== KEEP_EVERYTHING)
+    .map((entry) => entry.root);
+  const recursive = [];
+  const walked = [];
+  for (const dir of all) {
+    const resolved = path.resolve(dir);
+    const overlapsBounded = boundedRoots.some((root) => (
+      resolved === root
+      || resolved.startsWith(root + path.sep)
+      || root.startsWith(resolved + path.sep)
+    ));
+    (overlapsBounded ? walked : recursive).push(dir);
+  }
+  return { recursive, walked };
+}
+
 function watchIgnoreMatcher(clientsCsv) {
   const { entries, boundedCount } = watchPolicyEntries(clientsCsv);
   if (boundedCount === 0) return undefined;
@@ -3264,6 +3382,32 @@ function startCollector(options) {
   // the interval loop into spins. Clamping here means no timer below can
   // reintroduce that by forgetting.
   const watchDebounceMs = clampTimerDelayMs(options.watchDebounceMs, 1500);
+  // Debounce and throttle answer different questions and neither substitutes for
+  // the other. The debounce above collapses a burst — many writes inside one
+  // window cost one scan — but it re-arms per event, so a *steady* write cadence
+  // slower than the debounce (an agent appending a JSONL line every couple of
+  // seconds, which is the normal shape of an active coding session) passes every
+  // single write straight through to a scan. Measured on a 2.3 GB
+  // ~/.claude/projects: one scan is ~1.3 s wall and ~5.9 s CPU, so a 2 s write
+  // cadence keeps roughly three cores busy indefinitely, and the busier the user
+  // is the more the monitor costs — the wrong way round.
+  //
+  // This is the ceiling that bounds it: scans start at most this often, no
+  // matter how the writes arrive. It trades refresh latency for a flat CPU
+  // budget, which is the trade a background monitor should be making. Scans
+  // triggered by the interval loop or by an explicit refresh are deliberately
+  // not throttled — only the watch path, which is the one driven by an
+  // uncontrolled external rate.
+  // Deliberately not clampTimerDelayMs: that helper treats 0 as "no value given"
+  // and substitutes its fallback, which is right for a timer delay (a 0ms
+  // interval is meaningless) but wrong here — 0 is a real, documented setting
+  // meaning "never throttle", and silently turning it into 15s would make the
+  // opt-out impossible to express.
+  const minScanIntervalMs = (() => {
+    const parsed = Number(options.minScanIntervalMs);
+    if (!Number.isFinite(parsed) || parsed < 0) return 15 * 1000;
+    return Math.min(2 ** 31 - 1, parsed);
+  })();
   const intervalMs = clampTimerDelayMs(options.intervalMs, 5 * 60 * 1000);
   const historyRetryMs = clampTimerDelayMs(options.historyRetryMs, 60 * 1000);
   const watchUsePolling = resolveWatchUsePolling(options.watchUsePolling);
@@ -3293,6 +3437,12 @@ function startCollector(options) {
     env: process.env
   });
   let tickInFlight = false;
+  // When the last scan *started*, not finished: the gap that matters is between
+  // the starts, so a scan that runs long shortens its own next wait instead of
+  // adding to it. Every scan stamps this, including interval and manual ones, so
+  // a watch event arriving right after a full scan waits its turn rather than
+  // rescanning what was just read.
+  let lastScanStartedAt = 0;
   let idleWaiters = [];
   let tickPending = false;
   let pendingForceHistory = false;
@@ -3488,6 +3638,7 @@ function startCollector(options) {
 
   async function performTick(reason, tickOptions = {}) {
     const tickStartedAt = Date.now();
+    lastScanStartedAt = tickStartedAt;
     const collectedAt = collectionDate(options.now);
     const todayKey = localTodayKey(collectedAt);
     // The previous live DAY becomes durable history at local midnight. Finalize
@@ -3873,6 +4024,14 @@ function startCollector(options) {
     if (stopped) return;
     recordWatchClients(eventClients);
     if (debounceTimer) clearTimeout(debounceTimer);
+    // Wait out whichever is longer: the quiet window a burst needs, or what is
+    // left of the minimum gap since the last scan started. Taking the max leaves
+    // the debounce's meaning untouched — the throttle can only ever delay a
+    // scan, never bring one forward. Before the first scan there is no gap to
+    // honour, so startup still responds at debounce speed.
+    const throttleRemainingMs = lastScanStartedAt === 0
+      ? 0
+      : Math.max(0, minScanIntervalMs - (Date.now() - lastScanStartedAt));
     debounceTimer = setTimeout(() => {
       debounceTimer = null;
       // Re-arm instead of queueing onto the in-flight tick: the coalesce path
@@ -3887,7 +4046,7 @@ function startCollector(options) {
         targetClients: takeWatchClients(),
         sourceSelfSync: sourceSyncQueue.takeDue()
       });
-    }, watchDebounceMs);
+    }, Math.max(watchDebounceMs, throttleRemainingMs));
   }
 
   // chokidar's close() walks every watched entry and closes every fs.watch
@@ -4020,7 +4179,17 @@ function startCollector(options) {
       watchers.push(host);
       watchedDirectoryKey = directoryKey;
       lastWatchFailureCode = null;
-      for (const dir of dirs) log(`Watching ${dir} (${usePolling ? 'polling 2s' : 'native events'})`);
+      // Name which strategy each root actually got: the difference is thousands
+      // of descriptors on a session tree, so it is the first thing worth knowing
+      // when a user reports the watcher being expensive.
+      const { recursive: recursiveDirs } = recursiveWatchCandidates(dirs, clients, { usePolling });
+      const recursiveSet = new Set(recursiveDirs);
+      for (const dir of dirs) {
+        const mode = usePolling
+          ? 'polling 2s'
+          : (recursiveSet.has(dir) ? 'native events, recursive' : 'native events, per-directory');
+        log(`Watching ${dir} (${mode})`);
+      }
     } catch (error) {
       watchedDirectoryKey = null;
       lastWatchFailureCode = 'watcher-rebuild-failed';
@@ -4111,6 +4280,7 @@ function startCollector(options) {
       collectionMode: watchTriggersCollection ? 'live' : intervalRequiresActivity ? 'smart' : 'interval',
       intervalMs,
       watchDebounceMs,
+      minScanIntervalMs,
       watchEnabled,
       watchMode,
       watchFallbackCode,
@@ -4224,5 +4394,6 @@ module.exports = {
   watchAttributionRootsForClients,
   watcherOptions,
   watchIgnoreMatcher,
-  watchPathsForClients
+  watchPathsForClients,
+  recursiveWatchCandidates
 };

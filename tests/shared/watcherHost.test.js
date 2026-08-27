@@ -16,6 +16,23 @@ const {
 } = require('../../src/shared/watcherHost');
 
 const WATCH_HOST_ENV = 'TOKEN_MONITOR_WATCH_IN_PROCESS';
+const WATCH_RECURSIVE_ENV = 'TOKEN_MONITOR_WATCH_RECURSIVE';
+
+// This file covers host lifecycle — worker vs in-process selection, terminate
+// ordering, skipClose — by stubbing `chokidar.watch` and asserting the stub was
+// reached. The temp trees it watches belong to no client, so nothing prunes them
+// and they would otherwise be handed to a recursive kernel watch that the stub
+// never sees. Pin every root to the chokidar half; recursive watching has its
+// own coverage in recursiveWatcher.test.js.
+let savedRecursiveEnv;
+test.beforeEach(() => {
+  savedRecursiveEnv = process.env[WATCH_RECURSIVE_ENV];
+  process.env[WATCH_RECURSIVE_ENV] = '0';
+});
+test.afterEach(() => {
+  if (savedRecursiveEnv === undefined) delete process.env[WATCH_RECURSIVE_ENV];
+  else process.env[WATCH_RECURSIVE_ENV] = savedRecursiveEnv;
+});
 
 function tmpTree(extra = 'nested') {
   const root = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'tm-watch-host-'));

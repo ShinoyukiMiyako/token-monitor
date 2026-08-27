@@ -396,6 +396,7 @@ function sanitizeCollector(collector = {}, platform) {
     collectionMode: safeChoice(collector.collectionMode, new Set(['live', 'smart', 'interval'])),
     intervalMs: boundedNumber(collector.intervalMs),
     watchDebounceMs: boundedNumber(collector.watchDebounceMs),
+    minScanIntervalMs: boundedNumber(collector.minScanIntervalMs),
     watchEnabled: collector.watchEnabled === true,
     watchMode: safeChoice(collector.watchMode, new Set(['native', 'polling', 'disabled'])),
     watchFallbackCode: collector.watchFallbackCode ? identifier(collector.watchFallbackCode) : 'none',

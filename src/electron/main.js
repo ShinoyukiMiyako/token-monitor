@@ -487,6 +487,7 @@ function defaultSettings() {
     exportIntervalMs: 60 * 1000,
     collectionMode: 'live',
     collectionIntervalMs: 5 * 60 * 1000,
+    minScanIntervalMs: normalizeMinScanIntervalMs(process.env.TOKEN_MONITOR_MIN_SCAN_INTERVAL_MS),
     syncUploadIntervalMs: normalizeSyncUploadIntervalMs(process.env.TOKEN_MONITOR_SYNC_UPLOAD_INTERVAL_MS),
     serviceProviderDisplayOrder: '',
     hiddenServiceProviders: '',
@@ -607,6 +608,25 @@ function normalizeCollectionIntervalMs(value, fallback = DEFAULT_COLLECTION_INTE
   if (COLLECTION_INTERVAL_OPTIONS.includes(numeric)) return numeric;
   const fallbackNumeric = Number(fallback);
   return COLLECTION_INTERVAL_OPTIONS.includes(fallbackNumeric) ? fallbackNumeric : DEFAULT_COLLECTION_INTERVAL_MS;
+}
+
+// Free-form rather than a fixed option list: unlike collectionIntervalMs this is
+// a CPU/latency dial with no meaningful steps, and the right value depends on how
+// large the user's session tree has grown. 0 restores the pre-throttle behaviour
+// (scan on every settled write); the ceiling stops a mistyped value from making
+// live updates look broken with no way to tell it apart from a hang.
+const DEFAULT_MIN_SCAN_INTERVAL_MS = 15 * 1000;
+const MIN_SCAN_INTERVAL_CEILING_MS = 5 * 60 * 1000;
+
+function normalizeMinScanIntervalMs(value, fallback = DEFAULT_MIN_SCAN_INTERVAL_MS) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    return Math.min(Math.round(numeric), MIN_SCAN_INTERVAL_CEILING_MS);
+  }
+  const fallbackNumeric = Number(fallback);
+  return Number.isFinite(fallbackNumeric) && fallbackNumeric >= 0
+    ? Math.min(Math.round(fallbackNumeric), MIN_SCAN_INTERVAL_CEILING_MS)
+    : DEFAULT_MIN_SCAN_INTERVAL_MS;
 }
 
 function collectorIntervalMs() {
@@ -6330,6 +6350,7 @@ app.whenReady().then(() => {
       wslScanEnabled: parseBoolean(patch.wslScanEnabled ?? settings.wslScanEnabled, true),
       collectionMode: normalizeCollectionMode(patch.collectionMode ?? settings.collectionMode),
       collectionIntervalMs: normalizeCollectionIntervalMs(patch.collectionIntervalMs ?? settings.collectionIntervalMs),
+      minScanIntervalMs: normalizeMinScanIntervalMs(patch.minScanIntervalMs ?? settings.minScanIntervalMs),
       syncUploadIntervalMs: normalizeSyncUploadIntervalMs(patch.syncUploadIntervalMs ?? settings.syncUploadIntervalMs),
       serviceProviderDisplayOrder: patch.serviceProviderDisplayOrder !== undefined ? String(patch.serviceProviderDisplayOrder || '') : (settings.serviceProviderDisplayOrder || ''),
       hiddenServiceProviders: patch.hiddenServiceProviders !== undefined ? String(patch.hiddenServiceProviders || '') : (settings.hiddenServiceProviders || ''),

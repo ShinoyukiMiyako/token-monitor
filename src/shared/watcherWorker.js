@@ -15,9 +15,11 @@
 // keep in sync.
 
 const { parentPort, workerData } = require('node:worker_threads');
-const chokidar = require('chokidar');
 
-const { watcherOptions, watchIgnoreMatcher } = require('./collector');
+// Not chokidar directly: roots that need no pruning are watched recursively by
+// the kernel instead, and this joins both halves into one chokidar-shaped
+// object so the revision fencing and close serialisation below are unaffected.
+const { createCompositeWatcher } = require('./compositeWatcher');
 
 // Latest-wins rather than a queue. A teardown can run for seconds, and a user
 // flipping several settings in that window must not make the worker replay
@@ -74,7 +76,7 @@ async function pump() {
       if (target.config) {
         try {
           const { dirs, clients, usePolling } = target.config;
-          const instance = chokidar.watch(dirs, watcherOptions(usePolling === true, watchIgnoreMatcher(clients)));
+          const instance = createCompositeWatcher(dirs, clients, usePolling === true);
           watcher = instance;
           watcherRevision = target.revision;
           appliedRevision = target.revision;

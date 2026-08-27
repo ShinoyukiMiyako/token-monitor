@@ -55,6 +55,7 @@ const USAGE_CONFIG_FINGERPRINT_KEYS = Object.freeze([
   'watchTriggersCollection',
   'intervalRequiresActivity',
   'watchDebounceMs',
+  'minScanIntervalMs',
   'wslScanEnabled'
 ]);
 const LIMITS_RECONFIGURE_KEYS = Object.freeze([
@@ -138,6 +139,11 @@ function usageConfigFromSettings(settings = {}, context = {}) {
     watchTriggersCollection: context.watchTriggersCollection !== false,
     intervalRequiresActivity: Boolean(context.intervalRequiresActivity),
     watchDebounceMs: Number(context.watchDebounceMs || 1500),
+    // A user preference rather than a context constant: how stale the numbers may
+    // get is a taste call, and the cost of getting it wrong is paid in CPU on the
+    // user's own machine. `?? ` not `||` so an explicit 0 (never throttle) is
+    // honoured instead of silently becoming the default.
+    minScanIntervalMs: Number(settings.minScanIntervalMs ?? 15 * 1000),
     wslScanEnabled: settings.wslScanEnabled !== false,
     onError: context.onError,
     logger: context.logger

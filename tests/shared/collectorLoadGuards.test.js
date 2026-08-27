@@ -430,6 +430,7 @@ test('Antigravity source events target its umbrella client without watching sync
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'antigravity',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -553,6 +554,7 @@ test('a catch-up that comes due mid-tick keeps its targeted scan scope', async (
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,antigravity',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 5000,
@@ -659,6 +661,7 @@ test('a manual refresh satisfies a deferred source sync instead of adding one', 
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'antigravity',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -748,6 +751,7 @@ test('a failed forced sync hands the source event back instead of eating it', as
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'antigravity',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -851,6 +855,7 @@ test('a source event that keeps failing backs off to the idle cadence', async (t
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'antigravity',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -951,6 +956,7 @@ test('an unrelated client event does not bypass a source-sync backoff', async ()
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,antigravity',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -1240,6 +1246,7 @@ test('an Antigravity CLI event rescans without paying for an IDE sync', async ()
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'antigravity',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -2602,6 +2609,7 @@ test('a watch event during an in-flight tick re-arms the debounce instead of coa
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 5000,
@@ -2712,6 +2720,7 @@ test('live watch events scan only changed clients and preserve the other client 
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,codex',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -2830,6 +2839,7 @@ test('smart collection uses native watching and skips idle intervals after start
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -2908,6 +2918,7 @@ test('collector preserves Qoder CN while publishing other clients after a bounde
     const previews = [];
     const updates = [];
     const collectorOptions = {
+      minScanIntervalMs: 0,
       clients: 'claude,qodercn',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -2920,6 +2931,7 @@ test('collector preserves Qoder CN while publishing other clients after a bounde
       runTokscale: async () => ({ entries: [{ client: 'claude', model: 'm', input: claudeTokens }] })
     };
     handle = startCollector({
+      minScanIntervalMs: 0,
       ...collectorOptions,
       onPreview: (summary) => previews.push(summary),
       onUpdate: (summary) => updates.push(summary)
@@ -2947,6 +2959,7 @@ test('collector preserves Qoder CN while publishing other clients after a bounde
 
     handle.stop();
     handle = startCollector({
+      minScanIntervalMs: 0,
       ...collectorOptions,
       onUpdate: (summary) => updates.push(summary)
     });
@@ -2999,6 +3012,7 @@ test('collector does not reuse persisted Qoder CN periods after the DB path chan
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,qodercn',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3048,6 +3062,7 @@ test('collector publishes other clients when Qoder CN fails before the first com
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,qodercn',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3107,6 +3122,7 @@ test('collector publishes live periods when only Qoder CN history read fails', a
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,qodercn',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3178,6 +3194,7 @@ test('smart collection coalesces watch events into one targeted interval tick', 
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,codex,cursor',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3257,6 +3274,7 @@ test('smart collection keeps events received during a scan pending', async () =>
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3338,6 +3356,7 @@ test('smart collection retries a failed activity scan on the next interval', asy
     const updates = [];
     const errors = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,codex,cursor',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3426,6 +3445,7 @@ test('watch-descriptor exhaustion degrades to polling and stays there', async ()
   try {
     const { startCollector } = freshCollector();
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3497,6 +3517,7 @@ test('a successful watcher rebuild clears the current watcher failure', async ()
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3576,6 +3597,7 @@ test('watch roots reach chokidar canonicalised on Windows and untouched elsewher
   try {
     const { startCollector } = freshCollector();
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3650,6 +3672,7 @@ test('the ignore matcher agrees with the roots chokidar was actually handed', as
   try {
     const { startCollector } = freshCollector();
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'hermes',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3716,6 +3739,7 @@ test('TOKEN_MONITOR_WATCH_POLLING=0 opts out of the descriptor fallback', async 
   try {
     const { startCollector } = freshCollector();
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3778,6 +3802,7 @@ test('a non-descriptor watch error is logged without degrading to polling', asyn
   try {
     const { startCollector } = freshCollector();
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3854,6 +3879,7 @@ test('live collection retries all clients after a failed targeted watch scan', a
     const updates = [];
     const errors = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,codex',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3930,6 +3956,7 @@ test('idle smart collection still performs the hourly full reconciliation', asyn
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -3988,6 +4015,7 @@ test('hourly smart reconciliation refreshes WSL-only usage without a host event'
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude,gemini',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -4061,6 +4089,7 @@ test('hourly smart reconciliation starts watching a client directory created aft
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -4129,6 +4158,7 @@ test('smart collection lets a successful manual refresh acknowledge existing act
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -4203,6 +4233,7 @@ test('smart collection acknowledges the latest activity revision after tick coal
     const { startCollector } = freshCollector();
     const updates = [];
     handle = startCollector({
+      minScanIntervalMs: 0,
       clients: 'claude',
       allTimeSince: '2024-01-01',
       commandTimeoutMs: 1000,
@@ -4508,6 +4539,7 @@ test('the quit variant of stop() skips the watcher walk and leans on `stopped`',
   childProcess.spawn = recordingSpawn(calls);
 
   const collectorOptions = {
+    minScanIntervalMs: 0,
     clients: 'claude',
     allTimeSince: '2024-01-01',
     commandTimeoutMs: 1000,
