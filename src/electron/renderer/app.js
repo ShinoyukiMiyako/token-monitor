@@ -170,7 +170,6 @@ const TRAY_ICON_PROVIDERS = [
 const DEFAULT_LIMIT_PROVIDER_ORDER = LIMIT_PROVIDERS.map((provider) => provider.id).join(',');
 const limitProviderOrderApi = window.TokenMonitorLimitProviderOrder;
 const limitProviderPresentationApi = window.TokenMonitorLimitProviderPresentation;
-const appUpdatePresentationApi = window.TokenMonitorAppUpdatePresentation;
 const accountIdentityApi = window.TokenMonitorAccountIdentity;
 const clientStatusPresentationApi = window.TokenMonitorClientStatusPresentation;
 const clientHealthPresentationApi = window.TokenMonitorClientHealthPresentation;
@@ -314,7 +313,7 @@ function normalizeInitialViewValue(value, allowed, fallback) {
   return allowed.has(raw) ? raw : fallback;
 }
 
-const state = { period: normalizeInitialViewValue(initialViewState.period, viewPeriodValues, 'today'), appUpdate: null, breakdown: normalizeInitialViewValue(initialViewState.breakdown, viewBreakdownValues, 'home'), viewSwitcherOpen: false, viewSwitcherHasOpened: false, limitDetailTooltipHasOpened: false, limitDetailTooltipActive: false, limitDetailTooltipRenderPending: false, settings: null, stats: null, homeHistory: null, homeHistoryBusy: false, homeHistoryRequested: false, homeHistorySignature: '', homeHistoryRetries: 0, homeHistoryRetryTimer: null, homeActivityScrollLeft: null, homeActivityFollowEnd: true, homeActivityResizeObserver: null, serviceStatus: null, serviceStatusBusy: false, serviceProvidersExpanded: false, trendSettingsExpanded: false, trendsActivating: false, homeSettingsExpanded: false, homeLimitSettingsExpanded: false, limitProviderSettingsExpanded: '', clientHealthExpanded: '', clientSources: clientSourceCacheApi.createClientSourceCache(), clientSourcesKey: '', clientSourcesRequest: 0, subscriptionEditingId: '', subscriptionTopUps: [], subscriptionFormBase: null, subscriptionEditorTransitionId: 0, serviceStatusTicker: null, refreshTimer: null, refreshBusy: false, refreshFeedbackTimer: null, currentTotal: 0, rowSignature: '', streamConnected: false, streamFailure: null, mode: 'idle', appInfo: null, systemDarkUi: false, tokscaleStatus: null, tokscaleCheck: null, tokscaleBusy: false, hubInfo: null, hubBuildStatus: null, cursorAccount: { status: null, error: '' }, cursorAccountExpanded: false, codexAccountExpanded: false, codexAccountError: '', codexSignInBusy: false, codexSignInFlowId: '', codexLoginUrl: '', codexLoginStatus: '', codexLoginOutput: '', codexWorkspaceChoices: [], codexWorkspaceId: '', codexActiveAccount: null, codexPendingActiveAccount: null, codexPendingActiveAccountUntil: 0, codexPendingActiveAccountTimer: null, codexSystemSwitchingAccountId: '', codexSystemSwitchErrorAccountId: '', codexSystemSwitchError: '', codexSwitchPopoverHasOpened: false, codexSwitchPopoverActive: false, codexSwitchPopoverRenderPending: false, customPricingExpanded: false, claudeAccountExpanded: false, claudePendingCheckSince: 0, opencodeProfileCount: 0, opencodeCookieExpanded: false, openrouterProfileCount: 0, openrouterAccountExpanded: false, thirdPartyProfileCount: 0, thirdPartyAccountExpanded: false, deepseekAccountExpanded: false, deepseekPendingCheckSince: 0, minimaxAccountExpanded: false, minimaxPendingCheckSince: 0, zaiAccountExpanded: false, zaiPendingCheckSince: 0, zaiteamAccountExpanded: false, zaiteamPendingCheckSince: 0, volcengineAccountExpanded: false, volcenginePendingCheckSince: 0, volcengineAgentExpanded: false, qoderAccountExpanded: false, qoderPendingCheckSince: 0, commandcodeAccountExpanded: false, commandcodePendingCheckSince: 0, kimiAccountExpanded: false, kimiPendingCheckSince: 0, ollamaAccountExpanded: false, ollamaPendingCheckSince: 0, mimoAccountExpanded: false, mimoAccountError: '', copilotAccountExpanded: false, copilotManualExpanded: false, copilotPendingCheckSince: 0, copilotSignInBusy: false, copilotSignInCancelable: false, copilotSignInFlowId: '', copilotAuthorizeMessage: '', copilotLoginStatus: '', copilotErrorMessage: '', floatingBubble: initialFloatingBubble, suppressInitialNumberAnimation: window.__TOKEN_MONITOR_SUPPRESS_INITIAL_NUMBER_ANIMATION__ === true, openSession: null, detailSort: 'time', recordingWindowShortcut: false, windowShortcutInvalid: false };
+const state = { period: normalizeInitialViewValue(initialViewState.period, viewPeriodValues, 'today'), breakdown: normalizeInitialViewValue(initialViewState.breakdown, viewBreakdownValues, 'home'), viewSwitcherOpen: false, viewSwitcherHasOpened: false, limitDetailTooltipHasOpened: false, limitDetailTooltipActive: false, limitDetailTooltipRenderPending: false, settings: null, stats: null, homeHistory: null, homeHistoryBusy: false, homeHistoryRequested: false, homeHistorySignature: '', homeHistoryRetries: 0, homeHistoryRetryTimer: null, homeActivityScrollLeft: null, homeActivityFollowEnd: true, homeActivityResizeObserver: null, serviceStatus: null, serviceStatusBusy: false, serviceProvidersExpanded: false, trendSettingsExpanded: false, trendsActivating: false, homeSettingsExpanded: false, homeLimitSettingsExpanded: false, limitProviderSettingsExpanded: '', clientHealthExpanded: '', clientSources: clientSourceCacheApi.createClientSourceCache(), clientSourcesKey: '', clientSourcesRequest: 0, subscriptionEditingId: '', subscriptionTopUps: [], subscriptionFormBase: null, subscriptionEditorTransitionId: 0, serviceStatusTicker: null, refreshTimer: null, refreshBusy: false, refreshFeedbackTimer: null, currentTotal: 0, rowSignature: '', streamConnected: false, streamFailure: null, mode: 'idle', appInfo: null, systemDarkUi: false, tokscaleStatus: null, tokscaleCheck: null, tokscaleBusy: false, hubInfo: null, hubBuildStatus: null, cursorAccount: { status: null, error: '' }, cursorAccountExpanded: false, codexAccountExpanded: false, codexAccountError: '', codexSignInBusy: false, codexSignInFlowId: '', codexLoginUrl: '', codexLoginStatus: '', codexLoginOutput: '', codexWorkspaceChoices: [], codexWorkspaceId: '', codexActiveAccount: null, codexPendingActiveAccount: null, codexPendingActiveAccountUntil: 0, codexPendingActiveAccountTimer: null, codexSystemSwitchingAccountId: '', codexSystemSwitchErrorAccountId: '', codexSystemSwitchError: '', codexSwitchPopoverHasOpened: false, codexSwitchPopoverActive: false, codexSwitchPopoverRenderPending: false, customPricingExpanded: false, claudeAccountExpanded: false, claudePendingCheckSince: 0, opencodeProfileCount: 0, opencodeCookieExpanded: false, openrouterProfileCount: 0, openrouterAccountExpanded: false, thirdPartyProfileCount: 0, thirdPartyAccountExpanded: false, deepseekAccountExpanded: false, deepseekPendingCheckSince: 0, minimaxAccountExpanded: false, minimaxPendingCheckSince: 0, zaiAccountExpanded: false, zaiPendingCheckSince: 0, zaiteamAccountExpanded: false, zaiteamPendingCheckSince: 0, volcengineAccountExpanded: false, volcenginePendingCheckSince: 0, volcengineAgentExpanded: false, qoderAccountExpanded: false, qoderPendingCheckSince: 0, commandcodeAccountExpanded: false, commandcodePendingCheckSince: 0, kimiAccountExpanded: false, kimiPendingCheckSince: 0, ollamaAccountExpanded: false, ollamaPendingCheckSince: 0, mimoAccountExpanded: false, mimoAccountError: '', copilotAccountExpanded: false, copilotManualExpanded: false, copilotPendingCheckSince: 0, copilotSignInBusy: false, copilotSignInCancelable: false, copilotSignInFlowId: '', copilotAuthorizeMessage: '', copilotLoginStatus: '', copilotErrorMessage: '', floatingBubble: initialFloatingBubble, suppressInitialNumberAnimation: window.__TOKEN_MONITOR_SUPPRESS_INITIAL_NUMBER_ANIMATION__ === true, openSession: null, detailSort: 'time', recordingWindowShortcut: false, windowShortcutInvalid: false };
 state.clientRescans = clientRescanStateApi.createClientRescanState({
   onChange: (clientId) => {
     if (state.clientHealthExpanded === clientId) refillOpenClientHealthPanel();
@@ -329,7 +328,6 @@ state.settingsPushRevision = 0;
 state.homeHistoryLoadedSignature = '';
 state.homeHistoryRetrySignature = '';
 state.homeReturnVisible = false;
-state.appUpdateNotesPresentedVersion = '';
 state.periodMotionActive = false;
 state.animateBarsFromZero = false;
 state.animateChartsOnRender = true;
@@ -415,32 +413,6 @@ Object.assign(els, {
   openRepositoryButton: document.getElementById('openRepositoryButton'),
   openWebsiteButton: document.getElementById('openWebsiteButton'),
   reportIssueButton: document.getElementById('reportIssueButton'),
-  appUpdatePill: document.getElementById('appUpdatePill'),
-  appUpdatePillAction: document.getElementById('appUpdatePillAction'),
-  appUpdatePillLabel: document.getElementById('appUpdatePillLabel'),
-  appUpdatePillRestart: document.getElementById('appUpdatePillRestart'),
-  appUpdatePillRestartLabel: document.getElementById('appUpdatePillRestartLabel'),
-  appUpdatePillDismiss: document.getElementById('appUpdatePillDismiss'),
-  appUpdatePopover: document.getElementById('appUpdatePopover'),
-  appUpdatePopoverTitle: document.getElementById('appUpdatePopoverTitle'),
-  appUpdatePopoverBody: document.getElementById('appUpdatePopoverBody'),
-  appUpdatePopoverAction: document.getElementById('appUpdatePopoverAction'),
-  appUpdatePopoverRelease: document.getElementById('appUpdatePopoverRelease'),
-  appUpdatePopoverClose: document.getElementById('appUpdatePopoverClose'),
-  appUpdateInstalled: document.getElementById('appUpdateInstalled'),
-  automaticAppUpdatesRow: document.getElementById('automaticAppUpdatesRow'),
-  automaticAppUpdatesInput: document.getElementById('automaticAppUpdatesInput'),
-  automaticAppUpdatesNote: document.getElementById('automaticAppUpdatesNote'),
-  appUpdateLatest: document.getElementById('appUpdateLatest'),
-  appUpdateCheckButton: document.getElementById('appUpdateCheckButton'),
-  appUpdateViewReleaseButton: document.getElementById('appUpdateViewReleaseButton'),
-  appUpdateNotes: document.getElementById('appUpdateNotes'),
-  appUpdateNotesToggle: document.getElementById('appUpdateNotesToggle'),
-  appUpdateNotesDetails: document.getElementById('appUpdateNotesDetails'),
-  appUpdateNotesTitle: document.getElementById('appUpdateNotesTitle'),
-  appUpdateNotesBody: document.getElementById('appUpdateNotesBody'),
-  appUpdateReleaseNotesButton: document.getElementById('appUpdateReleaseNotesButton'),
-  appUpdateMessage: document.getElementById('appUpdateMessage'),
   titleIconInput: document.getElementById('titleIconInput'),
   showCompactTotalTokensInput: document.getElementById('showCompactTotalTokensInput'),
   compactTokenUnitsRow: document.getElementById('compactTokenUnitsRow'),
@@ -983,222 +955,6 @@ function formatUpdatedAge(value) {
 }
 function versionText(value) {
   return value ? `v${value}` : 'unknown';
-}
-function setAppUpdatePillDisclosure(available) {
-  const action = els.appUpdatePillAction;
-  if (available) {
-    action.setAttribute('aria-haspopup', 'dialog');
-    action.setAttribute('aria-controls', 'appUpdatePopover');
-    action.setAttribute('aria-expanded', String(els.appUpdatePopover.matches(':popover-open')));
-    return;
-  }
-  action.removeAttribute('aria-haspopup');
-  action.removeAttribute('aria-controls');
-  action.removeAttribute('aria-expanded');
-}
-function renderAppUpdatePill() {
-  const s = state.appUpdate;
-  const pill = els.appUpdatePill;
-  if (!pill) return;
-  const mode = appUpdatePresentationApi.appUpdateActionMode(s);
-  const version = s?.latest?.version || s?.installVersion || '';
-  if (!s || !mode || !version || !s.showUpdateNotice) {
-    pill.classList.add('hidden');
-    pill.classList.remove('is-ready');
-    pill.setAttribute('title', '');
-    els.appUpdatePillLabel.textContent = '';
-    els.appUpdatePillAction.removeAttribute('title');
-    els.appUpdatePillAction.removeAttribute('aria-label');
-    els.appUpdatePillAction.disabled = false;
-    els.appUpdatePillRestart.classList.add('hidden');
-    els.appUpdatePillRestartLabel.textContent = '';
-    els.appUpdatePillRestart.disabled = false;
-    els.appUpdatePillRestart.removeAttribute('title');
-    els.appUpdatePillRestart.removeAttribute('aria-label');
-    setAppUpdatePillDisclosure(false);
-    return;
-  }
-  const hasReleaseNotes = releaseNoteGroupsForCurrentLocale(s.latest).length > 0;
-  setAppUpdatePillDisclosure(hasReleaseNotes);
-  pill.classList.remove('hidden');
-  pill.classList.toggle('is-ready', mode === 'install');
-  els.appUpdatePillDismiss.classList.toggle('hidden', mode === 'install' || s.installBusy);
-  pill.setAttribute('title', '');
-  const releaseLabel = hasReleaseNotes
-    ? t('settings.appUpdate.whatsNew', { version })
-    : (s.latest?.name || `v${version}`);
-  els.appUpdatePillAction.setAttribute('title', releaseLabel);
-  els.appUpdatePillAction.setAttribute('aria-label', releaseLabel);
-  els.appUpdatePillAction.disabled = mode === 'install' && !hasReleaseNotes && !s.latest?.htmlUrl;
-  els.appUpdatePillRestart.classList.toggle('hidden', mode !== 'install');
-  els.appUpdatePillRestart.disabled = Boolean(s.installBusy);
-  els.appUpdatePillRestartLabel.textContent = mode === 'install'
-    ? t('settings.appUpdate.restartShort')
-    : '';
-  els.appUpdatePillRestart.setAttribute('title', t('settings.appUpdate.ready'));
-  els.appUpdatePillRestart.setAttribute('aria-label', t('settings.appUpdate.restart'));
-  if (s.installPhase === 'downloading' && Number.isFinite(s.installProgress)) {
-    els.appUpdatePillLabel.textContent = `${Math.round(s.installProgress)}%`;
-  } else {
-    els.appUpdatePillLabel.textContent = mode === 'install'
-      ? `v${version}`
-      : `↑ v${version}`;
-  }
-}
-function releaseNoteGroupsForCurrentLocale(latest) {
-  return appUpdatePresentationApi.releaseNoteGroupsForLocale(latest?.releaseNotes, currentLocale());
-}
-function buildAppUpdateNoteGroupNodes(groups) {
-  return groups.map((group) => {
-    const section = document.createElement('section');
-    section.className = 'app-update-note-group';
-    const title = document.createElement('div');
-    title.className = 'app-update-note-title';
-    title.textContent = String(group?.title || '');
-    const list = document.createElement('ul');
-    for (const item of Array.isArray(group?.items) ? group.items : []) {
-      const row = document.createElement('li');
-      row.textContent = String(item || '');
-      list.append(row);
-    }
-    section.append(title, list);
-    return section;
-  });
-}
-function renderAppUpdatePopover(s) {
-  const version = s?.latest?.version || '';
-  const groups = releaseNoteGroupsForCurrentLocale(s?.latest);
-  const mode = appUpdatePresentationApi.appUpdateActionMode(s);
-  if (!version || groups.length === 0 || !mode) {
-    if (els.appUpdatePopover.matches(':popover-open')) els.appUpdatePopover.hidePopover();
-    els.appUpdatePopoverTitle.textContent = '';
-    els.appUpdatePopoverBody.replaceChildren();
-    return false;
-  }
-  els.appUpdatePopoverTitle.textContent = t('settings.appUpdate.whatsNew', { version });
-  els.appUpdatePopoverBody.replaceChildren(...buildAppUpdateNoteGroupNodes(groups));
-  els.appUpdatePopoverAction.textContent = mode === 'install'
-    ? t('settings.appUpdate.restart')
-    : mode === 'download'
-      ? t('settings.appUpdate.download')
-      : t('settings.appUpdate.viewRelease');
-  els.appUpdatePopoverAction.disabled = Boolean(s.installBusy);
-  els.appUpdatePopoverRelease.classList.toggle('hidden', !s.latest?.htmlUrl);
-  return true;
-}
-function positionAppUpdatePopover() {
-  const rect = els.appUpdatePill.getBoundingClientRect();
-  const width = Math.min(320, window.innerWidth - 24);
-  const left = Math.max(12, Math.min(window.innerWidth - width - 12, rect.right - width));
-  els.appUpdatePopover.style.width = `${width}px`;
-  els.appUpdatePopover.style.left = `${left}px`;
-  els.appUpdatePopover.style.bottom = `${Math.max(12, window.innerHeight - rect.top + 8)}px`;
-}
-function renderAppUpdateNotes(s) {
-  const version = s?.latest?.version || '';
-  const groups = releaseNoteGroupsForCurrentLocale(s?.latest);
-  const visible = Boolean(version && groups.length > 0);
-  els.appUpdateNotes.classList.toggle('hidden', !visible);
-  if (!visible) {
-    setSettingsAccordionExpanded(els.appUpdateNotes, els.appUpdateNotesToggle, els.appUpdateNotesDetails, false);
-    els.appUpdateNotesTitle.textContent = '';
-    els.appUpdateNotesBody.replaceChildren();
-    return;
-  }
-
-  els.appUpdateNotesTitle.textContent = t('settings.appUpdate.whatsNew', { version });
-  els.appUpdateNotesBody.replaceChildren(...buildAppUpdateNoteGroupNodes(groups));
-  els.appUpdateReleaseNotesButton.classList.toggle('hidden', !s.latest?.htmlUrl);
-  if (s.hasUpdate && state.appUpdateNotesPresentedVersion !== version) {
-    // The disclosure may have just changed from display:none. Commit its
-    // collapsed grid once so the first automatic reveal can transition too.
-    els.appUpdateNotesDetails.getBoundingClientRect();
-    setSettingsAccordionExpanded(els.appUpdateNotes, els.appUpdateNotesToggle, els.appUpdateNotesDetails, true);
-    state.appUpdateNotesPresentedVersion = version;
-  }
-}
-function renderSettingsAppUpdateRow() {
-  const s = state.appUpdate;
-  if (!s) {
-    els.appUpdateInstalled.textContent = '—';
-    els.appUpdateLatest.textContent = t('settings.common.notChecked');
-    els.appUpdateCheckButton.disabled = false;
-    els.appUpdateCheckButton.textContent = t('settings.appUpdate.check');
-    els.appUpdateViewReleaseButton.classList.add('hidden');
-    els.appUpdateMessage.textContent = '';
-    els.appUpdateMessage.classList.remove('error');
-    renderAppUpdateNotes(null);
-    return;
-  }
-  els.appUpdateInstalled.textContent = `v${s.currentVersion}`;
-  const presentation = appUpdatePresentationApi.appUpdateStatusPresentation(s);
-  const displayVersion = presentation.displayVersion;
-  if (displayVersion) {
-    const status = presentation.latestStatusKey ? t(presentation.latestStatusKey) : '';
-    els.appUpdateLatest.textContent = status
-      ? t('settings.appUpdate.latestWithStatus', { version: displayVersion, status })
-      : `v${displayVersion}`;
-    const actionMode = appUpdatePresentationApi.appUpdateActionMode(s);
-    els.appUpdateViewReleaseButton.classList.toggle('hidden', !actionMode);
-    els.appUpdateViewReleaseButton.disabled = Boolean(s.installBusy);
-    els.appUpdateViewReleaseButton.textContent = actionMode === 'install'
-      ? t('settings.appUpdate.restart')
-      : actionMode === 'download'
-        ? t('settings.appUpdate.download')
-        : t('settings.appUpdate.viewRelease');
-  } else {
-    els.appUpdateLatest.textContent = s.lastError
-      ? t('settings.appUpdate.unavailable')
-      : s.lastCheckedAt
-        ? t('settings.appUpdate.upToDate')
-        : t('settings.common.notChecked');
-    els.appUpdateViewReleaseButton.classList.add('hidden');
-  }
-  // installRetryBlocked as well as busy: the main process stops running checks once
-  // an attempt is spent, so without this the button would sit live and do nothing.
-  // It is not folded into installBusy, which would disable View release along with
-  // it and take away the one path a spent attempt leaves working.
-  els.appUpdateCheckButton.disabled = Boolean(s.checking || s.installBusy || s.installRetryBlocked);
-  els.appUpdateCheckButton.textContent = s.checking ? t('settings.appUpdate.checking') : t('settings.appUpdate.check');
-  renderAppUpdateNotes(s);
-  if (s.installPhase === 'downloading') {
-    const percent = Number.isFinite(s.installProgress) ? Math.round(s.installProgress) : 0;
-    els.appUpdateMessage.textContent = t('settings.appUpdate.downloading', { percent });
-    els.appUpdateMessage.classList.remove('error');
-  } else if (s.installStarting) {
-    els.appUpdateMessage.textContent = t('settings.appUpdate.installStarting');
-    els.appUpdateMessage.classList.remove('error');
-  } else if (s.downloaded) {
-    els.appUpdateMessage.textContent = t('settings.appUpdate.ready');
-    els.appUpdateMessage.classList.remove('error');
-  } else if (s.installError) {
-    els.appUpdateMessage.textContent = t(appUpdatePresentationApi.appUpdateInstallErrorMessageKey(s.installErrorKind));
-    els.appUpdateMessage.classList.add('error');
-  } else if (s.lastError) {
-    const error = t(presentation.errorKey);
-    const age = compactAge(presentation.lastSuccessfulCheckAt);
-    els.appUpdateMessage.textContent = age
-      ? t('settings.appUpdate.errorWithLastSuccess', { error, age })
-      : error;
-    els.appUpdateMessage.classList.add('error');
-  } else {
-    els.appUpdateMessage.textContent = '';
-    els.appUpdateMessage.classList.remove('error');
-  }
-}
-
-function renderAutomaticAppUpdateControl() {
-  if (!els.automaticAppUpdatesInput) return;
-  const control = appUpdatePresentationApi.automaticAppUpdateControlState({
-    preferenceEnabled: state.settings?.automaticAppUpdates,
-    updateState: state.appUpdate
-  });
-  els.automaticAppUpdatesInput.checked = control.checked;
-  els.automaticAppUpdatesInput.disabled = control.disabled;
-  els.automaticAppUpdatesRow?.classList.toggle('is-disabled', control.unavailable);
-  if (els.automaticAppUpdatesNote) {
-    els.automaticAppUpdatesNote.textContent = t(control.descriptionKey);
-  }
 }
 
 function compactAge(value) {
@@ -8601,7 +8357,6 @@ function syncSettingsForm() {
   }
   if (els.wslScanInput) els.wslScanInput.checked = state.settings.wslScanEnabled !== false;
   if (els.sessionUsageArchiveInput) els.sessionUsageArchiveInput.checked = state.settings.sessionUsageArchiveEnabled !== false;
-  renderAutomaticAppUpdateControl();
   renderSessionUsageArchiveStatus();
   const exportAutoOn = Boolean(state.settings.exportAutoEnabled);
   const exportDir = state.settings.exportDir || '';
@@ -8694,7 +8449,6 @@ function syncSettingsForm() {
   applyAppearanceSettings(state.settings);
   buildAppearanceColorControls();
   renderTokscaleStatus();
-  renderSettingsAppUpdateRow();
   renderCodexAccounts();
   renderCustomPricing();
   renderCursorStatus();
@@ -11036,16 +10790,6 @@ async function init() {
   applyEffectiveCurrencyRates();
   deliverTrayProviderIcons();
 
-  state.appUpdate = await window.tokenMonitor.getAppUpdateState();
-  renderAppUpdatePill();
-  renderSettingsAppUpdateRow();
-  window.tokenMonitor.onAppUpdatePush?.((payload) => {
-    state.appUpdate = payload;
-    renderAppUpdatePill();
-    renderSettingsAppUpdateRow();
-    renderAutomaticAppUpdateControl();
-    if (els.appUpdatePopover.matches(':popover-open')) renderAppUpdatePopover(payload);
-  });
   if (state.appInfo?.loginItemSupported) {
     state.settings.startAtLogin = Boolean(state.appInfo.loginItemOpenAtLogin);
   }
@@ -11494,7 +11238,6 @@ function setupSettingsAccordion(group, toggle, details) {
   setSettingsAccordionExpanded(group, toggle, details, false);
 }
 
-setupSettingsAccordion(els.appUpdateNotes, els.appUpdateNotesToggle, els.appUpdateNotesDetails);
 setupSettingsAccordion(els.advancedSettingsGroup, els.advancedSettingsToggle, els.advancedSettingsDetails);
 setupSettingsAccordion(els.themeAdvancedGroup, els.themeAdvancedToggle, els.themeAdvancedDetails);
 setupSettingsAccordion(els.themeVendorGroup, els.themeVendorToggle, els.themeVendorDetails);
@@ -11577,7 +11320,6 @@ els.showTrayProviderBadgeInput.addEventListener('change', () => {
 els.windowToggleShortcutValue?.addEventListener('click', startWindowShortcutRecording);
 els.windowToggleShortcutClearButton?.addEventListener('click', () => setWindowToggleShortcut('').catch(() => {}));
 els.startAtLoginInput?.addEventListener('change', () => saveSettings({ startAtLogin: els.startAtLoginInput.checked }));
-els.automaticAppUpdatesInput?.addEventListener('change', () => saveSettings({ automaticAppUpdates: els.automaticAppUpdatesInput.checked }));
 els.glassInput.addEventListener('change', saveAppearanceFromControls);
 els.blurInput.addEventListener('change', saveAppearanceFromControls);
 els.zoomInput.addEventListener('change', saveAppearanceFromControls);
@@ -11625,96 +11367,6 @@ els.floatingBubbleTab.addEventListener('keydown', (event) => {
   if (event.key !== 'Enter' && event.key !== ' ') return;
   event.preventDefault();
   window.tokenMonitor.expandFloatingBubble?.();
-});
-
-async function runAppUpdateAction() {
-  const mode = appUpdatePresentationApi.appUpdateActionMode(state.appUpdate);
-  if (mode === 'install') {
-    state.appUpdate = await window.tokenMonitor.installAppUpdate();
-  } else if (mode === 'download') {
-    state.appUpdate = await window.tokenMonitor.downloadAppUpdate();
-  } else if (mode === 'release') {
-    const latest = state.appUpdate?.latest;
-    if (!latest?.htmlUrl) return;
-    await window.tokenMonitor.openExternal(latest.htmlUrl);
-  } else {
-    return;
-  }
-  renderAppUpdatePill();
-  renderSettingsAppUpdateRow();
-}
-
-els.appUpdatePillAction.addEventListener('click', async () => {
-  if (!renderAppUpdatePopover(state.appUpdate) || typeof els.appUpdatePopover.showPopover !== 'function') {
-    if (appUpdatePresentationApi.appUpdateActionMode(state.appUpdate) === 'install') {
-      const url = state.appUpdate?.latest?.htmlUrl;
-      if (url) await window.tokenMonitor.openExternal(url);
-      return;
-    }
-    await runAppUpdateAction();
-    return;
-  }
-  positionAppUpdatePopover();
-  els.appUpdatePopover.showPopover();
-  els.appUpdatePopoverAction.focus();
-});
-
-els.appUpdatePillRestart.addEventListener('click', async () => {
-  await runAppUpdateAction();
-});
-
-els.appUpdatePillDismiss.addEventListener('click', async () => {
-  const version = state.appUpdate?.latest?.version;
-  if (!version) return;
-  state.appUpdate = await window.tokenMonitor.dismissAppUpdate(version);
-  if (els.appUpdatePopover.matches(':popover-open')) els.appUpdatePopover.hidePopover();
-  renderAppUpdatePill();
-});
-
-els.appUpdatePopoverClose.addEventListener('click', () => {
-  els.appUpdatePopover.hidePopover();
-});
-
-els.appUpdatePopover.addEventListener('toggle', (event) => {
-  const open = event.newState === 'open';
-  if (els.appUpdatePillAction.hasAttribute('aria-haspopup')) {
-    els.appUpdatePillAction.setAttribute('aria-expanded', String(open));
-  }
-  if (!open) {
-    const active = document.activeElement;
-    if (active === document.body || active === els.appUpdatePopover || els.appUpdatePopover.contains(active)) {
-      els.appUpdatePillAction.focus();
-    }
-  }
-});
-
-els.appUpdatePopoverAction.addEventListener('click', async () => {
-  els.appUpdatePopover.hidePopover();
-  await runAppUpdateAction();
-});
-
-els.appUpdatePopoverRelease.addEventListener('click', async () => {
-  const url = state.appUpdate?.latest?.htmlUrl;
-  if (url) await window.tokenMonitor.openExternal(url);
-});
-
-window.addEventListener('resize', () => {
-  if (els.appUpdatePopover.matches(':popover-open')) positionAppUpdatePopover();
-});
-
-els.appUpdateCheckButton.addEventListener('click', async () => {
-  state.appUpdate = await window.tokenMonitor.checkAppUpdateNow();
-  renderAppUpdatePill();
-  renderSettingsAppUpdateRow();
-});
-
-els.appUpdateViewReleaseButton.addEventListener('click', async () => {
-  await runAppUpdateAction();
-});
-
-els.appUpdateReleaseNotesButton.addEventListener('click', async () => {
-  const url = state.appUpdate?.latest?.htmlUrl;
-  if (url) await window.tokenMonitor.openExternal(url);
 });
 
 window.tokenMonitor.onSettingsPush?.((next) => {

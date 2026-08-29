@@ -35,7 +35,6 @@ test('General settings keeps Tokscale inside a collapsed Advanced disclosure', (
   assert.match(advanced, /<div id="advancedSettingsDetails" class="advanced-settings-details hidden" inert>/);
   assert.match(advanced, /id="advancedSettingsSummary"[\s\S]*settings\.advanced\.summary/);
   assert.ok(advanced.indexOf('id="tokscaleGroup"') < advanced.indexOf('id="openConfigButton"'));
-  assert.ok(general.indexOf('settings.appUpdate.title') < start);
   assert.ok(end < general.indexOf('settings.about.title'));
 });
 
@@ -49,12 +48,10 @@ test('General settings explains Discord presence and identifies Tokscale as an n
   assert.doesNotMatch(i18n, /'settings\.tokscale\.source': '[^']*(?:Data engine|資料引擎|数据引擎|데이터 엔진|データエンジン)/);
 });
 
-test('General settings places integrations after the complete App Updates group', () => {
+test('General settings places integrations before the advanced group', () => {
   const html = read('index.html');
   const general = html.match(/<div id="generalSettingsDetails"[\s\S]*?<div id="mainSettingsDetails"/)?.[0] || '';
 
-  assert.ok(general.indexOf('id="startupGroup"') < general.indexOf('id="automaticAppUpdatesRow"'));
-  assert.ok(general.indexOf('id="appUpdateMessage"') < general.indexOf('id="discordRpcInput"'));
   assert.ok(general.indexOf('id="discordRpcInput"') < general.indexOf('id="advancedSettingsGroup"'));
 });
 

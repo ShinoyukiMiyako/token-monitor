@@ -55,7 +55,4 @@ test('before-quit hands over without taking the quit away from the OS', () => {
   // preventDefault would cancel an OS-initiated logout or restart on macOS, and
   // a synchronous performQuit gives it nothing to buy.
   assert.doesNotMatch(handler, /preventDefault/);
-  // electron-updater owns the restart, so that one route has to opt out.
-  assert.match(handler, /if \(skipForcedQuit\) return;/);
-  assert.match(main, /skipForcedQuit = true;/);
 });

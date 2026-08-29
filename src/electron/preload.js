@@ -95,11 +95,6 @@ contextBridge.exposeInMainWorld('tokenMonitor', {
   checkTokscaleNpm: () => ipcRenderer.invoke('tokscale:checkNpm'),
   downloadTokscaleFromNpm: () => ipcRenderer.invoke('tokscale:downloadFromNpm'),
   resetTokscaleToBundled: () => ipcRenderer.invoke('tokscale:resetToBundled'),
-  getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),
-  checkAppUpdateNow: () => ipcRenderer.invoke('appUpdate:checkNow'),
-  downloadAppUpdate: () => ipcRenderer.invoke('appUpdate:download'),
-  installAppUpdate: () => ipcRenderer.invoke('appUpdate:install'),
-  dismissAppUpdate: (version) => ipcRenderer.invoke('appUpdate:dismiss', version),
   expandFloatingBubble: () => ipcRenderer.invoke('floatingBubble:expand'),
   moveFloatingBubble: (delta) => ipcRenderer.invoke('floatingBubble:move', delta),
   signalContentReady: () => ipcRenderer.send('window:contentReady'),
@@ -111,11 +106,6 @@ contextBridge.exposeInMainWorld('tokenMonitor', {
     const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
     ipcRenderer.on('floatingBubble:state', listener);
     return () => ipcRenderer.removeListener('floatingBubble:state', listener);
-  },
-  onAppUpdatePush: (callback) => {
-    const listener = (_event, payload) => { try { callback(payload); } catch (_) {} };
-    ipcRenderer.on('appUpdate:push', listener);
-    return () => ipcRenderer.removeListener('appUpdate:push', listener);
   },
   setTrayIcons: (icons) => ipcRenderer.invoke('tray:setIcons', icons),
   cursor: {

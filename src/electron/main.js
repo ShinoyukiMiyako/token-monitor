@@ -5,7 +5,6 @@ const crypto = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, nativeImage, nativeTheme, net, Notification, screen, session, shell } = require('electron');
-const { autoUpdater } = require('electron-updater');
 const { defaultDeviceId, generateHubSecret, lanIpv4Addresses, loadDotEnv, pidFilePath, readJson, sharedDataDir } = require('../shared/config');
 const {
   CredentialStore,
@@ -123,21 +122,6 @@ const {
   getTokscaleStatus,
   resetToBundled
 } = require('../shared/tokscaleUpdater');
-const {
-  appUpdateInstallSupport,
-  classifyAppUpdateError,
-  checkLatestRelease,
-  deriveAppUpdateAvailability,
-  downloadedAppUpdateMatchesLatest,
-  installFailureErrorKind,
-  latestFromUpdaterInfo,
-  mergeLatestReleaseMetadata,
-  providerUpdateCheckAvailability,
-  resolveAppUpdateCheckError,
-  shouldDownloadAutomaticAppUpdate,
-  shouldSkipAppUpdateCheck,
-  updateInstallQuitPolicy
-} = require('../shared/appUpdater');
 const cursorAuth = require('../shared/cursorAuth');
 const cursorProbe = require('../shared/cursorProbe');
 const opencodeWeb = require('../shared/opencodeWeb');
@@ -263,7 +247,6 @@ const {
   trayToggleAction
 } = require('./trayModeSettings');
 const { SERVICE_STATUS_PROVIDERS, createServiceStatusClient } = require('./serviceStatus');
-const { createUpdateInstallQuitGuard, observeUpdateInstallHandoff } = require('./updateInstallQuit');
 const { classifyStreamFailure } = require('./syncConnection');
 const {
   attachLocalNativeViews,
@@ -536,7 +519,6 @@ function defaultSettings() {
     currency: normalizeCurrency(process.env.TOKEN_MONITOR_CURRENCY || 'USD'),
     currencyRates: {},
     startAtLogin: false,
-    automaticAppUpdates: false,
     language: 'auto',
     claudeWebCookie: '',
     opencodeCookie: '',
@@ -568,11 +550,6 @@ function defaultSettings() {
     ollamaCookie: '',
     codexManagedAccounts: [],
     mimoManagedAccounts: [],
-    appUpdate: {
-      lastCheckedAt: null,
-      lastKnownLatest: null,
-      dismissedVersion: null
-    }
   };
 }
 
@@ -2195,7 +2172,6 @@ function readSettings() {
     merged.opencodeLocalLimitsEnabled = parseBoolean(merged.opencodeLocalLimitsEnabled, false);
     delete merged.workbuddyLocalAppEnabled;
     merged.windowMaximized = parseBoolean(merged.windowMaximized, false);
-    merged.automaticAppUpdates = parseBoolean(merged.automaticAppUpdates, false);
     if (saved.homeLimitProviderOrder !== undefined) {
       merged.homeLimitProviderOrder = migrateHomeLimitProviderOrder(saved.homeLimitProviderOrder);
     }
@@ -5075,44 +5051,6 @@ function stopAll() {
 
 let quitRequested = false;
 let quitInProgress = false;
-// Owned by the update-install guard below and by nothing else: electron-updater
-// restarts the process itself, so the exit has to stand down or the install
-// never runs.
-let skipForcedQuit = false;
-
-// An install request stands the forced exit down, and quitAndInstall() never
-// reports back whether the installer actually took over. The guard owns that
-// unconfirmed window; these two flags are all it touches here. See
-// updateInstallQuit.js for why the claim expires and what promotes it.
-// Set once the hand-off listener is actually attached; see the guard's watchdog.
-let updateHandoffObserved = false;
-
-const updateInstallQuit = createUpdateInstallQuitGuard({
-  ...updateInstallQuitPolicy(),
-  watchdogEnabled: () => updateHandoffObserved,
-  claim: () => { quitRequested = true; skipForcedQuit = true; },
-  release: () => { quitRequested = false; skipForcedQuit = false; },
-  onStalled: () => {
-    // The bound is far enough out that reaching it means the install genuinely
-    // stalled, which is exactly what the user is looking at: they pressed Install
-    // and the app neither restarted nor complained. What to do about it depends on
-    // whether the attempt survived: where the guard handed it back the update is
-    // still one press away, and only where it did not is a restart the way out.
-    setNativeAppUpdateState({
-      phase: 'error',
-      progress: null,
-      error: 'Update installer did not start',
-      errorKind: installFailureErrorKind({ spent: updateInstallQuit.isSpent(), stalled: true })
-    });
-  },
-  onHandoff: (afterStalledReport) => {
-    // The bound is a decision to stop waiting, not proof the installer is dead, so
-    // a hand-off that turns up later withdraws the report rather than leaving the
-    // app advising a restart it is about to perform itself.
-    if (!afterStalledReport) return;
-    setNativeAppUpdateState({ phase: 'downloaded', progress: 100, error: null });
-  }
-});
 
 // The single quit path. Teardown above is what used to hang, so it runs
 // synchronously and cheaply, and then app.exit() ends the process without
@@ -5299,419 +5237,6 @@ async function downloadTokscaleFromNpm() {
   } finally {
     tokScaleUpdaterBusy = false;
   }
-}
-
-let appUpdateCheckInFlight = false;
-let appUpdateCheckPromise = null;
-let appUpdateLastError = null;
-let appUpdateLastAttemptAt = null;
-let appUpdateBackgroundTimer = null;
-let appUpdateNativeBusy = false;
-let appUpdateNativeConfigured = false;
-let appUpdateNativeState = {
-  phase: 'idle',
-  version: null,
-  progress: null,
-  error: null,
-  errorKind: null
-};
-
-function rememberSuccessfulAppUpdateCheck(latest, checkedAt = new Date().toISOString(), { clearLatest = false } = {}) {
-  if (!latest && !clearLatest) return null;
-  const remembered = latest
-    ? mergeLatestReleaseMetadata(settings?.appUpdate?.lastKnownLatest, latest)
-    : null;
-  settings.appUpdate = {
-    ...(settings.appUpdate || {}),
-    lastCheckedAt: checkedAt,
-    lastKnownLatest: remembered
-  };
-  saveSettings();
-  appUpdateLastAttemptAt = checkedAt;
-  appUpdateLastError = null;
-  return remembered;
-}
-
-function setNativeAppUpdateState(patch = {}) {
-  const next = { ...appUpdateNativeState, ...patch };
-  // A kind belongs to the error it arrived with and must never outlive it, so any
-  // patch that touches `error` without naming one clears it. That keeps the
-  // ordinary updater failures generic without every call site restating it.
-  if ('error' in patch && !('errorKind' in patch)) next.errorKind = null;
-  appUpdateNativeState = next;
-  sendAppUpdatePush();
-}
-
-function configureNativeAppUpdater() {
-  if (appUpdateNativeConfigured) return;
-  appUpdateNativeConfigured = true;
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = false;
-  autoUpdater.logger = console;
-  autoUpdater.on('download-progress', (progress) => {
-    setNativeAppUpdateState({
-      phase: 'downloading',
-      progress: Number.isFinite(progress?.percent) ? Math.max(0, Math.min(100, progress.percent)) : null,
-      error: null
-    });
-  });
-  autoUpdater.on('update-downloaded', (info) => {
-    appUpdateNativeBusy = false;
-    const latest = latestFromUpdaterInfo(info);
-    setNativeAppUpdateState({ phase: 'downloaded', version: latest?.version || info?.version || appUpdateNativeState.version || null, progress: 100, error: null });
-  });
-  // The hand-off is emitted on Electron's own autoUpdater, not electron-updater's:
-  // BaseUpdater re-emits it there to mimic what Squirrel does natively. Losing it
-  // is not merely losing a confirmation, so the flag records a verified
-  // registration and nothing weaker: without the listener nothing could re-claim
-  // the flags after the grace period, and the guard would expire into a state a
-  // late hand-off could not recover from. It stops arming the watchdog instead.
-  try {
-    updateHandoffObserved = observeUpdateInstallHandoff(
-      require('electron').autoUpdater,
-      () => updateInstallQuit.noteHandoff()
-    );
-  } catch (error) {
-    updateHandoffObserved = false;
-    console.log(`[update] cannot observe the install hand-off: ${error?.message || error}`);
-  }
-  if (!updateHandoffObserved) console.log('[update] no install hand-off signal; quit recovery disabled');
-  autoUpdater.on('error', (error) => {
-    // Released before the busy guard below, deliberately: update-downloaded has
-    // already cleared appUpdateNativeBusy by the time an install can fail, so a
-    // rollback behind that guard would never run and the quit flags would stay
-    // stuck for the rest of the session.
-    const wasInstalling = updateInstallQuit.abort();
-    // Availability checks use the same provider but report through
-    // appUpdateLastError. Only a real download or install attempt owns installError.
-    if (!appUpdateNativeBusy && !wasInstalling) return;
-    appUpdateNativeBusy = false;
-    setNativeAppUpdateState({
-      phase: 'error',
-      progress: null,
-      error: error?.message || String(error || 'Update failed'),
-      // Where the attempt was single-use, a failed install also closed the in-app
-      // path: the controls below now offer the release page instead of a retry, and
-      // a generic "couldn't install" leaves that looking like the end of the road.
-      // A restart is what brings the retry back, so the message has to say so.
-      // `wasInstalling` is the part the helper cannot know: without it a check
-      // failure arriving after an earlier spent attempt borrows its explanation.
-      errorKind: wasInstalling
-        ? installFailureErrorKind({ spent: updateInstallQuit.isSpent() })
-        : null
-    });
-  });
-}
-
-async function checkAppUpdateProvider() {
-  if (!app.isPackaged) return checkLatestRelease(app.getVersion());
-  const checkedAt = new Date().toISOString();
-  configureNativeAppUpdater();
-  const result = await autoUpdater.checkForUpdates();
-  const availability = providerUpdateCheckAvailability(result, app.getVersion());
-  if (!availability.valid) {
-    return {
-      ok: false,
-      newer: false,
-      latest: null,
-      error: 'Update metadata missing or invalid',
-      errorKind: 'metadata',
-      checkedAt
-    };
-  }
-  return {
-    ok: true,
-    newer: availability.newer,
-    latest: availability.latest,
-    clearLatest: availability.clearLatest,
-    error: null,
-    errorKind: null,
-    checkedAt
-  };
-}
-
-function deriveAppUpdateState() {
-  const block = settings?.appUpdate || {};
-  const currentVersion = app.getVersion();
-  const latest = block.lastKnownLatest || null;
-  const dismissedVersion = block.dismissedVersion || null;
-  const installSupport = appUpdateInstallSupport({ isPackaged: app.isPackaged, platform: process.platform, env: process.env });
-  const availability = deriveAppUpdateAvailability({
-    currentVersion,
-    latest,
-    dismissedVersion,
-    phase: appUpdateNativeState.phase,
-    downloadedVersion: appUpdateNativeState.version
-  });
-  return {
-    currentVersion,
-    latest,
-    hasUpdate: availability.hasUpdate,
-    showUpdateNotice: availability.showUpdateNotice,
-    dismissedVersion,
-    lastCheckedAt: block.lastCheckedAt || null,
-    lastAttemptAt: appUpdateLastAttemptAt,
-    checking: appUpdateCheckInFlight,
-    lastError: appUpdateLastError?.message || null,
-    lastErrorKind: appUpdateLastError?.kind || null,
-    installSupported: installSupport.supported,
-    installSupportReason: installSupport.reason,
-    installPhase: appUpdateNativeState.phase,
-    installProgress: appUpdateNativeState.progress,
-    installVersion: appUpdateNativeState.version,
-    installError: appUpdateNativeState.error,
-    installErrorKind: appUpdateNativeState.errorKind || null,
-    downloaded: availability.downloaded,
-    // The hand-off window, straight from the state machine rather than inferred
-    // from a pair of booleans downstream: between the press and the installer
-    // taking over there is nothing else to tell the user.
-    installStarting: updateInstallQuit.isInstalling(),
-    // No further attempt is possible until a restart, so the action policy and the
-    // automatic downloader both have to stop offering one.
-    installRetryBlocked: updateInstallQuit.isSpent(),
-    // An install the guard is still trying to complete counts as busy: on macOS
-    // Squirrel can take tens of seconds, and leaving the control live for that long
-    // invites a second press the guard can only refuse.
-    installBusy: appUpdateNativeBusy
-      || updateInstallQuit.isInstalling()
-      || appUpdateNativeState.phase === 'checking'
-      || appUpdateNativeState.phase === 'downloading'
-  };
-}
-
-function restoreDismissedAppUpdate(version) {
-  const block = settings?.appUpdate || {};
-  if (!version || block.dismissedVersion !== version) return false;
-  settings.appUpdate = {
-    ...block,
-    dismissedVersion: null
-  };
-  saveSettings();
-  return true;
-}
-
-function sendAppUpdatePush() {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send('appUpdate:push', deriveAppUpdateState());
-}
-
-async function runAppUpdateCheck({ force = false, bypassCooldown = false } = {}) {
-  // An outstanding install owns the updater until the guard is idle again.
-  // electron-updater reports a failed check by emitting on the same global 'error'
-  // event an install failure arrives on -- checkForUpdates() emits there and
-  // rethrows -- and the handler below has nothing to tell them apart. Treating a
-  // check's failure as the install's would tear down the install, which is what the
-  // hourly check made an ordinary overlap on macOS, where an install is outstanding
-  // for as long as minutes.
-  //
-  // `isOutstanding` rather than `isInstalling`, so this covers a spent attempt too.
-  // Spent is not terminal: the bound is only where we stopped waiting, and a late
-  // hand-off still promotes it back to `handoff` and re-claims the flags. A check
-  // allowed to start in the meantime would then be in flight during a genuine
-  // hand-off, and its failure would release `skipForcedQuit` with the installer
-  // owning the exit -- the one outcome this whole path exists to prevent. Checking
-  // is worth less than that: after a spent attempt it can only find a version this
-  // process is already refusing to download.
-  if (updateInstallQuit.isOutstanding()) return deriveAppUpdateState();
-  if (appUpdateCheckPromise) {
-    if (force) sendAppUpdatePush();
-    const activeResult = await appUpdateCheckPromise;
-    if (force) {
-      appUpdateLastAttemptAt = activeResult?.checkedAt || new Date().toISOString();
-      appUpdateLastError = resolveAppUpdateCheckError(appUpdateLastError, activeResult, { force: true });
-      if (activeResult?.ok) {
-        if (activeResult.newer) restoreDismissedAppUpdate(activeResult.latest?.version);
-      }
-      sendAppUpdatePush();
-    }
-    return maybeDownloadAutomaticAppUpdate(deriveAppUpdateState());
-  }
-  const block = settings?.appUpdate || {};
-  if (!bypassCooldown && shouldSkipAppUpdateCheck({
-    force,
-    lastCheckedAt: block.lastCheckedAt,
-    latest: block.lastKnownLatest,
-    dismissedVersion: block.dismissedVersion,
-    currentVersion: app.getVersion()
-  })) {
-    return maybeDownloadAutomaticAppUpdate(deriveAppUpdateState());
-  }
-  const checkTask = (async () => {
-    appUpdateCheckInFlight = true;
-    appUpdateLastAttemptAt = new Date().toISOString();
-    if (force) sendAppUpdatePush();
-    let result;
-    try {
-      result = await checkAppUpdateProvider();
-      appUpdateLastAttemptAt = result.checkedAt || appUpdateLastAttemptAt;
-      if (result.ok) {
-        rememberSuccessfulAppUpdateCheck(result.latest, result.checkedAt, { clearLatest: result.clearLatest });
-        if (force && result.newer) restoreDismissedAppUpdate(result.latest?.version);
-      } else {
-        appUpdateLastError = resolveAppUpdateCheckError(appUpdateLastError, result, { force });
-        if (!force) console.warn('App update check failed:', result.error);
-      }
-    } catch (error) {
-      const classified = classifyAppUpdateError(error);
-      appUpdateLastError = resolveAppUpdateCheckError(appUpdateLastError, {
-        ok: false,
-        error: classified.message,
-        errorKind: classified.kind
-      }, { force });
-      if (!force) console.warn('App update check threw:', error);
-      return {
-        ok: false,
-        newer: false,
-        latest: null,
-        error: classified.message,
-        errorKind: classified.kind,
-        checkedAt: appUpdateLastAttemptAt
-      };
-    } finally {
-      appUpdateCheckInFlight = false;
-      sendAppUpdatePush();
-    }
-    return result;
-  })();
-  appUpdateCheckPromise = checkTask;
-  try {
-    await checkTask;
-  } finally {
-    if (appUpdateCheckPromise === checkTask) appUpdateCheckPromise = null;
-  }
-  return maybeDownloadAutomaticAppUpdate(deriveAppUpdateState());
-}
-
-async function maybeDownloadAutomaticAppUpdate(updateState) {
-  if (!shouldDownloadAutomaticAppUpdate({
-    automaticAppUpdates: settings?.automaticAppUpdates,
-    updateState
-  })) return updateState;
-  return downloadAndPrepareAppUpdate();
-}
-
-function maybeRunBackgroundUpdateCheck() {
-  runAppUpdateCheck({ force: false }).catch(() => {});
-}
-
-function startAppUpdateBackgroundChecks() {
-  if (appUpdateBackgroundTimer) return;
-  appUpdateBackgroundTimer = setInterval(maybeRunBackgroundUpdateCheck, 60 * 60 * 1000);
-  appUpdateBackgroundTimer.unref?.();
-}
-
-function dismissAppUpdateVersion(version) {
-  if (typeof version !== 'string' || !version) return deriveAppUpdateState();
-  settings.appUpdate = {
-    ...(settings.appUpdate || {}),
-    dismissedVersion: version
-  };
-  saveSettings();
-  sendAppUpdatePush();
-  return deriveAppUpdateState();
-}
-
-async function downloadAndPrepareAppUpdate() {
-  const support = appUpdateInstallSupport({ isPackaged: app.isPackaged, platform: process.platform, env: process.env });
-  if (!support.supported) {
-    setNativeAppUpdateState({ phase: 'error', error: support.reason || 'unsupported-platform', progress: null });
-    return deriveAppUpdateState();
-  }
-  // Same ownership rule as the check path, and one more: a spent attempt can never
-  // be installed by this process either, so re-entering the download lifecycle
-  // rebuilds MacUpdater's local proxy while the listener the first quitAndInstall()
-  // attached is still on the native updater. The renderer stops offering this and
-  // the automatic downloader stands down, but neither of those is the boundary --
-  // this is, and an IPC action queued before the attempt ended still arrives here.
-  //
-  // Every entry point uses the same rule, for the same reason (see
-  // runAppUpdateCheck): while the guard holds anything, nothing else drives the
-  // updater.
-  if (updateInstallQuit.isOutstanding()) return deriveAppUpdateState();
-  if (appUpdateCheckPromise) await appUpdateCheckPromise;
-  if (appUpdateNativeBusy) return deriveAppUpdateState();
-  const latest = settings?.appUpdate?.lastKnownLatest || null;
-  if (downloadedAppUpdateMatchesLatest({
-    phase: appUpdateNativeState.phase,
-    downloadedVersion: appUpdateNativeState.version,
-    latest
-  })) return deriveAppUpdateState();
-  configureNativeAppUpdater();
-  appUpdateNativeBusy = true;
-  setNativeAppUpdateState({ phase: 'checking', progress: null, error: null });
-  try {
-    const result = await autoUpdater.checkForUpdates();
-    const availability = providerUpdateCheckAvailability(result, app.getVersion());
-    if (!availability.valid) throw new Error('Update metadata missing or invalid');
-    const checkedAt = new Date().toISOString();
-    const latestFromCheck = rememberSuccessfulAppUpdateCheck(
-      availability.latest,
-      checkedAt,
-      { clearLatest: availability.clearLatest }
-    );
-    const version = latestFromCheck?.version || null;
-    if (!availability.newer || !version) {
-      appUpdateNativeBusy = false;
-      setNativeAppUpdateState({ phase: 'idle', version, progress: null, error: null });
-      return deriveAppUpdateState();
-    }
-    restoreDismissedAppUpdate(version);
-    setNativeAppUpdateState({ phase: 'downloading', version, progress: 0, error: null });
-    await autoUpdater.downloadUpdate();
-  } catch (error) {
-    appUpdateNativeBusy = false;
-    setNativeAppUpdateState({ phase: 'error', progress: null, error: error?.message || String(error) });
-  }
-  return deriveAppUpdateState();
-}
-
-async function installDownloadedAppUpdate() {
-  // The other half of the same rule. Refusing new operations during the install
-  // only holds the boundary if nothing was already running when it started, and a
-  // check begun a moment earlier would still be reporting on the shared event.
-  // Waiting rather than refusing, since this one is a button press: the checks
-  // below are read afterwards, when the update it is about to install is settled.
-  if (appUpdateCheckPromise) await appUpdateCheckPromise;
-  const latest = settings?.appUpdate?.lastKnownLatest || null;
-  if (!downloadedAppUpdateMatchesLatest({
-    phase: appUpdateNativeState.phase,
-    downloadedVersion: appUpdateNativeState.version,
-    latest
-  })) return deriveAppUpdateState();
-  // quitAndInstall goes through before-quit, and electron-updater owns the
-  // restart from there. Stand the forced exit down or the installer never runs.
-  // Refused while an earlier request is still outstanding, and permanently once an
-  // attempt is spent, so a second press can never stack install attempts.
-  if (!updateInstallQuit.request()) {
-    // Say so rather than leave a button that quietly does nothing: a spent attempt
-    // cannot be retried in this process at all.
-    if (updateInstallQuit.phase() === 'spent') {
-      setNativeAppUpdateState({
-        phase: 'error',
-        progress: null,
-        error: 'Update install was already attempted',
-        errorKind: 'attempt-spent'
-      });
-    }
-    return deriveAppUpdateState();
-  }
-  try {
-    // isSilent: skip the NSIS installer UI on Windows so the update feels seamless
-    // (per-user install needs no elevation); isForceRunAfter relaunches the app.
-    autoUpdater.quitAndInstall(true, true);
-  } catch (error) {
-    // The abort above ended the attempt this call had just made, so unlike the
-    // updater's own error handler there is nothing else this failure could belong
-    // to, and the same recovery applies.
-    updateInstallQuit.abort();
-    setNativeAppUpdateState({
-      phase: 'error',
-      progress: null,
-      error: error?.message || String(error || 'Update failed'),
-      errorKind: installFailureErrorKind({ spent: updateInstallQuit.isSpent() })
-    });
-  }
-  return deriveAppUpdateState();
 }
 
 function isAllowedExternalUrl(value) {
@@ -6221,7 +5746,6 @@ app.whenReady().then(() => {
     const previousCompactTokenUnits = settings.compactTokenUnits;
     const previousLanguage = settings.language;
     const previousStartAtLogin = settings.startAtLogin;
-    const previousAutomaticAppUpdates = settings.automaticAppUpdates;
     const previousCustomModelPricing = JSON.stringify(settings.customModelPricing || []);
     const normalizedCurrency = patch.currency !== undefined ? normalizeCurrency(patch.currency, settings.currency) : normalizeCurrency(settings.currency);
     const normalizedPatch = { ...patch, currency: normalizedCurrency };
@@ -6379,7 +5903,6 @@ app.whenReady().then(() => {
       currencyRates: patch.currencyRates !== undefined ? normalizeCurrencyOverrides(patch.currencyRates) : normalizeCurrencyOverrides(settings.currencyRates),
       language: patch.language !== undefined ? normalizeLanguageSetting(patch.language, settings.language) : normalizeLanguageSetting(settings.language),
       startAtLogin: loginItemEnabledHere() ? parseBoolean(patch.startAtLogin ?? settings.startAtLogin, false) : false,
-      automaticAppUpdates: parseBoolean(patch.automaticAppUpdates ?? settings.automaticAppUpdates, false),
       claudeWebCookie: patch.claudeWebCookie !== undefined
         ? normalizeClaudeWebCookie(patch.claudeWebCookie)
         : (settings.claudeWebCookie || ''),
@@ -6425,9 +5948,6 @@ app.whenReady().then(() => {
     if (settings.startAtLogin !== previousStartAtLogin) {
       settings.startAtLogin = applyLoginItem(settings.startAtLogin);
       saveSettings({ throwOnError: true });
-    }
-    if (settings.automaticAppUpdates && !previousAutomaticAppUpdates) {
-      runAppUpdateCheck({ bypassCooldown: true }).catch(() => {});
     }
     if (patch.zoomFactor !== undefined) applyZoomFactor();
     if (settings.discordRpcEnabled && !previousDiscordRpcEnabled) {
@@ -6751,11 +6271,6 @@ app.whenReady().then(() => {
     sendTokscalePush({ type: 'reset', status });
     return status;
   });
-  ipcMain.handle('appUpdate:getState', () => deriveAppUpdateState());
-  ipcMain.handle('appUpdate:checkNow', () => runAppUpdateCheck({ force: true }));
-  ipcMain.handle('appUpdate:download', () => downloadAndPrepareAppUpdate());
-  ipcMain.handle('appUpdate:install', () => installDownloadedAppUpdate());
-  ipcMain.handle('appUpdate:dismiss', (_event, version) => dismissAppUpdateVersion(version));
   ipcMain.handle('cursor:loginManual', async (_event, raw) => {
     if (isExternalAgentActive()) {
       return { ok: false, code: 'EXTERNAL_AGENT_ACTIVE', error: CURSOR_EXTERNAL_AGENT_ERROR };
@@ -7746,8 +7261,6 @@ app.whenReady().then(() => {
   ipcMain.on('dashboard:minimize', (event) => { BrowserWindow.fromWebContents(event.sender)?.minimize(); });
   ipcMain.on('dashboard:close', (event) => { BrowserWindow.fromWebContents(event.sender)?.close(); });
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
-  maybeRunBackgroundUpdateCheck();
-  startAppUpdateBackgroundChecks();
 });
 
 app.on('second-instance', focusExistingWindow);
@@ -7760,10 +7273,8 @@ app.on('before-quit', () => {
   quitRequested = true;
   resetMacWidgetReloadThrottle();
   if (rateRefreshTimer) clearInterval(rateRefreshTimer);
-  if (appUpdateBackgroundTimer) clearInterval(appUpdateBackgroundTimer);
   unregisterWindowToggleShortcut();
   electronWorkbuddyLocalAuth.dispose();
-  if (skipForcedQuit) return;
   performQuit();
 });
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {

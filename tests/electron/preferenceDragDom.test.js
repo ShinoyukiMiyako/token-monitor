@@ -520,7 +520,6 @@ test('settings accordions share accessible collapsed-state handling', () => {
   assert.match(setup, /details\.classList\.toggle\('hidden', !open\)/);
   assert.match(setup, /details\.inert = !open/);
   assert.match(setup, /group\.classList\.toggle\('expanded', open\)/);
-  assert.match(app, /setupSettingsAccordion\(els\.appUpdateNotes, els\.appUpdateNotesToggle, els\.appUpdateNotesDetails\)/);
   assert.match(app, /setupSettingsAccordion\(els\.advancedSettingsGroup, els\.advancedSettingsToggle, els\.advancedSettingsDetails\)/);
   assert.match(app, /setupSettingsAccordion\(els\.themeAdvancedGroup, els\.themeAdvancedToggle, els\.themeAdvancedDetails\)/);
   assert.match(app, /setupSettingsAccordion\(els\.themeVendorGroup, els\.themeVendorToggle, els\.themeVendorDetails\)/);

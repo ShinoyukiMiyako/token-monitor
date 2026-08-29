@@ -104,19 +104,6 @@ test('translate falls back to English and interpolates values', () => {
   assert.equal(translate('zh-TW', 'missing.key'), 'missing.key');
 });
 
-test('automatic app update copy describes background downloads, not update checks', () => {
-  assert.equal(translate('en', 'settings.appUpdate.automatic'), 'Download updates automatically');
-  assert.equal(
-    translate('en', 'settings.appUpdate.automaticDescription'),
-    "Download new versions in the background. You'll be prompted to restart when ready."
-  );
-  assert.equal(translate('zh-TW', 'settings.appUpdate.automatic'), '自動下載更新');
-  assert.equal(
-    translate('zh-TW', 'settings.appUpdate.automaticUnsupportedWindowsPortable'),
-    'Portable 版本不支援自動下載，請透過「查看 release」手動更新。'
-  );
-});
-
 test('Hub deployment copy describes the whole build instead of only its shared core', () => {
   assert.equal(translate('en', 'settings.sync.hubBuild.current', { target: 'Worker' }), 'Worker is up to date');
   assert.equal(
@@ -251,7 +238,7 @@ test('Claude prepaid balance copy points to its merged provider panel', () => {
 test('applyTranslations updates text, title, aria-label, placeholders, and document lang', () => {
   const title = fakeElement({ i18n: 'settings.sync.title' });
   const button = fakeElement({ i18nTitle: 'settings.sync.copySecret' });
-  const dismiss = fakeElement({ i18nAriaLabel: 'settings.appUpdate.dismiss' });
+  const bubble = fakeElement({ i18nAriaLabel: 'floatingBubble.expand' });
   const input = fakeElement({ i18nPlaceholder: 'settings.sync.secretPlaceholder' });
   const paste = fakeElement({ i18nTitle: 'settings.sync.pasteSecret', i18nAriaLabel: 'settings.sync.pasteSecret' });
   const langOption = fakeElement({ i18n: 'settings.language.zhTW' });
@@ -261,7 +248,7 @@ test('applyTranslations updates text, title, aria-label, placeholders, and docum
     querySelectorAll(selector) {
       if (selector === '[data-i18n]') return [title, langOption];
       if (selector === '[data-i18n-title]') return [button, paste];
-      if (selector === '[data-i18n-aria-label]') return [dismiss, paste];
+      if (selector === '[data-i18n-aria-label]') return [bubble, paste];
       if (selector === '[data-i18n-placeholder]') return [input];
       return [];
     }
@@ -273,7 +260,7 @@ test('applyTranslations updates text, title, aria-label, placeholders, and docum
   assert.equal(button.title, '複製密鑰');
   assert.equal(paste.title, '貼上密鑰');
   assert.equal(paste.getAttribute('aria-label'), '貼上密鑰');
-  assert.equal(dismiss.getAttribute('aria-label'), '忽略此版本');
+  assert.equal(bubble.getAttribute('aria-label'), '顯示 Token Monitor');
   assert.equal(input.placeholder, '選填的共享密鑰');
   assert.equal(langOption.textContent, '繁體中文');
   assert.equal(documentElement.getAttribute('lang'), 'zh-TW');
