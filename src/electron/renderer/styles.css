@@ -4782,11 +4782,6 @@ html.is-windows .limit-live-badge {
 .mode-button { width: auto; max-width: 52%; min-width: 0; height: 30px; padding: 0 10px; overflow: hidden; color: var(--muted); text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .mode-button:hover { border-color: rgba(115, 189, 245, 0.62); color: var(--blue); }
 .error { color: var(--red); }
-.footer:has(.refresh-button:is(.is-refreshing,
-.is-refreshed {
-  opacity: 0;
-  pointer-events: none;
-}
 @media (prefers-reduced-motion: reduce) {
 
   :root:not([data-reduce-motion="off"]) *,
