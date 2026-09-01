@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const test = require('node:test');
 
-const { decideResolver, kimiWorkSessionsRoots } = require('../../src/shared/collector');
+const { decideResolver, kimiWorkSessionsRoots, tokscaleThreadEnv } = require('../../src/shared/collector');
 
 test('decideResolver prefers downloaded binary only when it is newer than bundled', () => {
   const bundled = { source: 'bundled', version: '2.1.3', path: '/bundled/tokscale' };
@@ -57,4 +57,28 @@ test('kimiWorkSessionsRoots mirrors platform paths and relocated Windows shares'
     [path.join(homeAppData, workSuffix), path.join('D:\\KimiShare', 'daimon', 'runtime', 'kimi-code', 'home', 'sessions')]
   );
   assert.deepEqual(kimiWorkSessionsRoots(home, 'linux'), []);
+});
+
+// tokscale sizes its rayon pool to every logical core by default. On a large
+// session tree that is dominated by contention, so the cap both cuts CPU and
+// removes the whole-machine spike the user actually feels.
+test('tokscaleThreadEnv caps the rayon pool by default', () => {
+  assert.deepEqual(tokscaleThreadEnv({}), { RAYON_NUM_THREADS: '4' });
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: '' }), { RAYON_NUM_THREADS: '4' });
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: '   ' }), { RAYON_NUM_THREADS: '4' });
+});
+
+test('tokscaleThreadEnv honours an explicit thread count', () => {
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: '8' }), { RAYON_NUM_THREADS: '8' });
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: '1' }), { RAYON_NUM_THREADS: '1' });
+  // Fractional input still has to reach rayon as an integer.
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: '2.9' }), { RAYON_NUM_THREADS: '2' });
+});
+
+test('tokscaleThreadEnv expresses "no cap" by leaving the variable unset', () => {
+  // rayon rejects an explicit 0, so the opt-out cannot be passed through as one:
+  // it has to be the absence of the variable.
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: '0' }), {});
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: '-2' }), {});
+  assert.deepEqual(tokscaleThreadEnv({ TOKEN_MONITOR_TOKSCALE_THREADS: 'off' }), {});
 });

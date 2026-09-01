@@ -148,12 +148,48 @@ function resolvePlatformBinary() {
   return decideResolver({ downloaded, bundled, shim });
 }
 
+// tokscale parallelises its scan with rayon, which by default sizes its pool to
+// every logical core. On a large session tree that is a losing trade: the work is
+// dominated by contention rather than by CPU, so the extra threads mostly fight
+// each other while every core on the machine spikes to full for the duration.
+//
+// Measured on a 32-thread machine over a 111-day / 26.9B-token tree, 8 runs per
+// setting, ABBA-alternated:
+//
+//   default   wall 1.96s   cpu 17.21s   8.8 threads busy
+//   4 threads wall 2.19s   cpu  4.67s   2.1 threads busy
+//   8 threads wall 3.18s   cpu  6.48s   — slower than 4, purely contention
+//
+// So capping at 4 costs 0.23s of latency and returns 73% of the CPU. It is not a
+// trade so much as removing waste, and the larger the tree grows the worse the
+// uncapped case gets. What the user actually feels is the peak: a scan every few
+// seconds that lights up every core reads as system-wide stutter, while the same
+// scan on 4 threads is invisible.
+//
+// 0 restores rayon's own default. An explicit value wins over both.
+const DEFAULT_TOKSCALE_THREADS = 4;
+
+function tokscaleThreadEnv(env = process.env) {
+  const raw = String(env.TOKEN_MONITOR_TOKSCALE_THREADS ?? '').trim();
+  if (raw === '') return { RAYON_NUM_THREADS: String(DEFAULT_TOKSCALE_THREADS) };
+  const parsed = Number(raw);
+  // 0 (or anything unparseable) means "do not constrain it at all", which has to
+  // be expressed by leaving the variable unset rather than by passing 0 — rayon
+  // treats an explicit 0 as invalid.
+  if (!Number.isFinite(parsed) || parsed <= 0) return {};
+  return { RAYON_NUM_THREADS: String(Math.floor(parsed)) };
+}
+
 function tokscaleCommand() {
   const resolved = resolvePlatformBinary();
   const useDirect = Boolean(resolved && resolved.source !== 'shim');
+  // Applied here rather than at each call site so every tokscale invocation —
+  // the period scans, `graph` behind History, and the self-sync subprocesses —
+  // inherits the same cap.
+  const threadEnv = tokscaleThreadEnv();
   const command = useDirect
-    ? { bin: resolved.path, prefixArgs: [], env: process.env }
-    : { bin: process.execPath, prefixArgs: [TOKSCALE_BIN_JS], env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } };
+    ? { bin: resolved.path, prefixArgs: [], env: { ...process.env, ...threadEnv } }
+    : { bin: process.execPath, prefixArgs: [TOKSCALE_BIN_JS], env: { ...process.env, ...threadEnv, ELECTRON_RUN_AS_NODE: '1' } };
   return {
     ...command,
     identity: [resolved?.source || 'none', resolved?.path || '', resolved?.version || '', resolved?.integrity || ''].join('|')
@@ -4394,6 +4430,7 @@ module.exports = {
   watchAttributionRootsForClients,
   watcherOptions,
   watchIgnoreMatcher,
+  tokscaleThreadEnv,
   watchPathsForClients,
   recursiveWatchCandidates
 };
