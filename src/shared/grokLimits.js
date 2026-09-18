@@ -9,6 +9,9 @@
 //
 // The CLI RPC may return a JSON `config` envelope; the web fallback returns
 // the protobuf `GetGrokCreditsConfig` response used by CodexBar.
+//
+// Neither billing response names the plan, so the tier label is read from the
+// remote settings document Grok Build polls for its own status line.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -21,6 +24,7 @@ const { abortError } = require('./probeDeadline');
 const { listRunningWslDistros } = require('./wslUsage');
 
 const GROK_WEB_BILLING_GRPC_URL = 'https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig';
+const GROK_CLI_SETTINGS_URL = 'https://cli-chat-proxy.grok.com/v1/settings';
 const GROK_KEY_NAMES = ['GROK_BEARER_TOKEN'];
 const GROK_OIDC_PREFIX = 'https://auth.x.ai::';
 const GROK_LEGACY_SCOPE = 'https://accounts.x.ai/sign-in';
@@ -709,6 +713,47 @@ async function fetchGrokWebGrpcBilling(credential, deps = {}) {
   }
 }
 
+// The server sends a ready-made display name ("SuperGrok Heavy"), used verbatim
+// so a new tier shows up correctly without a client-side enum to keep in step.
+async function fetchGrokSubscriptionTier(credential, deps = {}) {
+  const timeoutMs = Number(deps.fetchTimeoutMs || 12000);
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const fetchFn = resolveGrokFetch(deps);
+    const response = await fetchFn(GROK_CLI_SETTINGS_URL, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${credential.token}`,
+        Accept: 'application/json',
+        'User-Agent': 'Grok Build'
+      },
+      ...(controller ? { signal: controller.signal } : {})
+    });
+    if (!response.ok) {
+      throw new Error(`Grok settings request failed (HTTP ${response.status})`);
+    }
+    const settings = await response.json();
+    const tier = settings && typeof settings === 'object' ? settings.subscription_tier_display : null;
+    return typeof tier === 'string' ? tier.trim() : '';
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// The plan name decorates a quota that has already been read, so a failed
+// lookup blanks the label instead of failing the provider. Blank, not a guessed
+// "SuperGrok": that constant is how Heavy subscribers ended up mislabeled.
+async function grokPlanLabel(credential, deps = {}) {
+  if (!credential) return '';
+  try {
+    return await (deps.fetchSubscriptionTier || fetchGrokSubscriptionTier)(credential, deps);
+  } catch (_) {
+    if (deps.signal?.aborted) throw abortError(deps.signal);
+    return '';
+  }
+}
+
 async function fetchGrokLimits(options = {}, deps = {}) {
   const env = deps.env || process.env;
   const now = (deps.now || Date.now)();
@@ -718,10 +763,11 @@ async function fetchGrokLimits(options = {}, deps = {}) {
     try {
       const rpcBody = await (deps.fetchRpcBilling || fetchGrokRpcBilling)(options, deps);
       const windows = parseGrokBilling(rpcBody);
+      const accountLabel = await grokPlanLabel(credential, deps);
       return normalizeLimitProvider({
         provider: 'grok',
         accountKey: credential ? hashKey('grok', credential.token) : '',
-        accountLabel: 'SuperGrok',
+        accountLabel,
         accountEmail: credential?.email || '',
         source: 'rpc',
         sourceDetail: 'cli',
@@ -774,11 +820,13 @@ async function fetchGrokLimits(options = {}, deps = {}) {
   }
 
   if (deps.signal?.aborted) throw abortError(deps.signal);
+  const accountLabel = await grokPlanLabel(credential, deps);
+  if (deps.signal?.aborted) throw abortError(deps.signal);
   try {
     return normalizeLimitProvider({
       provider: 'grok',
       accountKey: hashKey('grok', credential.token),
-      accountLabel: 'SuperGrok',
+      accountLabel,
       accountEmail: credential.email || '',
       source: 'web',
       sourceDetail: 'credits-config',
@@ -799,6 +847,7 @@ async function fetchGrokLimits(options = {}, deps = {}) {
 
 module.exports = {
   GROK_WEB_BILLING_GRPC_URL,
+  GROK_CLI_SETTINGS_URL,
   GROK_KEY_NAMES,
   GROK_OIDC_PREFIX,
   GROK_LEGACY_SCOPE,
@@ -812,6 +861,7 @@ module.exports = {
   resolveGrokFetch,
   fetchGrokRpcBilling,
   fetchGrokWebGrpcBilling,
+  fetchGrokSubscriptionTier,
   fetchGrokLimits,
   isRetryableNetworkError,
   grpcWebTrailerFields,
