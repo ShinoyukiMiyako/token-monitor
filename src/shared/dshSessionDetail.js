@@ -14,8 +14,10 @@
  *   `skill-catalog` (the available-skills list) for harness-injected context.
  *   Only `kind === 'user'` may become a prompt bubble.
  * - A forked session's log is seeded with a byte-for-byte copy of its parent's
- *   events up to `session.seedLength` (the `seq` of the `session/end-seed`
- *   marker). Tokscale's own aggregate leaves that seeded prefix on the parent
+ *   events. Legacy headers store the inherited count as `seedLength` (the `seq`
+ *   of the `session/end-seed` marker); v3 headers store only `isSeeded: true`
+ *   and put the exact cut on the LAST `session/end-seed { inherited: true }`
+ *   marker. Tokscale's own aggregate leaves that seeded prefix on the parent
  *   and counts only the fork's own new events; Session Detail must match, or
  *   opening a forked session shows more tokens than tokscale's own count for
  *   it (measured up to +52.7% total across a small real sample dominated by
@@ -91,22 +93,40 @@ function parseDshDetailEvents(text) {
   // otherwise-identical assistant call cannot suppress a real compaction
   // charge.
   const seenUsageKeys = new Set();
+  const records = [];
   let header = null;
-  let seedLength = null;
+  let headerIndex = -1;
   for (const line of String(text || '').split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    let record;
     try {
-      record = JSON.parse(trimmed);
+      const record = JSON.parse(trimmed);
+      if (record?.type === 'session') {
+        header = record;
+        headerIndex = records.length;
+      }
+      records.push(record);
     } catch (_) {
       continue;
     }
-    if (record?.type === 'session') {
-      header = record;
-      seedLength = Number.isFinite(Number(record.seedLength)) ? Number(record.seedLength) : null;
-      continue;
+  }
+  // A fork can inherit its ancestor's tagged marker along with the rest of the
+  // copy, so only the LAST tagged marker is this session's own cut. Untagged
+  // end-seed markers are resume boundaries and never hide history. A v3 seeded
+  // header without a readable tagged marker leaves ownership unrecoverable, so
+  // nothing is attributed to the child rather than charging it the parent's
+  // copied prefix.
+  let seedLength = Number.isFinite(Number(header?.seedLength)) ? Number(header.seedLength) : null;
+  const needsTaggedCut = seedLength === null && header?.isSeeded === true;
+  if (needsTaggedCut) {
+    for (const record of records) {
+      if (record?.type === 'session/end-seed' && record.data?.inherited === true && Number.isFinite(record.seq)) {
+        seedLength = record.seq;
+      }
     }
+  }
+  for (const [recordIndex, record] of records.entries()) {
+    if (record?.type === 'session') continue;
     // tokscale's own loop never gates user/assistant processing on having
     // seen the header first (dsh.rs): every line is matched by its own
     // `type` independently, and seed_length simply stays its 0 default until
@@ -121,9 +141,12 @@ function parseDshDetailEvents(text) {
     // event AT seq === seedLength is the fork's own first new event, not
     // part of the copied prefix — tokscale itself skips strictly `seq <
     // seed_length` (dsh.rs), and matching it here is a hard requirement,
-    // not a rounding choice.
+    // not a rounding choice. A v3 tagged marker at seq N sits on the same
+    // boundary, so the identical `seq < N` rule applies to it.
     const recordSeq = Number.isFinite(record?.seq) ? record.seq : null;
-    if (seedLength !== null && recordSeq !== null && recordSeq < seedLength) continue;
+    const cutApplies = headerIndex >= 0 && recordIndex > headerIndex;
+    if (cutApplies && needsTaggedCut && seedLength === null) continue;
+    if (cutApplies && seedLength !== null && recordSeq !== null && recordSeq < seedLength) continue;
     // An event without a usable time cannot be placed in the exchange
     // timeline correctly — defaulting it to epoch 0 would either sort it out
     // of order or drop it from every non-"total" period filter silently.

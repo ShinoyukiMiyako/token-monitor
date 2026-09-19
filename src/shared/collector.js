@@ -53,7 +53,12 @@ const {
 } = require('./qoderCnUsage');
 const { resolveReasonixStatsDir, REASONIX_SOURCE_CHECK_ID } = require('./reasonixPaths');
 const { resolveDshSessionsDir, DSH_SOURCE_CHECK_ID } = require('./dshPaths');
-const { indexDshSessionHeaders, readDshSessionHeader, resolveDshSessionsRoot } = require('./dshSessionFiles');
+const {
+  indexDshSessionHeaders,
+  preferredDshSessionFileInDirectory,
+  readDshSessionHeader,
+  resolveDshSessionsRoot
+} = require('./dshSessionFiles');
 const {
   createReasonixNativeSessionCache,
   isReasonixNativeSessionPath,
@@ -925,7 +930,8 @@ function projectIdentity(value) {
 // stutter once project tracking made this run on every session each tick).
 const jsonlTimestampCache = new Map();
 
-// Keyed by `sessionsRoot\0sessionId` -> { filePath, createdAt, statFingerprint }.
+// Keyed by `sessionsRoot\0sessionId` -> { filePath, createdAt, statFingerprint,
+// directoryFingerprint }.
 // DSH sessions are deliberately excluded from sessionTimestampMap's
 // resolvedSessionKeys (so lastUsedAt keeps refreshing), so every known id is
 // looked up again on every tick; this is what turns that into a stat() on an
@@ -940,6 +946,27 @@ const jsonlTimestampCache = new Map();
 // session-metadata deps fresh on every call, same as jsonlTimestampCache and
 // projectPathCache already rely on being module-level rather than deps-held.
 const dshSessionFileCache = new Map();
+
+// Nanosecond size/mtime/ctime of a session directory: creating a new
+// generation file inside it changes this on filesystems that report it.
+function dshDirectoryStatFingerprint(dir) {
+  try {
+    const st = fs.statSync(dir, { bigint: true });
+    return `${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+  } catch (_) {
+    return '';
+  }
+}
+
+// Only re-points to a sibling whose header carries the same session id, so a
+// foreign transcript dropped into the directory cannot take the session over.
+function preferredDshSessionEntry(sessionId, entry) {
+  const preferredPath = preferredDshSessionFileInDirectory(path.dirname(entry.filePath));
+  if (!preferredPath || preferredPath === entry.filePath) return entry;
+  const header = readDshSessionHeader(preferredPath);
+  if (header?.id !== sessionId) return entry;
+  return { filePath: preferredPath, createdAt: header.createdAt };
+}
 
 // Keyed by `home\0client\0sessionId` -> transcript path, for the clients whose
 // files are located by walking a tree (claude, codex).
@@ -1126,17 +1153,26 @@ function sessionTimestampMap(periods, home = os.homedir(), deps = {}) {
   // append-only log, so mtime tracks the last flush) for lastUsedAt. DSH
   // sessions are deliberately never added to resolvedSessionKeys (see below),
   // so every id in scope this tick is looked up again on the next one too.
-  // A session, once found, has a file path that never changes — dshFileCache
+  // A session, once found, stays in its own directory — dshFileCache
   // (persisted across ticks by the caller, like metadataCache) lets a known
   // id skip straight to statting its own file instead of re-walking the
   // whole DSH sessions tree; only an id this cache has never seen triggers
-  // that walk, and it resolves every unknown id in the tick at once.
+  // that walk, and it resolves every unknown id in the tick at once. The file
+  // inside that directory can change: a v3 upgrade writes a new versioned
+  // transcript beside the old one, so a cached entry is re-pointed to the
+  // preferred generation when its directory changes.
   const dshIds = byClient.get('dsh') || new Set();
   if (dshIds.size > 0) {
     // Falls back to the module-level cache, not a fresh Map: this must
     // persist across collectUsageOnce calls to do anything, and every
     // caller that wants test isolation already passes its own Map explicitly.
     const dshFileCache = deps.dshSessionFileCache || dshSessionFileCache;
+    // Windows can leave a directory's timestamps unchanged across a file
+    // created in the same collection window, so there the preferred generation
+    // is re-checked in each known session directory every tick. That is one
+    // readdir per in-scope session, never a walk of the whole sessions tree.
+    const dshDirectoryFingerprintsReliable = deps.dshDirectoryFingerprintsReliable
+      ?? ((deps.platform || process.platform) !== 'win32');
     // dshPaths.js checks env.DSH_HOME before the homeDir it's given, same as
     // tokscale's own PathRoot::EnvVar — and tokscale's own scanner never lets
     // that leak into an explicit --home lookup (use_env_roots: false, lib.rs).
@@ -1150,22 +1186,38 @@ function sessionTimestampMap(periods, home = os.homedir(), deps = {}) {
     if (unresolvedDshIds.length > 0) {
       const buildIndex = deps.indexDshSessionHeaders || indexDshSessionHeaders;
       const index = buildIndex({ homeDir: home, env: dshEnv, platform: deps.platform });
-      for (const [sessionId, entry] of index) {
+      for (const [sessionId, indexedEntry] of index) {
         const key = dshKey(sessionId);
         if (dshFileCache.has(key)) continue;
+        // Captured before the final per-directory pick: a generation created
+        // during the whole-tree index is selected now, and one landing after
+        // this point changes the fingerprint and is promoted next tick.
+        const directoryFingerprint = dshDirectoryStatFingerprint(path.dirname(indexedEntry.filePath));
+        const entry = preferredDshSessionEntry(sessionId, indexedEntry);
         // A stat fingerprint lets an entry whose header was unreadable at
         // index time (createdAt undefined, directory-name fallback) be re-read
         // later, once the file actually changes, instead of being stuck on
         // mtime forever.
         let statFingerprint = '';
         try { const st = fs.statSync(entry.filePath); statFingerprint = `${st.size}:${st.mtimeMs}`; } catch (_) { /* file vanished mid-scan */ }
-        dshFileCache.set(key, { ...entry, statFingerprint });
+        dshFileCache.set(key, { ...entry, statFingerprint, directoryFingerprint });
       }
     }
     for (const sessionId of dshIds) {
       const key = dshKey(sessionId);
       let entry = dshFileCache.get(key);
       if (!entry) continue;
+      const directoryFingerprint = dshDirectoryStatFingerprint(path.dirname(entry.filePath));
+      const directoryChanged = Boolean(directoryFingerprint && entry.directoryFingerprint
+        && directoryFingerprint !== entry.directoryFingerprint);
+      if (directoryChanged || !dshDirectoryFingerprintsReliable) {
+        const preferred = preferredDshSessionEntry(sessionId, entry);
+        if (preferred !== entry) entry = { ...preferred, statFingerprint: '' };
+      }
+      if (directoryFingerprint && entry.directoryFingerprint !== directoryFingerprint) {
+        entry = { ...entry, directoryFingerprint };
+      }
+      dshFileCache.set(key, entry);
       let lastUsedAt = '';
       let statFingerprint = '';
       try {
@@ -1182,7 +1234,7 @@ function sessionTimestampMap(periods, home = os.homedir(), deps = {}) {
       if (entry.createdAt === undefined && statFingerprint && statFingerprint !== entry.statFingerprint) {
         const refreshed = readDshSessionHeader(entry.filePath);
         if (refreshed) {
-          entry = { filePath: entry.filePath, createdAt: refreshed.createdAt, statFingerprint };
+          entry = { ...entry, createdAt: refreshed.createdAt, statFingerprint };
         } else {
           entry.statFingerprint = statFingerprint;
         }

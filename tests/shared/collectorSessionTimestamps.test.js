@@ -307,8 +307,8 @@ test('applySessionTimestamps walks the DSH sessions tree once per tick, not once
 // DSH sessions never join resolvedSessionKeys, so every known id is in scope
 // again on the next tick — without a cache that would mean walking the whole
 // tree on every tick forever, the exact perceived-UI-stutter cost this file's
-// own comments describe avoiding for claude/codex. A known session's file
-// path never changes, so a second tick for the same ids must not re-walk.
+// own comments describe avoiding for claude/codex. A known session never
+// leaves its directory, so a second tick for the same ids must not re-walk.
 test('applySessionTimestamps does not re-walk the DSH tree for already-known sessions on the next tick', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-dsh-cache-'));
   try {
@@ -336,6 +336,72 @@ test('applySessionTimestamps does not re-walk the DSH tree for already-known ses
   }
 });
 
+// A DSH v3 upgrade writes session.v3.jsonl beside a session already cached on
+// its old session.jsonl, which stops being appended to. Pinned to the old file,
+// lastUsedAt would freeze at the upgrade moment forever.
+function dshUpgradeFixture(prefix) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = path.join(home, '.dsh', 'sessions', 'proj', 's1');
+  fs.mkdirSync(dir, { recursive: true });
+  const legacy = path.join(dir, 'session.jsonl');
+  fs.writeFileSync(legacy, `${JSON.stringify({ type: 'session', id: 's1', createdAt: 1750000000000 })}\n`);
+  const legacyTime = new Date('2026-09-01T00:00:00.000Z');
+  fs.utimesSync(legacy, legacyTime, legacyTime);
+  const upgrade = () => {
+    const versioned = path.join(dir, 'session.v3.jsonl');
+    fs.writeFileSync(versioned, `${JSON.stringify({ type: 'session', version: 3, id: 's1', createdAt: 1750000000000 })}\n`);
+    const liveTime = new Date('2026-09-18T12:00:00.000Z');
+    fs.utimesSync(versioned, liveTime, liveTime);
+    return liveTime;
+  };
+  return { home, dir, legacyTime, upgrade };
+}
+
+function dshTick(home, cache) {
+  const periods = { today: { sessions: { 'dsh:s1': { client: 'dsh', sessionId: 's1' } } } };
+  applySessionTimestamps(periods, home, cache);
+  return periods.today.sessions['dsh:s1'];
+}
+
+test('applySessionTimestamps promotes a cached DSH session to its v3 transcript when directory stats are unreliable', () => {
+  const { home, legacyTime, upgrade } = dshUpgradeFixture('tm-dsh-promote-win-');
+  try {
+    let walks = 0;
+    const cache = {
+      metadataCache: new Map(), resolvedSessionKeys: new Set(), attemptedSessionKeys: new Set(),
+      dshSessionFileCache: new Map(), retryMisses: true,
+      dshDirectoryFingerprintsReliable: false,
+      indexDshSessionHeaders: (options) => { walks += 1; return indexDshSessionHeaders(options); }
+    };
+    assert.equal(dshTick(home, cache).lastUsedAt, legacyTime.toISOString());
+    const liveTime = upgrade();
+    assert.equal(dshTick(home, cache).lastUsedAt, liveTime.toISOString());
+    assert.equal(walks, 1, 'promotion checks the known directory, not the whole tree');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('applySessionTimestamps promotes a cached DSH session to its v3 transcript when its directory changes', () => {
+  const { home, dir, legacyTime, upgrade } = dshUpgradeFixture('tm-dsh-promote-posix-');
+  try {
+    const cache = {
+      metadataCache: new Map(), resolvedSessionKeys: new Set(), attemptedSessionKeys: new Set(),
+      dshSessionFileCache: new Map(), retryMisses: true,
+      dshDirectoryFingerprintsReliable: true
+    };
+    assert.equal(dshTick(home, cache).lastUsedAt, legacyTime.toISOString());
+    const liveTime = upgrade();
+    // Pin the invalidation signal instead of relying on the host filesystem
+    // to bump the directory mtime within the test's time resolution.
+    const dirTime = new Date('2026-09-18T12:00:01.000Z');
+    fs.utimesSync(dir, dirTime, dirTime);
+    assert.equal(dshTick(home, cache).lastUsedAt, liveTime.toISOString());
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // The test above proves sessionTimestampMap's own caching logic works when a
 // caller shares one deps object across calls — but collectUsageOnce (what a
 // real collector tick actually calls) used to rebuild dshSessionFileCache
@@ -354,13 +420,17 @@ test('collectUsageOnce does not re-walk the DSH sessions tree on a second real t
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'session.jsonl'), `${JSON.stringify({ type: 'session', id: 'session-e2e', createdAt: 1750000000000 })}\n`);
 
-    // dshSessionFiles() walks the tree via fs.readdirSync(dir, {withFileTypes}).
-    // Counting only calls rooted under the DSH sessions dir isolates "the
-    // tree was walked" from every other readdirSync call a full tick makes
-    // (tokscale client discovery, WSL probing, etc).
+    // dshSessionFiles() walks root -> project -> session. Counting only the
+    // first two levels isolates "the tree was walked" from every other
+    // readdirSync call a full tick makes (tokscale client discovery, WSL
+    // probing, etc) and from the Windows check of one already-known session
+    // directory, which is not a rebuild of the whole tree.
     let walks = 0;
     fs.readdirSync = (target, ...rest) => {
-      if (typeof target === 'string' && target.startsWith(sessionsRoot)) walks += 1;
+      if (typeof target === 'string') {
+        const relative = path.relative(sessionsRoot, target);
+        if (relative === '' || (!relative.startsWith('..') && relative.split(path.sep).length === 1)) walks += 1;
+      }
       return realReaddirSync(target, ...rest);
     };
 

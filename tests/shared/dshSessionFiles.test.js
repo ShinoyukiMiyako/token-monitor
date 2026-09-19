@@ -12,6 +12,9 @@ const {
   decodeFirstFrameText,
   decodeSessionText,
   dshSessionFiles,
+  indexDshSessionHeaders,
+  isDshSessionLogName,
+  preferredDshSessionFileInDirectory,
   readDshSessionHeader,
   resolveDshSessionsRoot,
   scanZstdFrames,
@@ -55,6 +58,56 @@ test('dshSessionFiles finds session.jsonl and session.jsonl.zstd two levels deep
 
   const found = dshSessionFiles(root).sort();
   assert.deepEqual(found, [path.join(dirA, 'session.jsonl'), path.join(dirB, 'session.jsonl.zstd')].sort());
+});
+
+// A v3 harness re-encodes a session into session.v3.jsonl.zstd and leaves the
+// pre-upgrade file in place; the versioned file is the one still written, so it
+// must be listed first for callers that stop at the first match.
+test('dshSessionFiles finds versioned transcripts and lists the highest generation first per directory', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-files-'));
+  const upgraded = path.join(root, 'projA', 'session-1');
+  const v3Only = path.join(root, 'projB', 'session-2');
+  fs.mkdirSync(upgraded, { recursive: true });
+  fs.mkdirSync(v3Only, { recursive: true });
+  for (const name of ['session.jsonl.zstd', 'session.v3.jsonl.zstd', 'session.v10.jsonl', 'session.vX.jsonl.zstd', 'session.v3.jsonl.zstd.tmp']) {
+    fs.writeFileSync(path.join(upgraded, name), '');
+  }
+  fs.writeFileSync(path.join(v3Only, 'session.v3.jsonl.zstd'), '');
+
+  const found = dshSessionFiles(root);
+  const inUpgraded = found.filter((file) => path.dirname(file) === upgraded).map((file) => path.basename(file));
+  assert.deepEqual(inUpgraded, ['session.v10.jsonl', 'session.v3.jsonl.zstd', 'session.jsonl.zstd']);
+  assert.ok(found.includes(path.join(v3Only, 'session.v3.jsonl.zstd')));
+  assert.equal(found.length, 4);
+});
+
+test('indexDshSessionHeaders resolves an upgraded session to its versioned transcript', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-files-'));
+  const dir = path.join(root, 'proj', 'session-up');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'session.jsonl'), `${JSON.stringify({ type: 'session', id: 'session-up', createdAt: 1 })}\n`);
+  fs.writeFileSync(path.join(dir, 'session.v3.jsonl'), `${JSON.stringify({ type: 'session', version: 3, id: 'session-up', createdAt: 1 })}\n`);
+
+  const index = indexDshSessionHeaders({ sessionsRoot: root });
+  assert.equal(index.get('session-up').filePath, path.join(dir, 'session.v3.jsonl'));
+});
+
+test('preferredDshSessionFileInDirectory picks the highest generation and tolerates a missing directory', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-files-'));
+  fs.writeFileSync(path.join(dir, 'session.jsonl.zstd'), '');
+  assert.equal(preferredDshSessionFileInDirectory(dir), path.join(dir, 'session.jsonl.zstd'));
+  fs.writeFileSync(path.join(dir, 'session.v3.jsonl.zstd'), '');
+  assert.equal(preferredDshSessionFileInDirectory(dir), path.join(dir, 'session.v3.jsonl.zstd'));
+  assert.equal(preferredDshSessionFileInDirectory(path.join(dir, 'missing')), null);
+});
+
+test('isDshSessionLogName accepts only the harness naming convention', () => {
+  for (const name of ['session.jsonl', 'session.jsonl.zstd', 'session.v3.jsonl', 'session.v3.jsonl.zstd']) {
+    assert.equal(isDshSessionLogName(name), true, name);
+  }
+  for (const name of ['session.vX.jsonl.zstd', 'session.v.jsonl', 'other.jsonl.zstd', 'session.jsonl.lock', 'session.v3.jsonl.zstd.tmp']) {
+    assert.equal(isDshSessionLogName(name), false, name);
+  }
 });
 
 test('dshSessionFiles tolerates a missing root', () => {

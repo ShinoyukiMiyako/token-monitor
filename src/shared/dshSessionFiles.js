@@ -4,7 +4,7 @@
  * DeepSeek Harness (`dsh`) session-file discovery and transcript decoding.
  *
  * `dsh` persists one append-only JSONL transcript per session under
- * `<dsh-home>/sessions/<encoded-cwd>/<session-id>/session.jsonl(.zstd)`. The
+ * `<dsh-home>/sessions/<encoded-cwd>/<session-id>/session[.v<N>].jsonl(.zstd)`. The
  * default artifact is a concatenation of independently decodable Zstandard
  * frames — one per flush — so a live session scanned mid-write routinely ends
  * in a torn trailing frame; `scanZstdFrames` locates frame boundaries without
@@ -50,6 +50,41 @@ function readFileHead(filePath, bytes = HEADER_READ_BYTES) {
 }
 
 const DSH_SESSION_LOG_NAMES = new Set(['session.jsonl', 'session.jsonl.zstd']);
+// A v3+ harness re-encodes a session into a NEW file (`session.v3.jsonl.zstd`)
+// instead of rotating the old one, so a fixed name list stops finding live
+// sessions. The version segment is matched as the harness's own numeric
+// `session.v<N>` convention — the same rule tokscale 4.17.0's scanner uses — so
+// an unrelated sibling in a session directory is never taken for a transcript.
+const DSH_SESSION_LOG_PATTERN = /^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/;
+
+function isDshSessionLogName(name) {
+  return DSH_SESSION_LOG_PATTERN.test(String(name || ''));
+}
+
+// The upgrade leaves the pre-v3 file beside the re-encoded one, and only the
+// versioned file is still appended to, so a higher generation must win.
+function dshSessionLogRank(name) {
+  const versioned = /^session\.v(\d+)\.jsonl/.exec(String(name || ''));
+  return versioned ? Number(versioned[1]) : 0;
+}
+
+function sortDshSessionLogNames(names) {
+  return names.sort((a, b) => (dshSessionLogRank(b) - dshSessionLogRank(a)) || (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function preferredDshSessionFileInDirectory(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (_) {
+    return null;
+  }
+  const names = sortDshSessionLogNames(entries
+    .filter((entry) => entry.isFile() && isDshSessionLogName(entry.name))
+    .map((entry) => entry.name));
+  return names.length > 0 ? path.join(dir, names[0]) : null;
+}
+
 const DSH_SESSION_DIR_DEPTH = 2; // <root>/<project>/<session>/<artifact>
 const ZSTD_MAGIC = 0xFD2FB528;
 
@@ -72,8 +107,11 @@ function resolveDshSessionsRoot(options = {}) {
   }));
 }
 
+// Grouped per directory so a session holding several transcripts yields its
+// live one first: every caller that stops at the first match (Session Detail,
+// the header index) then reads the file the harness is still writing.
 function dshSessionFiles(root) {
-  const files = [];
+  const byDir = new Map();
   const stack = [{ dir: root, depth: 0 }];
   while (stack.length > 0) {
     const { dir, depth } = stack.pop();
@@ -86,10 +124,16 @@ function dshSessionFiles(root) {
     for (const entry of entries) {
       if (entry.isDirectory()) {
         if (depth < DSH_SESSION_DIR_DEPTH) stack.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
-      } else if (entry.isFile() && DSH_SESSION_LOG_NAMES.has(entry.name)) {
-        files.push(path.join(dir, entry.name));
+      } else if (entry.isFile() && isDshSessionLogName(entry.name)) {
+        const names = byDir.get(dir);
+        if (names) names.push(entry.name);
+        else byDir.set(dir, [entry.name]);
       }
     }
+  }
+  const files = [];
+  for (const [dir, names] of byDir) {
+    for (const name of sortDshSessionLogNames(names)) files.push(path.join(dir, name));
   }
   return files;
 }
@@ -273,7 +317,9 @@ function indexDshSessionHeaders(options = {}) {
   const index = new Map();
   for (const filePath of dshSessionFiles(root)) {
     const header = readDshSessionHeader(filePath);
-    if (header) index.set(header.id, { filePath, createdAt: header.createdAt });
+    // First wins: dshSessionFiles() lists a session's live transcript before
+    // the stale pre-upgrade copy of the same id sitting beside it.
+    if (header && !index.has(header.id)) index.set(header.id, { filePath, createdAt: header.createdAt });
   }
   return index;
 }
@@ -285,6 +331,8 @@ module.exports = {
   decodeSessionText,
   dshSessionFiles,
   indexDshSessionHeaders,
+  isDshSessionLogName,
+  preferredDshSessionFileInDirectory,
   readDshSessionHeader,
   resolveDshSessionsRoot,
   scanZstdFrames,

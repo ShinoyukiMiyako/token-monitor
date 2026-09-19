@@ -270,6 +270,72 @@ test('readDshSessionDetail keeps a usage row without seq even when a fork has se
   assert.equal(detail.totals.totalTokens, 15);
 });
 
+// A v3 header keeps only `isSeeded: true`; the exact cut is the LAST end-seed
+// marker tagged `inherited: true`. An earlier tagged marker was copied in from
+// the grandparent along with the rest of the prefix.
+test('readDshSessionDetail drops a v3 fork prefix up to the last inherited end-seed marker', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-detail-'));
+  writeFixture(root, 'session-v3-fork', [
+    { ...sessionHeader({ id: 'session-v3-fork', parentSession: 'session-parent' }), version: 3, isSeeded: true },
+    { type: 'session/end-seed', seq: 1, time: BASE_TIME + 1000, data: { inherited: true } },
+    userMessage({ seq: 2, text: 'inherited from parent' }),
+    assistantMessage({ seq: 3, usage: { inputTokens: 1000, outputTokens: 1000 } }),
+    { type: 'session/end-seed', seq: 4, time: BASE_TIME + 4000, data: { inherited: true } },
+    userMessage({ seq: 5, text: 'the forks own new question' }),
+    assistantMessage({ seq: 6, usage: { inputTokens: 10, outputTokens: 5 } })
+  ]);
+
+  const detail = readDshSessionDetail({ sessionId: 'session-v3-fork', sessionsRoot: root, home: '/home/tester', env: {} });
+  assert.equal(detail.exchanges.length, 1);
+  assert.equal(detail.exchanges[0].promptPreview, 'the forks own new question');
+  assert.equal(detail.totals.totalTokens, 15);
+});
+
+// Untagged end-seed markers are resume boundaries written into ordinary
+// sessions; treating one as a fork cut would hide the session's own history.
+test('readDshSessionDetail keeps history before an untagged end-seed marker', () => {
+  const events = parseDshDetailEvents([
+    { ...sessionHeader({ id: 'session-v3-resumed' }), version: 3, isSeeded: false },
+    userMessage({ seq: 1, text: 'before resume' }),
+    assistantMessage({ seq: 2, usage: { inputTokens: 10, outputTokens: 5 } }),
+    { type: 'session/end-seed', seq: 3, time: BASE_TIME + 3000, data: {} },
+    userMessage({ seq: 4, text: 'after resume' }),
+    assistantMessage({ seq: 5, usage: { inputTokens: 20, outputTokens: 5 } })
+  ].map((line) => JSON.stringify(line)).join('\n'));
+  assert.deepEqual(events.map((event) => event.kind), ['prompt', 'turn', 'prompt', 'turn']);
+});
+
+test('readDshSessionDetail attributes nothing to a v3 fork whose cut marker is missing', () => {
+  const events = parseDshDetailEvents([
+    { ...sessionHeader({ id: 'session-v3-orphan', parentSession: 'session-parent' }), version: 3, isSeeded: true },
+    userMessage({ seq: 1, text: 'owner unknown' }),
+    assistantMessage({ seq: 2, usage: { inputTokens: 1000, outputTokens: 1000 } })
+  ].map((line) => JSON.stringify(line)).join('\n'));
+  assert.deepEqual(events, []);
+});
+
+test('readDshSessionDetail opens the versioned transcript when both encodings exist', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-detail-'));
+  const dir = writeFixture(root, 'session-upgraded', [
+    sessionHeader({ id: 'session-upgraded' }),
+    userMessage({ seq: 1, text: 'stale pre-upgrade copy' }),
+    assistantMessage({ seq: 2, usage: { inputTokens: 10, outputTokens: 5 } })
+  ]);
+  const live = [
+    { ...sessionHeader({ id: 'session-upgraded' }), version: 3, isSeeded: false },
+    userMessage({ seq: 1, text: 'stale pre-upgrade copy' }),
+    assistantMessage({ seq: 2, usage: { inputTokens: 10, outputTokens: 5 } }),
+    userMessage({ seq: 3, text: 'written after the upgrade' }),
+    assistantMessage({ seq: 4, usage: { inputTokens: 30, outputTokens: 10 } })
+  ];
+  fs.writeFileSync(path.join(dir, 'session.v3.jsonl'), `${live.map((line) => JSON.stringify(line)).join('\n')}\n`);
+
+  const detail = readDshSessionDetail({ sessionId: 'session-upgraded', sessionsRoot: root, home: '/home/tester', env: {} });
+  assert.equal(detail.exchanges.length, 2);
+  assert.equal(detail.exchanges[1].promptPreview, 'written after the upgrade');
+  assert.equal(detail.totals.totalTokens, 55);
+});
+
 test('readDshSessionDetail counts every event when the session was never forked', () => {
   const events = parseDshDetailEvents([
     sessionHeader({ id: 'session-plain' }),
