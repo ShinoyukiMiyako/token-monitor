@@ -49,6 +49,7 @@ const WSL_DATA_MARKERS = [
   '.config/kiro/User/globalStorage/kiro.kiroagent',
   '.codebuddy/projects',
   '.workbuddy',
+  '.workbuddy-ai',
   '.proma/agent-sessions'
 ];
 
@@ -92,6 +93,7 @@ const MARKER_CLIENTS = {
   '.config/kiro/User/globalStorage/kiro.kiroagent': 'kiro',
   '.codebuddy/projects': 'codebuddy',
   '.workbuddy': 'workbuddy',
+  '.workbuddy-ai': 'workbuddy',
   '.proma/agent-sessions': 'proma'
 };
 
