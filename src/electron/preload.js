@@ -115,7 +115,8 @@ contextBridge.exposeInMainWorld('tokenMonitor', {
     status: (options = {}) => ipcRenderer.invoke('cursor:status', options)
   },
   claude: {
-    saveCookie: (cookie) => ipcRenderer.invoke('claude:saveCookie', cookie)
+    saveCookie: (cookie) => ipcRenderer.invoke('claude:saveCookie', cookie),
+    removeAccount: (id) => ipcRenderer.invoke('claude:removeAccount', id)
   },
   ollama: {
     validateCookie: (cookie) => ipcRenderer.invoke('ollama:validateCookie', cookie)

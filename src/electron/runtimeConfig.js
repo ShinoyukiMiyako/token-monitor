@@ -68,7 +68,7 @@ const LIMITS_RECONFIGURE_KEYS = Object.freeze([
 ]);
 const SINK_STRUCTURAL_KEYS = Object.freeze(['syncUploadIntervalMs']);
 const LIMIT_PROVIDER_SETTING_KEYS = Object.freeze({
-  claude: ['claudeWebCookie'],
+  claude: ['claudeWebCookie', 'claudeWebAccounts'],
   cursor: ['cursorDisabledAccountIds'],
   opencode: ['opencodeCookie', 'opencodeProfiles', 'opencodeLocalLimitsEnabled'],
   openrouter: ['openrouterProfiles'],
@@ -169,6 +169,7 @@ function limitsConfigFromSettings(settings = {}, context = {}) {
     claudeWebCookie: settings.claudeWebCookie
       || env.CLAUDE_WEB_COOKIE
       || '',
+    claudeWebAccounts: settings.claudeWebAccounts || [],
     claudePrepaidBalanceEnabled: settings.claudePrepaidBalanceEnabled !== false,
     opencodeLocalLimitsEnabled: settings.opencodeLocalLimitsEnabled === true,
     opencodeAmbientEnabled: settings.opencodeAmbientEnabled !== false,

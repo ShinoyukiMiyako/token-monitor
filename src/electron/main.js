@@ -78,7 +78,7 @@ const { customPricingPath } = require('../shared/tokscaleConfig');
 const { applyCustomPricing, normalizeCustomPricingSetting } = require('../shared/tokscaleCustomPricing');
 const { createHub } = require('../hub/server');
 const { probeHubBuild } = require('./hubBuildStatus');
-const { claudeWebCookie, deepseekToken, fetchClaudeLimits, normalizeClaudeWebCookieInput, normalizeLimitsRefreshMode, normalizeLimitsRefreshMs, parseBoolean, parseLimitProviders, runCodexLogin, minimaxToken, copilotToken, zaiToken, zaiRegion, zaiTeamToken, volcengineCredentials, qoderCookie, traeAccessToken, traeDeviceId, commandcodeCookie, kimiToken, kimiWebToken, ollamaSessionCookie } = require('../shared/limitCollector');
+const { claudeWebCookie, deepseekToken, fetchClaudeLimits, normalizeClaudeWebAccounts, normalizeClaudeWebCookieInput, normalizeLimitsRefreshMode, normalizeLimitsRefreshMs, parseBoolean, parseLimitProviders, runCodexLogin, minimaxToken, copilotToken, zaiToken, zaiRegion, zaiTeamToken, volcengineCredentials, qoderCookie, traeAccessToken, traeDeviceId, commandcodeCookie, kimiToken, kimiWebToken, ollamaSessionCookie } = require('../shared/limitCollector');
 const { fetchOllamaLimits, rememberOllamaValidation } = require('../shared/ollamaLimits');
 const { copilotLoginErrorMessage, isAllowedVerificationUrl, runCopilotDeviceFlowLogin } = require('../shared/copilotDeviceFlow');
 const {
@@ -361,7 +361,6 @@ let mainWindow = null;
 let dashboardWindow = null;
 let settingsPath = null;
 let settings = null;
-let claudeWebCookieMutationRevision = 0;
 let persistedSettingsSnapshot = null;
 let credentialStore = null;
 let credentialStorageErrorShown = false;
@@ -521,6 +520,7 @@ function defaultSettings() {
     startAtLogin: false,
     language: 'auto',
     claudeWebCookie: '',
+    claudeWebAccounts: [],
     opencodeCookie: '',
     opencodeProfiles: {},
     openrouterProfiles: {},
@@ -693,12 +693,31 @@ function normalizeClaudeWebCookie(value) {
   return normalizeClaudeWebCookieInput(value);
 }
 
-function currentClaudeWebCookie() {
-  return settings?.claudeWebCookie || claudeWebCookie(process.env);
+function claudeWebAccounts() {
+  return normalizeClaudeWebAccounts(settings?.claudeWebAccounts);
+}
+
+// Identity only: the cookies never leave the main process.
+function claudeWebAccountsForRenderer() {
+  return claudeWebAccounts().map(({ id, accountKey, accountEmail, accountName, accountLabel }) => ({
+    id, accountKey, accountEmail, accountName, accountLabel
+  }));
+}
+
+// A cookie saved before several Web logins could be kept becomes the first
+// account. Its identity is unknown here and is filled in by the next successful
+// read, through persistClaudeWebAccountIdentity.
+function migrateClaudeWebCookie(merged) {
+  const accounts = normalizeClaudeWebAccounts(merged.claudeWebAccounts);
+  const legacyCookie = claudeWebCookie({}, { claudeWebCookie: merged.claudeWebCookie });
+  if (legacyCookie && !accounts.some((account) => account.cookie === legacyCookie)) {
+    accounts.push({ id: crypto.randomUUID(), cookie: legacyCookie });
+  }
+  merged.claudeWebAccounts = normalizeClaudeWebAccounts(accounts);
+  merged.claudeWebCookie = '';
 }
 
 function persistClaudeWebCookieRenewal({ previousCookie, cookie } = {}) {
-  if (!settings?.claudeWebCookie) return false;
   let expected;
   let renewed;
   try {
@@ -707,11 +726,28 @@ function persistClaudeWebCookieRenewal({ previousCookie, cookie } = {}) {
   } catch (_) {
     return false;
   }
-  if (!renewed || normalizeClaudeWebCookie(settings.claudeWebCookie) !== expected) return false;
-  if (settings.claudeWebCookie === renewed) return true;
-  settings.claudeWebCookie = renewed;
+  const accounts = claudeWebAccounts();
+  const account = renewed ? accounts.find((entry) => entry.cookie === expected) : null;
+  if (!account) return false;
+  if (account.cookie === renewed) return true;
+  account.cookie = renewed;
+  settings.claudeWebAccounts = accounts;
   saveSettings({ throwOnError: true });
   return true;
+}
+
+// Runs after a successful read, so the settings list can name the account and a
+// login that later stops working still reports under it.
+function persistClaudeWebAccountIdentity({ id, accountKey, accountEmail, accountName, accountLabel } = {}) {
+  const accounts = claudeWebAccounts();
+  if (!accounts.some((account) => account.id === id)) return;
+  const next = normalizeClaudeWebAccounts(accounts.map((account) => (
+    account.id === id ? { ...account, accountKey, accountEmail, accountName, accountLabel } : account
+  )));
+  if (JSON.stringify(next) === JSON.stringify(accounts)) return;
+  settings.claudeWebAccounts = next;
+  saveSettings({ throwOnError: true });
+  pushSettingsToRenderer();
 }
 
 function electronLimitsDeps() {
@@ -728,6 +764,7 @@ function electronLimitsDeps() {
     },
     resolveConfigSnapshot: () => electronLimitsConfig(),
     onClaudeWebCookieRenewed: persistClaudeWebCookieRenewal,
+    onClaudeWebAccountResolved: persistClaudeWebAccountIdentity,
     onThirdPartyCredentialsRenewed: persistThirdPartyCredentialsRenewal,
     onThirdPartyAccountKeyResolved: persistThirdPartyAccountKey
   };
@@ -2241,6 +2278,7 @@ function readSettings() {
     if (merged.opencodeCookie && Object.keys(merged.opencodeProfiles || {}).length === 0) {
       merged.opencodeProfiles = { default: { cookie: merged.opencodeCookie, enabled: true } };
     }
+    migrateClaudeWebCookie(merged);
     migrateLegacyMimoCredentialFiles(merged.mimoManagedAccounts);
     Object.assign(merged, normalizeTrayModeSettings(merged));
     return normalizeWindowBehaviorSettings(merged);
@@ -4364,7 +4402,7 @@ function thirdPartyProfileWithCanonicalIdentity(profile, provider) {
 }
 
 function settingsForRenderer() {
-  const claudeWebCookieSource = settings?.claudeWebCookie
+  const claudeWebCookieSource = claudeWebAccounts().length > 0
     ? 'settings'
     : claudeWebCookie(process.env)
       ? 'env'
@@ -4464,7 +4502,7 @@ function settingsForRenderer() {
     zaiTeamProjectId: settings?.zaiTeamProjectId ? 'set' : '',
     volcengineAccessKeyId: settings?.volcengineAccessKeyId ? 'set' : '',
     volcengineAgentAccessKeyId: settings?.volcengineAgentAccessKeyId ? 'set' : '',
-    claudeWebCookie: settings?.claudeWebCookie ? 'set' : '',
+    claudeWebAccounts: claudeWebAccountsForRenderer(),
     qoderCookie: settings?.qoderCookie ? 'set' : '',
     traeAccessToken: settings?.traeAccessToken ? 'set' : '',
     traeDeviceId: settings?.traeDeviceId ? 'set' : '',
@@ -4486,7 +4524,7 @@ function settingsForRenderer() {
     thirdPartyEnvConfigured: thirdPartyLimits.configuredAccounts({}, { env: process.env }).length > 0,
     codexManagedAccounts: codexAccountsForRenderer(),
     mimoManagedAccounts: mimoAccountsForRenderer(),
-    claudeWebCookieConfigured: Boolean(currentClaudeWebCookie()),
+    claudeWebCookieConfigured: Boolean(claudeWebCookieSource),
     claudeWebCookieSource,
     deepseekApiKeyConfigured: Boolean(currentDeepSeekApiKey()),
     deepseekApiKeySource,
@@ -5728,7 +5766,6 @@ app.whenReady().then(() => {
     }
   });
   ipcMain.handle('settings:update', (_event, patch) => {
-    if (patch?.claudeWebCookie !== undefined) claudeWebCookieMutationRevision += 1;
     const previousSettingsState = settings;
     const previousRuntimeSettings = JSON.parse(JSON.stringify(settings));
     const previousNativeMaterial = nativeBlurEnabled();
@@ -5752,6 +5789,11 @@ app.whenReady().then(() => {
     delete normalizedPatch.windowMaximized;
     delete normalizedPatch.codexManagedAccounts;
     delete normalizedPatch.mimoManagedAccounts;
+    // Claude Web logins go through claude:saveCookie and claude:removeAccount,
+    // which validate a cookie before it is stored. The renderer only ever holds
+    // the redacted list, so a patch carrying one could only erase the cookies.
+    delete normalizedPatch.claudeWebCookie;
+    delete normalizedPatch.claudeWebAccounts;
     delete normalizedPatch.workbuddyAccessToken;
     delete normalizedPatch.workbuddyUserId;
     delete normalizedPatch.workbuddyEnterpriseId;
@@ -5778,7 +5820,6 @@ app.whenReady().then(() => {
     delete normalizedPatch.subscriptionsHub;
     delete normalizedPatch.subscriptionsUpdatedAt;
     if (patch.clients !== undefined) normalizedPatch.clients = clientsCsvForSetting(patch.clients, '');
-    if (patch.claudeWebCookie !== undefined) normalizedPatch.claudeWebCookie = normalizeClaudeWebCookie(patch.claudeWebCookie);
     if (patch.deepseekApiKey !== undefined) normalizedPatch.deepseekApiKey = normalizeDeepSeekApiKey(patch.deepseekApiKey);
     if (patch.minimaxApiKey !== undefined) normalizedPatch.minimaxApiKey = normalizeMinimaxApiKey(patch.minimaxApiKey);
     if (patch.copilotApiToken !== undefined) normalizedPatch.copilotApiToken = normalizeCopilotApiToken(patch.copilotApiToken);
@@ -5903,9 +5944,6 @@ app.whenReady().then(() => {
       currencyRates: patch.currencyRates !== undefined ? normalizeCurrencyOverrides(patch.currencyRates) : normalizeCurrencyOverrides(settings.currencyRates),
       language: patch.language !== undefined ? normalizeLanguageSetting(patch.language, settings.language) : normalizeLanguageSetting(settings.language),
       startAtLogin: loginItemEnabledHere() ? parseBoolean(patch.startAtLogin ?? settings.startAtLogin, false) : false,
-      claudeWebCookie: patch.claudeWebCookie !== undefined
-        ? normalizeClaudeWebCookie(patch.claudeWebCookie)
-        : (settings.claudeWebCookie || ''),
       deepseekApiKey: patch.deepseekApiKey !== undefined ? normalizeDeepSeekApiKey(patch.deepseekApiKey) : (settings.deepseekApiKey || ''),
       minimaxApiKey: patch.minimaxApiKey !== undefined ? normalizeMinimaxApiKey(patch.minimaxApiKey) : (settings.minimaxApiKey || ''),
       copilotApiToken: patch.copilotApiToken !== undefined ? normalizeCopilotApiToken(patch.copilotApiToken) : (settings.copilotApiToken || ''),
@@ -6302,7 +6340,6 @@ app.whenReady().then(() => {
     }
   });
   ipcMain.handle('claude:saveCookie', async (_event, raw) => {
-    const requestRevision = ++claudeWebCookieMutationRevision;
     let cookie;
     try {
       cookie = normalizeClaudeWebCookie(raw);
@@ -6338,15 +6375,26 @@ app.whenReady().then(() => {
           status: provider?.status || 'error'
         };
       }
-      if (claudeWebCookieMutationRevision !== requestRevision) {
-        return {
-          ok: false,
-          status: 'superseded',
-          superseded: true
-        };
-      }
-      settings.claudeWebCookie = cookieToPersist;
+      // Read only now, after the probe: another save or a removal may have
+      // landed while this cookie was being checked. A cookie for an account
+      // that is already listed replaces that account's login in place.
+      const accounts = claudeWebAccounts();
+      const existing = accounts.find((account) => (
+        (account.accountKey && account.accountKey === provider.accountKey) || account.cookie === cookie
+      ));
+      const account = {
+        id: existing?.id || crypto.randomUUID(),
+        cookie: cookieToPersist,
+        accountKey: provider.accountKey,
+        accountEmail: provider.accountEmail,
+        accountName: provider.accountName,
+        accountLabel: provider.accountLabel
+      };
+      settings.claudeWebAccounts = normalizeClaudeWebAccounts(existing
+        ? accounts.map((entry) => (entry === existing ? account : entry))
+        : [...accounts, account]);
       saveSettings({ throwOnError: true });
+      pushSettingsToRenderer();
       void queueLimitInvalidation({ provider: 'claude' }, 'login', { clear: true });
       return {
         ok: true,
@@ -6359,6 +6407,23 @@ app.whenReady().then(() => {
         errorCode: error?.code || ''
       };
     }
+  });
+  ipcMain.handle('claude:removeAccount', (_event, id) => {
+    const accounts = claudeWebAccounts();
+    const remaining = accounts.filter((account) => account.id !== String(id || '').trim());
+    if (remaining.length === accounts.length) return { ok: false, error: 'Account not found' };
+    settings.claudeWebAccounts = remaining;
+    try {
+      saveSettings({ throwOnError: true });
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+    pushSettingsToRenderer();
+    // Provider-wide on purpose: the remaining logins report in a different shape
+    // once only one is left, and removing the last one hands Claude back to
+    // OAuth/CLI detection.
+    void queueLimitInvalidation({ provider: 'claude' }, 'credential-change', { clear: true });
+    return { ok: true };
   });
   ipcMain.handle('ollama:validateCookie', async (_event, raw) => {
     const cookie = normalizeOllamaCookie(raw);

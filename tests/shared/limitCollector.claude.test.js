@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const test = require('node:test');
 
-const { claudeCommandCandidates, claudeWebCookie, fetchClaudeLimits, mapClaudeCliUsageToProvider, mapClaudeUsageToProvider, normalizeClaudeWebCookieInput } = require('../../src/shared/limitCollector');
+const { claudeCommandCandidates, claudeWebCookie, fetchClaudeLimits, mapClaudeCliUsageToProvider, mapClaudeUsageToProvider, normalizeClaudeWebAccounts, normalizeClaudeWebCookieInput } = require('../../src/shared/limitCollector');
 
 function fakeSpawnForClaudeUsage(expectedCommand = 'claude.cmd') {
   return (command, args) => {
@@ -1756,4 +1756,223 @@ test('the prepaid TTL follows the limits refresh interval at twice its length', 
   nowMs += 61_000;
   await fetchClaudeLimits(options, deps);
   assert.equal(requests.filter((url) => url.includes('/prepaid/credits')).length, 1);
+});
+
+// Three claude.ai accounts, each behind its own session cookie. `rejected`
+// names cookies claude.ai no longer accepts.
+const WEB_LOGINS = {
+  'sessionKey=sk-ant-login-a': { account: 'account-a', email: 'a@example.com', organization: 'org-a', capability: 'claude_max', session: 11 },
+  'sessionKey=sk-ant-login-b': { account: 'account-b', email: 'b@example.com', organization: 'org-b', capability: 'claude_pro', session: 52 },
+  'sessionKey=sk-ant-login-c': { account: 'account-c', email: 'c@example.com', organization: 'org-c', capability: 'claude_pro', session: 93 }
+};
+
+function fakeClaudeWebLoginsFetch({ logins = WEB_LOGINS, rejected = [], requests = [] } = {}) {
+  return async (url, options) => {
+    const headers = { get: () => '', getSetCookie: () => [] };
+    const cookie = options.headers.cookie;
+    requests.push({ cookie, url });
+    const login = logins[cookie];
+    if (!login || rejected.includes(cookie)) return { ok: false, status: 401, headers, json: async () => ({}) };
+    if (url.endsWith('/api/organizations')) {
+      return {
+        ok: true,
+        status: 200,
+        headers,
+        json: async () => [{ uuid: login.organization, name: login.organization, capabilities: ['chat', login.capability] }]
+      };
+    }
+    if (url.endsWith('/api/account')) {
+      return { ok: true, status: 200, headers, json: async () => ({ uuid: login.account, email_address: login.email }) };
+    }
+    if (url.includes('/prepaid/credits')) {
+      return { ok: true, status: 200, headers, json: async () => ({ amount: 0, currency: 'USD' }) };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers,
+      json: async () => ({
+        five_hour: { utilization: login.session, resets_at: '2026-07-27T10:50:00Z' },
+        seven_day: { utilization: 5, resets_at: '2026-07-31T10:00:00Z' }
+      })
+    };
+  };
+}
+
+function webLogins(...suffixes) {
+  return suffixes.map((suffix) => ({ id: `login-${suffix}`, cookie: `sessionKey=sk-ant-login-${suffix}` }));
+}
+
+// The identity each login resolves to, as the widget would have stored it after
+// a first successful read.
+async function resolvedWebLogins(...suffixes) {
+  const resolved = new Map();
+  await fetchClaudeLimits({ claudeWebAccounts: webLogins(...suffixes) }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch(),
+    onClaudeWebAccountResolved: ({ id, ...identity }) => resolved.set(id, identity)
+  });
+  return webLogins(...suffixes).map((login) => ({ ...login, ...resolved.get(login.id) }));
+}
+
+function sessionUsedPercent(provider) {
+  return provider.windows.find((window) => window.kind === 'session').usedPercent;
+}
+
+test('several saved Claude Web logins each report their own account', async () => {
+  const providers = await fetchClaudeLimits(
+    {
+      claudeWebAccounts: webLogins('a', 'b', 'c'),
+      // Saved logins outrank the single-cookie option the same way the saved
+      // cookie used to outrank the environment.
+      claudeWebCookie: 'sessionKey=sk-ant-ignored'
+    },
+    { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch() }
+  );
+
+  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'b@example.com', 'c@example.com']);
+  assert.deepEqual(providers.map((provider) => provider.status), ['ok', 'ok', 'ok']);
+  assert.deepEqual(providers.map((provider) => provider.source), ['web', 'web', 'web']);
+  assert.deepEqual(providers.map((provider) => provider.accountLabel), ['Max', 'Pro', 'Pro']);
+  assert.deepEqual(providers.map(sessionUsedPercent), [11, 52, 93]);
+  assert.equal(new Set(providers.map((provider) => provider.accountKey)).size, 3);
+});
+
+test('one saved Claude Web login keeps the single-provider shape and reports its identity once', async () => {
+  const resolutions = [];
+  const deps = {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch(),
+    onClaudeWebAccountResolved: (resolution) => resolutions.push(resolution)
+  };
+
+  const provider = await fetchClaudeLimits({ claudeWebAccounts: webLogins('b') }, deps);
+
+  assert.equal(Array.isArray(provider), false);
+  assert.equal(provider.accountEmail, 'b@example.com');
+  assert.deepEqual(resolutions, [{
+    id: 'login-b',
+    accountKey: provider.accountKey,
+    accountEmail: 'b@example.com',
+    accountName: 'org-b',
+    accountLabel: 'Pro'
+  }]);
+
+  // Once the identity is stored there is nothing new to report.
+  const { id: _id, ...identity } = resolutions[0];
+  await fetchClaudeLimits({ claudeWebAccounts: [{ ...webLogins('b')[0], ...identity }] }, deps);
+  assert.equal(resolutions.length, 1);
+});
+
+test('one rejected Claude Web login still fails the way the single cookie did', async () => {
+  await assert.rejects(
+    fetchClaudeLimits({ claudeWebAccounts: webLogins('b') }, {
+      providerRuntimeState: new Map(),
+      claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
+    }),
+    (error) => error.status === 'unauthorized'
+  );
+});
+
+test('a rejected Claude Web login among several keeps its own account and leaves the others intact', async () => {
+  const accounts = await resolvedWebLogins('a', 'b', 'c');
+  const providers = await fetchClaudeLimits({ claudeWebAccounts: accounts }, {
+    now: () => Date.parse('2026-07-27T00:00:00Z'),
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
+  });
+
+  assert.deepEqual(providers.map((provider) => provider.status), ['ok', 'unauthorized', 'ok']);
+  assert.deepEqual(providers.map((provider) => provider.accountKey), accounts.map((account) => account.accountKey));
+  assert.equal(providers[1].accountEmail, 'b@example.com');
+  assert.equal(providers[1].accountLabel, 'Pro');
+  assert.equal(providers[1].source, 'web');
+  assert.deepEqual(providers[1].windows, []);
+  assert.equal(providers[1].updatedAt, '2026-07-27T00:00:00.000Z');
+  assert.deepEqual([sessionUsedPercent(providers[0]), sessionUsedPercent(providers[2])], [11, 93]);
+});
+
+test('a failing Claude Web login with no resolved identity is left out instead of reported anonymously', async () => {
+  const [known] = await resolvedWebLogins('a');
+  const providers = await fetchClaudeLimits({ claudeWebAccounts: [known, ...webLogins('b')] }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
+  });
+
+  // An unauthorized row with no accountKey is how a provider-wide failure
+  // looks, and LimitsRuntime would spread it over the healthy account too.
+  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com']);
+  assert.equal(providers[0].status, 'ok');
+});
+
+test('an account-scoped Claude refresh reads only the account it names', async () => {
+  const accounts = await resolvedWebLogins('a', 'b', 'c');
+  const requests = [];
+  const read = (limitRefreshScope) => fetchClaudeLimits({ claudeWebAccounts: accounts, limitRefreshScope }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({ requests })
+  });
+
+  const byKey = await read({ provider: 'claude', accountKey: accounts[1].accountKey });
+  assert.deepEqual(byKey.map((provider) => provider.accountEmail), ['b@example.com']);
+  assert.deepEqual([...new Set(requests.map((request) => request.cookie))], ['sessionKey=sk-ant-login-b']);
+
+  const byEmail = await read({ provider: 'claude', accountEmail: 'C@example.com' });
+  assert.deepEqual(byEmail.map((provider) => provider.accountEmail), ['c@example.com']);
+
+  // LimitsRuntime writes every row of a scoped refresh onto the scoped account,
+  // so a scope that names no saved login must not fall back to reading them all.
+  assert.deepEqual(await read({ provider: 'claude', accountKey: 'sha256:unknown' }), []);
+  assert.deepEqual(await read({ provider: 'claude', accountLabel: 'Pro' }), []);
+});
+
+test('a scoped Claude refresh finds a login whose identity is only cached so far', async () => {
+  const deps = { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch() };
+  const claudeWebAccounts = webLogins('a', 'b');
+  const [, second] = await fetchClaudeLimits({ claudeWebAccounts }, deps);
+
+  const scoped = await fetchClaudeLimits({
+    claudeWebAccounts,
+    limitRefreshScope: { provider: 'claude', accountKey: second.accountKey }
+  }, deps);
+
+  assert.deepEqual(scoped.map((provider) => provider.accountEmail), ['b@example.com']);
+});
+
+test('two sessions of one Claude account report a single row', async () => {
+  const providers = await fetchClaudeLimits({
+    claudeWebAccounts: [
+      ...webLogins('a'),
+      // A second cookie for account-a, saved before either identity was known.
+      { id: 'login-a-again', cookie: 'sessionKey=sk-ant-login-a-again' },
+      ...webLogins('c')
+    ]
+  }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({
+      logins: { ...WEB_LOGINS, 'sessionKey=sk-ant-login-a-again': WEB_LOGINS['sessionKey=sk-ant-login-a'] }
+    })
+  });
+
+  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'c@example.com']);
+});
+
+test('saved Claude Web logins are deduplicated and invalid ones dropped', () => {
+  assert.deepEqual(
+    normalizeClaudeWebAccounts([
+      { id: 'one', cookie: 'sk-ant-one', accountKey: 'sha256:one', accountEmail: ' One@Example.com ', accountName: ' Org ', accountLabel: 'Pro' },
+      { id: 'one', cookie: 'sessionKey=sk-ant-same-id' },
+      { id: 'two', cookie: 'sessionKey=sk-ant-one' },
+      { id: 'three', cookie: 'sessionKey=sk-ant-three', accountKey: 'sha256:one' },
+      { id: 'four', cookie: 'not-a-session-key' },
+      { id: '', cookie: 'sessionKey=sk-ant-no-id' },
+      null,
+      { id: 'five', cookie: 'sessionKey=sk-ant-five' }
+    ]),
+    [
+      { id: 'one', cookie: 'sessionKey=sk-ant-one', accountKey: 'sha256:one', accountEmail: 'one@example.com', accountName: 'Org', accountLabel: 'Pro' },
+      { id: 'five', cookie: 'sessionKey=sk-ant-five', accountKey: '', accountEmail: '', accountName: '', accountLabel: '' }
+    ]
+  );
+  assert.deepEqual(normalizeClaudeWebAccounts('sessionKey=sk-ant-one'), []);
 });

@@ -197,6 +197,44 @@ function claudeWebCookie(env = process.env, options = {}) {
   return normalizeClaudeWebCookie(env.CLAUDE_WEB_COOKIE);
 }
 
+const CLAUDE_WEB_ACCOUNT_IDENTITY_FIELDS = Object.freeze([
+  'accountKey',
+  'accountEmail',
+  'accountName',
+  'accountLabel'
+]);
+
+// Web logins saved in the widget, one per claude.ai account. `id` is local
+// bookkeeping; the identity fields are whatever the last successful read
+// resolved, kept so a login that has stopped working still reports under its
+// own account. The same cookie pasted twice, or two sessions of one account,
+// is one account.
+function normalizeClaudeWebAccounts(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const accounts = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const id = String(entry.id || '').trim();
+    const cookie = normalizeClaudeWebCookie(entry.cookie);
+    if (!id || !cookie) continue;
+    const accountKey = String(entry.accountKey || '').trim();
+    const identities = [`id:${id}`, `cookie:${cookie}`];
+    if (accountKey) identities.push(`key:${accountKey}`);
+    if (identities.some((identity) => seen.has(identity))) continue;
+    for (const identity of identities) seen.add(identity);
+    accounts.push({
+      id,
+      cookie,
+      accountKey,
+      accountEmail: String(entry.accountEmail || '').trim().toLowerCase().slice(0, 254),
+      accountName: String(entry.accountName || '').trim(),
+      accountLabel: String(entry.accountLabel || '').trim()
+    });
+  }
+  return accounts;
+}
+
 async function readJsonFile(filePath, deps) {
   const readFile = deps.readFile || fs.promises.readFile;
   const text = await readFile(filePath, 'utf8');
@@ -1449,6 +1487,87 @@ async function fetchClaudeWebLimits(cookie, deps = {}, options = {}) {
   });
 }
 
+// The account a saved login belongs to, without a request. A cookie saved
+// before identities were recorded has none stored until its first successful
+// read, so the identity cache answers for it in the meantime.
+function claudeWebAccountKnownIdentity(account, deps = {}) {
+  const identity = account.accountKey
+    ? account
+    : claudeCachedIdentity(claudeWebIdentityFingerprint(account.cookie), deps, { allowStale: true })?.identity;
+  return Object.fromEntries(
+    CLAUDE_WEB_ACCOUNT_IDENTITY_FIELDS.map((field) => [field, identity?.[field] || ''])
+  );
+}
+
+// Same precedence LimitsRuntime uses to turn a scope into a lane identity.
+function claudeWebAccountInScope(identity, scope) {
+  if (scope.accountKey) return identity.accountKey === scope.accountKey;
+  if (scope.accountEmail) return identity.accountEmail === String(scope.accountEmail).trim().toLowerCase();
+  if (scope.accountName) return identity.accountName === scope.accountName;
+  return false;
+}
+
+async function fetchClaudeWebAccount(account, deps = {}, options = {}) {
+  const provider = await fetchClaudeWebLimits(account.cookie, deps, options);
+  if (CLAUDE_WEB_ACCOUNT_IDENTITY_FIELDS.some((field) => provider[field] !== account[field])) {
+    try {
+      await deps.onClaudeWebAccountResolved?.({
+        id: account.id,
+        ...Object.fromEntries(CLAUDE_WEB_ACCOUNT_IDENTITY_FIELDS.map((field) => [field, provider[field]]))
+      });
+    } catch (error) {
+      deps.logger?.(`[limits] Claude Web account identity could not be persisted: ${error.message}`);
+    }
+  }
+  return provider;
+}
+
+async function fetchClaudeWebAccounts(accounts, deps = {}, options = {}) {
+  // One login keeps the single-provider shape and its error propagation, so a
+  // rejected cookie surfaces exactly as it did before more could be saved.
+  if (accounts.length === 1) return fetchClaudeWebAccount(accounts[0], deps, options);
+  const nowMs = (deps.now || Date.now)();
+  // LimitsRuntime writes every row of an account-scoped refresh onto that one
+  // account, so a scoped call has to answer for that account alone.
+  const scope = options.limitRefreshScope?.provider === 'claude'
+    ? options.limitRefreshScope
+    : null;
+  const targets = scope
+    ? accounts.filter((account) => claudeWebAccountInScope(claudeWebAccountKnownIdentity(account, deps), scope))
+    : accounts;
+  // Concurrent on purpose: every login is its own claude.ai session, and reading
+  // them in turn would multiply the provider's worst case by the account count.
+  const providers = await Promise.all(targets.map(async (account) => {
+    try {
+      return await fetchClaudeWebAccount(account, deps, options);
+    } catch (error) {
+      const identity = claudeWebAccountKnownIdentity(account, deps);
+      // A failure that names no account is indistinguishable from a
+      // provider-wide one, and LimitsRuntime would apply it to every other
+      // account's row. The login stays listed in settings, where it can be
+      // replaced or removed.
+      if (!identity.accountKey) {
+        deps.logger?.(`[limits] Claude Web account without a resolved identity failed: ${error.message}`);
+        return null;
+      }
+      return normalizeLimitProvider({
+        provider: 'claude',
+        ...identity,
+        source: 'web',
+        status: providerStatusFromError(error),
+        updatedAt: nowIso(nowMs),
+        windows: []
+      });
+    }
+  }));
+  const seen = new Set();
+  return providers.filter((provider) => {
+    if (!provider || seen.has(provider.accountKey)) return false;
+    seen.add(provider.accountKey);
+    return true;
+  });
+}
+
 function claudeIdentityUnavailable(message, cause) {
   const error = errorWithStatus('unavailable', message);
   error.code = 'CLAUDE_IDENTITY_UNAVAILABLE';
@@ -1532,6 +1651,8 @@ async function refreshClaudeCredentials(currentCredentials, deps = {}) {
 async function fetchClaudeLimits(options = {}, deps = {}) {
   const nowMs = (deps.now || Date.now)();
   const platform = deps.platform || process.platform;
+  const webAccounts = normalizeClaudeWebAccounts(options.claudeWebAccounts);
+  if (webAccounts.length > 0) return fetchClaudeWebAccounts(webAccounts, deps, options);
   const webCookie = claudeWebCookie(deps.env || process.env, options);
   if (webCookie) return fetchClaudeWebLimits(webCookie, deps, options);
   let oauthIdentity = null;
@@ -4275,6 +4396,7 @@ module.exports = {
   fetchThirdPartyLimits: thirdPartyLimits.fetchThirdPartyLimits,
   fetchOpenCodeProfile,
   claudeWebCookie,
+  normalizeClaudeWebAccounts,
   normalizeClaudeWebCookieInput,
   fetchClaudeLimits,
   fetchCodexLimits,

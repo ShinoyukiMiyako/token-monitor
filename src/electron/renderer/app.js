@@ -313,7 +313,7 @@ function normalizeInitialViewValue(value, allowed, fallback) {
   return allowed.has(raw) ? raw : fallback;
 }
 
-const state = { period: normalizeInitialViewValue(initialViewState.period, viewPeriodValues, 'today'), breakdown: normalizeInitialViewValue(initialViewState.breakdown, viewBreakdownValues, 'home'), viewSwitcherOpen: false, viewSwitcherHasOpened: false, limitDetailTooltipHasOpened: false, limitDetailTooltipActive: false, limitDetailTooltipRenderPending: false, settings: null, stats: null, homeHistory: null, homeHistoryBusy: false, homeHistoryRequested: false, homeHistorySignature: '', homeHistoryRetries: 0, homeHistoryRetryTimer: null, homeActivityScrollLeft: null, homeActivityFollowEnd: true, homeActivityResizeObserver: null, serviceStatus: null, serviceStatusBusy: false, serviceProvidersExpanded: false, trendSettingsExpanded: false, trendsActivating: false, homeSettingsExpanded: false, homeLimitSettingsExpanded: false, limitProviderSettingsExpanded: '', clientHealthExpanded: '', clientSources: clientSourceCacheApi.createClientSourceCache(), clientSourcesKey: '', clientSourcesRequest: 0, subscriptionEditingId: '', subscriptionTopUps: [], subscriptionFormBase: null, subscriptionEditorTransitionId: 0, serviceStatusTicker: null, refreshTimer: null, refreshBusy: false, refreshFeedbackTimer: null, currentTotal: 0, rowSignature: '', streamConnected: false, streamFailure: null, mode: 'idle', appInfo: null, systemDarkUi: false, tokscaleStatus: null, tokscaleCheck: null, tokscaleBusy: false, hubInfo: null, hubBuildStatus: null, cursorAccount: { status: null, error: '' }, cursorAccountExpanded: false, codexAccountExpanded: false, codexAccountError: '', codexSignInBusy: false, codexSignInFlowId: '', codexLoginUrl: '', codexLoginStatus: '', codexLoginOutput: '', codexWorkspaceChoices: [], codexWorkspaceId: '', codexActiveAccount: null, codexPendingActiveAccount: null, codexPendingActiveAccountUntil: 0, codexPendingActiveAccountTimer: null, codexSystemSwitchingAccountId: '', codexSystemSwitchErrorAccountId: '', codexSystemSwitchError: '', codexSwitchPopoverHasOpened: false, codexSwitchPopoverActive: false, codexSwitchPopoverRenderPending: false, customPricingExpanded: false, claudeAccountExpanded: false, claudePendingCheckSince: 0, opencodeProfileCount: 0, opencodeCookieExpanded: false, openrouterProfileCount: 0, openrouterAccountExpanded: false, thirdPartyProfileCount: 0, thirdPartyAccountExpanded: false, deepseekAccountExpanded: false, deepseekPendingCheckSince: 0, minimaxAccountExpanded: false, minimaxPendingCheckSince: 0, zaiAccountExpanded: false, zaiPendingCheckSince: 0, zaiteamAccountExpanded: false, zaiteamPendingCheckSince: 0, volcengineAccountExpanded: false, volcenginePendingCheckSince: 0, volcengineAgentExpanded: false, qoderAccountExpanded: false, qoderPendingCheckSince: 0, commandcodeAccountExpanded: false, commandcodePendingCheckSince: 0, kimiAccountExpanded: false, kimiPendingCheckSince: 0, ollamaAccountExpanded: false, ollamaPendingCheckSince: 0, mimoAccountExpanded: false, mimoAccountError: '', copilotAccountExpanded: false, copilotManualExpanded: false, copilotPendingCheckSince: 0, copilotSignInBusy: false, copilotSignInCancelable: false, copilotSignInFlowId: '', copilotAuthorizeMessage: '', copilotLoginStatus: '', copilotErrorMessage: '', floatingBubble: initialFloatingBubble, suppressInitialNumberAnimation: window.__TOKEN_MONITOR_SUPPRESS_INITIAL_NUMBER_ANIMATION__ === true, openSession: null, detailSort: 'time', recordingWindowShortcut: false, windowShortcutInvalid: false };
+const state = { period: normalizeInitialViewValue(initialViewState.period, viewPeriodValues, 'today'), breakdown: normalizeInitialViewValue(initialViewState.breakdown, viewBreakdownValues, 'home'), viewSwitcherOpen: false, viewSwitcherHasOpened: false, limitDetailTooltipHasOpened: false, limitDetailTooltipActive: false, limitDetailTooltipRenderPending: false, settings: null, stats: null, homeHistory: null, homeHistoryBusy: false, homeHistoryRequested: false, homeHistorySignature: '', homeHistoryRetries: 0, homeHistoryRetryTimer: null, homeActivityScrollLeft: null, homeActivityFollowEnd: true, homeActivityResizeObserver: null, serviceStatus: null, serviceStatusBusy: false, serviceProvidersExpanded: false, trendSettingsExpanded: false, trendsActivating: false, homeSettingsExpanded: false, homeLimitSettingsExpanded: false, limitProviderSettingsExpanded: '', clientHealthExpanded: '', clientSources: clientSourceCacheApi.createClientSourceCache(), clientSourcesKey: '', clientSourcesRequest: 0, subscriptionEditingId: '', subscriptionTopUps: [], subscriptionFormBase: null, subscriptionEditorTransitionId: 0, serviceStatusTicker: null, refreshTimer: null, refreshBusy: false, refreshFeedbackTimer: null, currentTotal: 0, rowSignature: '', streamConnected: false, streamFailure: null, mode: 'idle', appInfo: null, systemDarkUi: false, tokscaleStatus: null, tokscaleCheck: null, tokscaleBusy: false, hubInfo: null, hubBuildStatus: null, cursorAccount: { status: null, error: '' }, cursorAccountExpanded: false, codexAccountExpanded: false, codexAccountError: '', codexSignInBusy: false, codexSignInFlowId: '', codexLoginUrl: '', codexLoginStatus: '', codexLoginOutput: '', codexWorkspaceChoices: [], codexWorkspaceId: '', codexActiveAccount: null, codexPendingActiveAccount: null, codexPendingActiveAccountUntil: 0, codexPendingActiveAccountTimer: null, codexSystemSwitchingAccountId: '', codexSystemSwitchErrorAccountId: '', codexSystemSwitchError: '', codexSwitchPopoverHasOpened: false, codexSwitchPopoverActive: false, codexSwitchPopoverRenderPending: false, customPricingExpanded: false, claudeAccountExpanded: false, claudeAddAccountExpanded: false, claudePendingCheckSince: 0, opencodeProfileCount: 0, opencodeCookieExpanded: false, openrouterProfileCount: 0, openrouterAccountExpanded: false, thirdPartyProfileCount: 0, thirdPartyAccountExpanded: false, deepseekAccountExpanded: false, deepseekPendingCheckSince: 0, minimaxAccountExpanded: false, minimaxPendingCheckSince: 0, zaiAccountExpanded: false, zaiPendingCheckSince: 0, zaiteamAccountExpanded: false, zaiteamPendingCheckSince: 0, volcengineAccountExpanded: false, volcenginePendingCheckSince: 0, volcengineAgentExpanded: false, qoderAccountExpanded: false, qoderPendingCheckSince: 0, commandcodeAccountExpanded: false, commandcodePendingCheckSince: 0, kimiAccountExpanded: false, kimiPendingCheckSince: 0, ollamaAccountExpanded: false, ollamaPendingCheckSince: 0, mimoAccountExpanded: false, mimoAccountError: '', copilotAccountExpanded: false, copilotManualExpanded: false, copilotPendingCheckSince: 0, copilotSignInBusy: false, copilotSignInCancelable: false, copilotSignInFlowId: '', copilotAuthorizeMessage: '', copilotLoginStatus: '', copilotErrorMessage: '', floatingBubble: initialFloatingBubble, suppressInitialNumberAnimation: window.__TOKEN_MONITOR_SUPPRESS_INITIAL_NUMBER_ANIMATION__ === true, openSession: null, detailSort: 'time', recordingWindowShortcut: false, windowShortcutInvalid: false };
 state.clientRescans = clientRescanStateApi.createClientRescanState({
   onChange: (clientId) => {
     if (state.clientHealthExpanded === clientId) refillOpenClientHealthPanel();
@@ -13440,7 +13440,7 @@ function renderExternalProviderStatus(providerName) {
   const refreshBtn = document.getElementById(`${providerName}RefreshButton`);
   const manualPanel = document.getElementById(`${providerName}ManualPanel`);
   const errorEl = document.getElementById(`${providerName}ErrorMessage`);
-  if (!config || !statusEl || !openBtn || !logoutBtn || !refreshBtn || !manualPanel || !errorEl) return;
+  if (!config || !statusEl || !openBtn || !refreshBtn || !manualPanel || !errorEl) return;
 
   errorEl.classList.add('hidden');
   errorEl.textContent = '';
@@ -13471,10 +13471,90 @@ function renderExternalProviderStatus(providerName) {
   );
   manualPanel.classList.toggle('hidden', linked);
   openBtn.classList.toggle('hidden', linked);
-  const canClearConfiguredClaude = providerName === 'claude' && configured;
-  logoutBtn.classList.toggle('hidden', source !== 'settings' || (!linked && !canClearConfiguredClaude));
+  // Claude has no single logout: each saved login is removed from its own row.
+  logoutBtn?.classList.toggle('hidden', source !== 'settings' || !linked);
   refreshBtn.classList.toggle('hidden', !configured);
+  if (providerName === 'claude') renderClaudeWebAccounts(statusEl, linked, enabled && !pending);
   renderSettingsSummaries();
+}
+
+function claudeWebAccountInfoText(account) {
+  if (!account.accountKey) return t('settings.common.notChecked');
+  const provider = localProviderStatuses('claude').find((entry) => entry.accountKey === account.accountKey);
+  return provider?.status === 'unauthorized'
+    ? t('settings.claude.statusInvalid')
+    : limitProviderPresentationApi.limitProviderDisplayLabel(account.accountLabel);
+}
+
+// Claude keeps one Web login per account, where the generic panel above assumes
+// a single credential. This lists the saved logins and keeps the cookie form
+// reachable after the first one is linked, behind the add button.
+function renderClaudeWebAccounts(statusEl, linked, settled) {
+  const listEl = document.getElementById('claudeAccountList');
+  const addBtn = document.getElementById('claudeAddAccountButton');
+  if (!listEl || !addBtn) return;
+  const accounts = state.settings?.claudeWebAccounts || [];
+  if (settled && accounts.length > 1) {
+    setCursorStatusText(statusEl, t('settings.claude.nAccounts', { count: accounts.length }));
+  }
+  const collapsible = linked || accounts.length > 0;
+  const formHidden = collapsible && !state.claudeAddAccountExpanded;
+  document.getElementById('claudeManualPanel').classList.toggle('hidden', formHidden);
+  document.getElementById('claudeOpenBrowser').classList.toggle('hidden', formHidden);
+  addBtn.classList.toggle('hidden', !collapsible);
+  addBtn.setAttribute('aria-expanded', formHidden ? 'false' : 'true');
+
+  listEl.replaceChildren(...accounts.map((account, index) => {
+    const accountName = limitAccountTitle('claude', account, index, accounts);
+    const row = document.createElement('div');
+    row.className = 'managed-account-row';
+
+    const main = document.createElement('div');
+    main.className = 'managed-account-main';
+    const label = document.createElement('div');
+    label.className = 'managed-account-email';
+    label.textContent = accountName;
+    main.append(label);
+
+    const right = document.createElement('span');
+    right.className = 'managed-account-right';
+    const info = document.createElement('span');
+    info.className = 'managed-account-info';
+    info.textContent = claudeWebAccountInfoText(account);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'managed-account-remove';
+    remove.textContent = '✕';
+    remove.title = t('settings.claude.remove');
+    let confirmingRemove = false;
+    remove.addEventListener('click', async () => {
+      if (!confirmingRemove) {
+        confirmingRemove = true;
+        remove.classList.add('confirming');
+        remove.textContent = '✓';
+        remove.title = t('settings.claude.removeConfirm', { account: accountName });
+        return;
+      }
+      const result = await window.tokenMonitor.claude.removeAccount(account.id);
+      if (result?.ok) {
+        state.settings.claudeWebAccounts = accounts.filter((entry) => entry.id !== account.id);
+      }
+      renderExternalProviderStatus('claude');
+      if (!result?.ok) {
+        // After the render: it clears this element on every pass.
+        const errorEl = document.getElementById('claudeErrorMessage');
+        errorEl.textContent = t('settings.claude.removeFailed', { message: result?.error || '' });
+        errorEl.classList.remove('hidden');
+        return;
+      }
+      refreshStats({ force: true }).catch(() => {});
+    });
+
+    right.append(info, remove);
+    row.append(main, right);
+    return row;
+  }));
 }
 
 // The override inputs are password fields, cleared after every save and never
@@ -15579,12 +15659,9 @@ function setupCursorAccountUI() {
       window.tokenMonitor.openExternal(claudePlatformUrl());
     });
 
-    document.getElementById('claudeLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ claudeWebCookie: '' });
-      clearExternalProviderCheckPending('claude');
-      clearExternalProviderPendingStatus('claude');
+    document.getElementById('claudeAddAccountButton').addEventListener('click', () => {
+      state.claudeAddAccountExpanded = !state.claudeAddAccountExpanded;
       renderExternalProviderStatus('claude');
-      await refreshStats({ force: true });
     });
 
     document.getElementById('claudeRefreshButton').addEventListener('click', async () => {
@@ -15611,7 +15688,6 @@ function setupCursorAccountUI() {
       submitButton.textContent = t('settings.common.checking');
       try {
         const result = await window.tokenMonitor.claude.saveCookie(input.value);
-        if (result?.superseded) return;
         if (!result?.ok) {
           if (result?.errorCode === 'INVALID_CLAUDE_WEB_SESSION_KEY') {
             errorEl.textContent = t('settings.claude.cookieInvalidFormat');
@@ -15631,9 +15707,11 @@ function setupCursorAccountUI() {
           limitsEnabled: true
         });
         input.value = '';
+        // The panel stays open on the list, so the account just added is visible
+        // and the next one is a single click away.
+        state.claudeAddAccountExpanded = false;
         renderExternalProviderStatus('claude');
         await refreshStats({ force: true });
-        setExternalAccountExpanded('claude', !externalProviderAccountLinked('claude'));
         renderExternalProviderStatus('claude');
       } catch (err) {
         clearExternalProviderCheckPending('claude');

@@ -1223,3 +1223,38 @@ test('a retained transient previous row seeds lastGood windows after restart', (
   assert.equal(row.windows[0].usedPercent, 20);
   runtime.stop();
 });
+
+// Runs the real Claude probe, not a stub: what is under test is that the
+// collector and the lane agree on what an account-scoped refresh returns.
+test('a scoped refresh of one saved Claude Web login leaves the other accounts untouched', async () => {
+  const sessionUsed = { a: 10, b: 20, c: 30 };
+  const claudeWebFetch = async (url, options) => {
+    const login = options.headers.cookie.slice('sessionKey=sk-ant-'.length);
+    const headers = { get: () => '', getSetCookie: () => [] };
+    const json = url.endsWith('/api/organizations')
+      ? [{ uuid: `org-${login}`, name: `Org ${login}`, capabilities: ['chat', 'claude_pro'] }]
+      : url.endsWith('/api/account')
+        ? { uuid: `account-${login}`, email_address: `${login}@example.com` }
+        : { five_hour: { utilization: sessionUsed[login], resets_at: '2026-07-27T10:50:00Z' } };
+    return { ok: true, status: 200, headers, json: async () => json };
+  };
+  const runtime = createLimitsRuntime({
+    limitProviders: ['claude'],
+    claudePrepaidBalanceEnabled: false,
+    claudeWebAccounts: ['a', 'b', 'c'].map((login) => ({ id: login, cookie: `sessionKey=sk-ant-${login}` }))
+  }, runtimeDeps({ claudeWebFetch }));
+  const sessionByEmail = () => Object.fromEntries(runtime.getSnapshot().providers.map((row) => [
+    row.accountEmail,
+    row.windows.find((window) => window.kind === 'session').usedPercent
+  ]));
+
+  await runtime.refresh({ provider: 'claude' }, 'manual');
+  assert.deepEqual(sessionByEmail(), { 'a@example.com': 10, 'b@example.com': 20, 'c@example.com': 30 });
+
+  Object.assign(sessionUsed, { a: 11, b: 21, c: 31 });
+  const accountB = runtime.getSnapshot().providers.find((row) => row.accountEmail === 'b@example.com');
+  await runtime.refresh({ provider: 'claude', accountKey: accountB.accountKey }, 'reset-boundary');
+
+  assert.deepEqual(sessionByEmail(), { 'a@example.com': 10, 'b@example.com': 21, 'c@example.com': 30 });
+  runtime.stop();
+});

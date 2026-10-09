@@ -426,6 +426,22 @@ test('Claude Web cookie falls back to env and invalidates only the Claude limits
   assert.equal(classification.limitsReconfigure, false);
 });
 
+test('saved Claude Web logins reach the limits config and invalidate only the Claude lane', () => {
+  const accounts = [
+    { id: 'a', cookie: 'sessionKey=sk-ant-a', accountKey: 'sha256:a' },
+    { id: 'b', cookie: 'sessionKey=sk-ant-b', accountKey: 'sha256:b' }
+  ];
+  assert.deepEqual(limitsConfigFromSettings({ claudeWebAccounts: accounts }, { env: {} }).claudeWebAccounts, accounts);
+  assert.deepEqual(limitsConfigFromSettings({}, { env: {} }).claudeWebAccounts, []);
+
+  const classification = classifySettingsChange(
+    { claudeWebAccounts: accounts.slice(0, 1) },
+    { claudeWebAccounts: accounts }
+  );
+  assert.deepEqual(classification.limitScopes, [{ provider: 'claude' }]);
+  assert.equal(classification.limitsReconfigure, false);
+});
+
 test('OpenCode local limits are explicit and invalidate the OpenCode lane', () => {
   assert.equal(limitsConfigFromSettings({}, { env: {} }).opencodeLocalLimitsEnabled, false);
   const limits = limitsConfigFromSettings({ opencodeLocalLimitsEnabled: false }, { env: {} });

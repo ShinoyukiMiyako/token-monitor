@@ -12,6 +12,7 @@ const CREDENTIAL_SETTING_PATHS = Object.freeze({
   hubHostSecret: ['hub', 'hostSecret'],
   secret: ['hub', 'clientSecret'],
   claudeWebCookie: ['providers', 'claude', 'webCookie'],
+  claudeWebAccounts: ['providers', 'claude', 'webAccounts'],
   opencodeCookie: ['providers', 'opencode', 'cookie'],
   opencodeProfiles: ['providers', 'opencode', 'profiles'],
   openrouterProfiles: ['providers', 'openrouter', 'profiles'],

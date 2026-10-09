@@ -516,7 +516,7 @@ test('Codex account email masking is an opt-in display-only setting', () => {
 
   const updateHandler = main.slice(
     main.indexOf("ipcMain.handle('settings:update'"),
-    main.indexOf("ipcMain.handle('settings:openConfig'")
+    main.indexOf("ipcMain.handle('appearance:preview'")
   );
   assert.match(updateHandler, /maskLimitAccountEmails:\s*parseBoolean\(patch\.maskLimitAccountEmails \?\? settings\.maskLimitAccountEmails, false\)/);
   assert.doesNotMatch(updateHandler, /accountEmail|accountKey|syncLimits|publicLimits/);
@@ -944,6 +944,9 @@ test('Claude Web account panel stores a redacted cookie and opens only the usage
   assert.match(details, /settings\.claude\.step3[\s\S]*Copy the sessionKey value/);
   assert.match(details, /<textarea id="claudeWebCookieInput" rows="3" autocomplete="off"[\s\S]*placeholder="sessionKey=\.\.\."/);
   assert.match(details, /<button id="claudeWebCookieSubmit"[\s\S]*data-i18n="settings\.claude\.saveCookie">/);
+  assert.match(details, /<div id="claudeAccountList" class="managed-account-list"><\/div>/);
+  assert.match(details, /<button id="claudeAddAccountButton" class="hidden"[^>]*aria-controls="claudeManualPanel"[^>]*data-i18n="settings\.claude\.addAccount">/);
+  assert.doesNotMatch(details, /claudeLogoutButton/, 'each saved login is removed from its own row');
   assert.ok(
     html.indexOf('id="claudeAccountGroup"') < html.indexOf('id="codexAccountGroup"'),
     'Claude should follow the AI Limits provider order and appear before Codex'
@@ -1013,7 +1016,6 @@ test('Claude Web account panel stores a redacted cookie and opens only the usage
   const setupBody = functionBodyBeforeMarker(app, 'setupCursorAccountUI', '\nsetupCursorAccountUI();');
   assert.match(setupBody, /if \(\/\[\\r\\n\]\/\.test\(input\.value\)\)[\s\S]*settings\.claude\.cookieInvalidFormat/);
   assert.match(setupBody, /window\.tokenMonitor\.claude\.saveCookie\(input\.value\)/);
-  assert.match(setupBody, /if \(result\?\.superseded\) return;/);
   assert.ok(
     setupBody.indexOf('window.tokenMonitor.claude.saveCookie(input.value)')
       < setupBody.indexOf("limitProviders: limitProviderSelectionIncluding('claude')"),
@@ -1023,39 +1025,250 @@ test('Claude Web account panel stores a redacted cookie and opens only the usage
   assert.match(setupBody, /CLAUDE_WEB_SOURCE_CHALLENGE[\s\S]*settings\.claude\.sourceChallenge/);
   assert.match(setupBody, /result\?\.status === 'unauthorized'[\s\S]*settings\.claude\.cookieRejected/);
   assert.match(setupBody, /saveSettings\(\{\s*limitProviders: limitProviderSelectionIncluding\('claude'\),[\s\S]*?limitsEnabled: true/);
-  assert.doesNotMatch(setupBody, /saveSettings\(\{\s*claudeWebCookie: input\.value/);
-  assert.match(setupBody, /saveSettings\(\{ claudeWebCookie: '' \}\)/);
+  assert.doesNotMatch(setupBody, /claudeWebCookie:|claudeWebAccounts:/, 'the renderer never writes a Claude cookie through settings');
   assert.match(setupBody, /window\.tokenMonitor\.openExternal\(claudePlatformUrl\(\)\)/);
-  const statusBody = functionBody(app, 'renderExternalProviderStatus', 'setMinimaxAccountExpanded');
-  assert.match(statusBody, /const canClearConfiguredClaude = providerName === 'claude' && configured;/);
+  const statusBody = functionBody(app, 'renderExternalProviderStatus', 'claudeWebAccountInfoText');
   assert.match(statusBody, /manualPanel\.classList\.toggle\('hidden', linked\)/);
-  assert.match(statusBody, /source !== 'settings' \|\| \(!linked && !canClearConfiguredClaude\)/);
+  assert.match(statusBody, /logoutBtn\?\.classList\.toggle\('hidden', source !== 'settings' \|\| !linked\)/);
+  assert.match(statusBody, /if \(providerName === 'claude'\) renderClaudeWebAccounts\(statusEl, linked, enabled && !pending\);/);
   const urlBody = functionBody(app, 'claudePlatformUrl', 'selectedQoderSite');
   assert.match(urlBody, /return 'https:\/\/claude\.ai\/settings\/usage';/);
 
   const main = fs.readFileSync(path.join(rendererDir, '..', 'main.js'), 'utf8');
   assert.match(main, /function normalizeClaudeWebCookie\(value\) \{\s*return normalizeClaudeWebCookieInput\(value\);\s*\}/);
-  assert.match(main, /ipcMain\.handle\('claude:saveCookie'[\s\S]*fetchClaudeLimits\([\s\S]*providerRuntimeState: new Map\(\)/);
-  assert.match(main, /const requestRevision = \+\+claudeWebCookieMutationRevision;/);
-  assert.match(main, /claudeWebCookieMutationRevision !== requestRevision[\s\S]*superseded: true/);
-  assert.match(main, /settings\.claudeWebCookie = cookieToPersist;[\s\S]*saveSettings\(\{ throwOnError: true \}\)/);
+  const saveHandler = main.slice(
+    main.indexOf("ipcMain.handle('claude:saveCookie'"),
+    main.indexOf("ipcMain.handle('claude:removeAccount'")
+  );
+  assert.match(saveHandler, /fetchClaudeLimits\([\s\S]*providerRuntimeState: new Map\(\)/);
+  assert.ok(
+    saveHandler.indexOf("provider?.status !== 'ok'") < saveHandler.indexOf('settings.claudeWebAccounts ='),
+    'a cookie is only stored once claude.ai has accepted it'
+  );
+  assert.ok(
+    saveHandler.indexOf('await fetchClaudeLimits(') < saveHandler.indexOf('const accounts = claudeWebAccounts();'),
+    'the list is read after the probe, so a save that landed meanwhile is not overwritten'
+  );
+  assert.match(saveHandler, /cookie: cookieToPersist,[\s\S]*saveSettings\(\{ throwOnError: true \}\)/);
   const preload = fs.readFileSync(path.join(rendererDir, '..', 'preload.js'), 'utf8');
-  assert.match(preload, /claude: \{\s*saveCookie: \(cookie\) => ipcRenderer\.invoke\('claude:saveCookie', cookie\)/);
+  assert.match(preload, /claude: \{\s*saveCookie: \(cookie\) => ipcRenderer\.invoke\('claude:saveCookie', cookie\),\s*removeAccount: \(id\) => ipcRenderer\.invoke\('claude:removeAccount', id\)/);
   const updateHandler = main.slice(
     main.indexOf("ipcMain.handle('settings:update'"),
     main.indexOf("ipcMain.handle('appearance:preview'")
   );
-  assert.ok(
-    updateHandler.indexOf('normalizeClaudeWebCookie(patch.claudeWebCookie)')
-      < updateHandler.indexOf('saveSettings({ throwOnError: true })'),
-    'invalid Claude cookies must be rejected before the existing credential can be persisted over'
-  );
+  // The renderer only holds the redacted list, so a settings patch that carried
+  // either key could do nothing but erase the stored cookies.
+  for (const key of ['claudeWebCookie', 'claudeWebAccounts']) {
+    assert.match(updateHandler, new RegExp(`delete normalizedPatch\\.${key};`));
+    assert.doesNotMatch(updateHandler, new RegExp(`patch\\.${key}\\b`));
+  }
   const rendererSettings = functionBody(main, 'settingsForRenderer', 'pushSettingsToRenderer');
-  assert.match(rendererSettings, /claudeWebCookie: settings\?\.claudeWebCookie \? 'set' : ''/);
-  assert.match(rendererSettings, /claudeWebCookieConfigured: Boolean\(currentClaudeWebCookie\(\)\)/);
+  assert.match(rendererSettings, /claudeWebAccounts: claudeWebAccountsForRenderer\(\)/);
+  assert.ok(
+    rendererSettings.indexOf('...redactedCredentials') < rendererSettings.indexOf('claudeWebAccounts: claudeWebAccountsForRenderer()'),
+    'the redacted account list must replace the default-deny blank, not be overwritten by it'
+  );
+  assert.match(rendererSettings, /claudeWebCookieConfigured: Boolean\(claudeWebCookieSource\)/);
   assert.match(rendererSettings, /claudeWebCookieSource/);
   const allowlist = functionBody(main, 'isAllowedExternalUrl', 'revealWindow');
   assert.match(allowlist, /parsed\.hostname === 'claude\.ai' && parsed\.pathname\.startsWith\('\/settings'\)/);
+});
+
+test('saved Claude Web logins migrate from the single cookie, follow renewals and record identities', () => {
+  const main = fs.readFileSync(path.join(rendererDir, '..', 'main.js'), 'utf8');
+  const {
+    claudeWebCookie,
+    normalizeClaudeWebAccounts,
+    normalizeClaudeWebCookieInput
+  } = require('../../src/shared/limitCollector');
+  let saves = 0;
+  let pushes = 0;
+  const context = {
+    claudeWebCookie,
+    crypto: { randomUUID: () => 'migrated-id' },
+    normalizeClaudeWebAccounts,
+    normalizeClaudeWebCookie: normalizeClaudeWebCookieInput,
+    pushSettingsToRenderer: () => { pushes += 1; },
+    saveSettings: () => { saves += 1; },
+    settings: null
+  };
+  // Values cross the vm boundary as JSON so they compare against plain objects.
+  const run = (expression) => JSON.parse(
+    runMainFunction(main, 'claudeWebAccounts', 'electronLimitsDeps', `JSON.stringify(${expression})`, context)
+  );
+  const unresolved = { accountKey: '', accountEmail: '', accountName: '', accountLabel: '' };
+
+  // A cookie saved by a version that kept only one becomes the first account.
+  const migrated = { id: 'migrated-id', cookie: 'sessionKey=sk-ant-legacy', ...unresolved };
+  context.merged = { claudeWebCookie: 'sk-ant-legacy' };
+  assert.deepEqual(run('(migrateClaudeWebCookie(merged), merged)'), {
+    claudeWebCookie: '',
+    claudeWebAccounts: [migrated]
+  });
+  // Already listed, or not a session key at all: nothing is added, nothing throws.
+  context.merged = { claudeWebCookie: 'sessionKey=sk-ant-legacy', claudeWebAccounts: [migrated] };
+  assert.deepEqual(run('(migrateClaudeWebCookie(merged), merged)').claudeWebAccounts, [migrated]);
+  context.merged = { claudeWebCookie: 'not a session key' };
+  assert.deepEqual(run('(migrateClaudeWebCookie(merged), merged)'), { claudeWebCookie: '', claudeWebAccounts: [] });
+
+  context.settings = {
+    claudeWebAccounts: [
+      { id: 'a', cookie: 'sessionKey=sk-ant-a', accountKey: 'sha256:a', accountEmail: 'a@example.com' },
+      { id: 'b', cookie: 'sessionKey=sk-ant-b' }
+    ]
+  };
+
+  // A rotated sessionKey replaces the cookie of the login it was issued to.
+  assert.equal(run("persistClaudeWebCookieRenewal({ previousCookie: 'sessionKey=sk-ant-b', cookie: 'sessionKey=sk-ant-b2' })"), true);
+  assert.deepEqual(context.settings.claudeWebAccounts.map((account) => account.cookie), ['sessionKey=sk-ant-a', 'sessionKey=sk-ant-b2']);
+  assert.equal(saves, 1);
+  // One issued to a login that is no longer saved has nowhere to go.
+  assert.equal(run("persistClaudeWebCookieRenewal({ previousCookie: 'sessionKey=sk-ant-gone', cookie: 'sessionKey=sk-ant-new' })"), false);
+  assert.equal(saves, 1);
+
+  const identity = "{ id: 'b', accountKey: 'sha256:b', accountEmail: 'b@example.com', accountName: 'Org B', accountLabel: 'Pro' }";
+  run(`persistClaudeWebAccountIdentity(${identity}) || null`);
+  assert.deepEqual(run('claudeWebAccounts()')[1], {
+    id: 'b',
+    cookie: 'sessionKey=sk-ant-b2',
+    accountKey: 'sha256:b',
+    accountEmail: 'b@example.com',
+    accountName: 'Org B',
+    accountLabel: 'Pro'
+  });
+  assert.deepEqual([saves, pushes], [2, 1]);
+  // The same identity again is not a change worth a write.
+  run(`persistClaudeWebAccountIdentity(${identity}) || null`);
+  assert.deepEqual([saves, pushes], [2, 1]);
+
+  // The renderer is told who the accounts are, never what their cookies are.
+  assert.deepEqual(run('claudeWebAccountsForRenderer()'), [
+    { id: 'a', accountKey: 'sha256:a', accountEmail: 'a@example.com', accountName: '', accountLabel: '' },
+    { id: 'b', accountKey: 'sha256:b', accountEmail: 'b@example.com', accountName: 'Org B', accountLabel: 'Pro' }
+  ]);
+});
+
+test('Claude Web panel lists every saved login and removes one only on a second click', async () => {
+  const app = readRendererFile('app.js');
+
+  class FakeElement {
+    constructor() {
+      this.children = [];
+      this.attributes = {};
+      this.listeners = {};
+      const classes = new Set();
+      this.classList = {
+        toggle: (name, force) => {
+          const on = force === undefined ? !classes.has(name) : Boolean(force);
+          if (on) classes.add(name);
+          else classes.delete(name);
+          return on;
+        },
+        add: (name) => classes.add(name),
+        remove: (name) => classes.delete(name),
+        contains: (name) => classes.has(name)
+      };
+    }
+    append(...children) { this.children.push(...children); }
+    replaceChildren(...children) { this.children = children; }
+    setAttribute(name, value) { this.attributes[name] = value; }
+    addEventListener(type, listener) { this.listeners[type] = listener; }
+  }
+
+  const elements = Object.fromEntries(
+    ['claudeAccountList', 'claudeAddAccountButton', 'claudeManualPanel', 'claudeOpenBrowser', 'claudeErrorMessage']
+      .map((id) => [id, new FakeElement()])
+  );
+  const statusEl = new FakeElement();
+  const removed = [];
+  let refreshes = 0;
+  let linked = true;
+  const context = {
+    document: { getElementById: (id) => elements[id], createElement: () => new FakeElement() },
+    limitAccountTitle: (_provider, account, index) => account.accountEmail || `Account ${index + 1}`,
+    limitProviderPresentationApi: { limitProviderDisplayLabel: (label) => label },
+    localProviderStatuses: () => [
+      { provider: 'claude', accountKey: 'sha256:a', status: 'unauthorized' },
+      { provider: 'claude', accountKey: 'sha256:b', status: 'ok' }
+    ],
+    refreshStats: async () => { refreshes += 1; },
+    renderExternalProviderStatus: () => context.renderClaudeWebAccounts(statusEl, linked, true),
+    setCursorStatusText: (el, text) => { el.textContent = text; },
+    state: {
+      settings: {
+        claudeWebAccounts: [
+          { id: 'a', accountKey: 'sha256:a', accountEmail: 'a@example.com', accountLabel: 'Max 20x' },
+          { id: 'b', accountKey: 'sha256:b', accountEmail: 'b@example.com', accountLabel: 'Pro' },
+          { id: 'c', accountKey: '', accountEmail: '', accountLabel: '' }
+        ]
+      }
+    },
+    t: (key, params) => (params ? `${key}:${JSON.stringify(params)}` : key),
+    window: { tokenMonitor: { claude: { removeAccount: async (id) => { removed.push(id); return { ok: true }; } } } }
+  };
+  runRendererFunctions(app, ['claudeWebAccountInfoText', 'renderClaudeWebAccounts'], '', context);
+  const render = () => context.renderExternalProviderStatus();
+  const rows = () => elements.claudeAccountList.children.map((row) => {
+    const [main, right] = row.children;
+    const [info, remove] = right.children;
+    return { title: main.children[0].textContent, info: info.textContent, remove };
+  });
+
+  render();
+  assert.equal(statusEl.textContent, 'settings.claude.nAccounts:{"count":3}');
+  assert.deepEqual(rows().map(({ title, info }) => [title, info]), [
+    // The row for this login came back unauthorized, so its plan gives way to that.
+    ['a@example.com', 'settings.claude.statusInvalid'],
+    ['b@example.com', 'Pro'],
+    // Saved before identities were recorded and not read successfully since.
+    ['Account 3', 'settings.common.notChecked']
+  ]);
+  // With logins saved, the cookie form waits behind the add button.
+  assert.equal(elements.claudeManualPanel.classList.contains('hidden'), true);
+  assert.equal(elements.claudeOpenBrowser.classList.contains('hidden'), true);
+  assert.equal(elements.claudeAddAccountButton.classList.contains('hidden'), false);
+  assert.equal(elements.claudeAddAccountButton.attributes['aria-expanded'], 'false');
+
+  context.state.claudeAddAccountExpanded = true;
+  render();
+  assert.equal(elements.claudeManualPanel.classList.contains('hidden'), false);
+  assert.equal(elements.claudeOpenBrowser.classList.contains('hidden'), false);
+  assert.equal(elements.claudeAddAccountButton.attributes['aria-expanded'], 'true');
+  context.state.claudeAddAccountExpanded = false;
+
+  // The first click only arms the removal.
+  const removeB = rows()[1].remove;
+  assert.equal(removeB.title, 'settings.claude.remove');
+  await removeB.listeners.click();
+  assert.deepEqual(removed, []);
+  assert.equal(removeB.classList.contains('confirming'), true);
+  assert.equal(rows()[0].remove.classList.contains('confirming'), false);
+  assert.equal(removeB.title, 'settings.claude.removeConfirm:{"account":"b@example.com"}');
+
+  await removeB.listeners.click();
+  assert.deepEqual(removed, ['b']);
+  assert.deepEqual(context.state.settings.claudeWebAccounts.map((account) => account.id), ['a', 'c']);
+  assert.deepEqual(rows().map(({ title }) => title), ['a@example.com', 'Account 2']);
+  assert.equal(refreshes, 1);
+
+  // A removal the main process refuses leaves the list alone and says why.
+  context.window.tokenMonitor.claude.removeAccount = async () => ({ ok: false, error: 'disk full' });
+  const removeA = rows()[0].remove;
+  await removeA.listeners.click();
+  await removeA.listeners.click();
+  assert.deepEqual(context.state.settings.claudeWebAccounts.map((account) => account.id), ['a', 'c']);
+  assert.equal(elements.claudeErrorMessage.textContent, 'settings.claude.removeFailed:{"message":"disk full"}');
+  assert.equal(refreshes, 1);
+
+  // Nothing saved and nothing linked: the form is the panel, with no button in front of it.
+  context.state.settings.claudeWebAccounts = [];
+  linked = false;
+  statusEl.textContent = 'settings.claude.statusNotSet';
+  render();
+  assert.equal(statusEl.textContent, 'settings.claude.statusNotSet');
+  assert.deepEqual(rows(), []);
+  assert.equal(elements.claudeManualPanel.classList.contains('hidden'), false);
+  assert.equal(elements.claudeAddAccountButton.classList.contains('hidden'), true);
 });
 
 test('DeepSeek account pill keeps its validated API key state after moving into Limits', () => {
@@ -1870,12 +2083,13 @@ test('main collectors share one live GUI limit credential resolver in every widg
   assert.match(limitsDeps, /fetch: electronLimitsFetch\(\)/);
   assert.match(limitsDeps, /resolveConfigSnapshot: \(\) => electronLimitsConfig\(\)/);
   assert.match(limitsDeps, /onClaudeWebCookieRenewed: persistClaudeWebCookieRenewal/);
+  assert.match(limitsDeps, /onClaudeWebAccountResolved: persistClaudeWebAccountIdentity/);
   const renewalPersistence = functionBody(
     main,
     'persistClaudeWebCookieRenewal',
-    'electronLimitsDeps'
+    'persistClaudeWebAccountIdentity'
   );
-  assert.match(renewalPersistence, /settings\.claudeWebCookie === renewed\) return true/);
+  assert.match(renewalPersistence, /account\.cookie === renewed\) return true/);
   assert.match(renewalPersistence, /saveSettings\(\{ throwOnError: true \}\)/);
   assert.doesNotMatch(renewalPersistence, /queueLimitInvalidation|classifySettingsChange/);
   for (const key of [

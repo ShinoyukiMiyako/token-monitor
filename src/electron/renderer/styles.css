@@ -1194,6 +1194,10 @@ span.settings-note.settings-item-desc {
   border-radius: 6px;
   background: rgba(var(--sunken-rgb), 0.36);
 }
+/* Claude's saved logins have no enable toggle, so the row has no checkbox column. */
+#claudeAccountList .managed-account-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
 .managed-account-row.disabled .managed-account-email,
 .managed-account-row.disabled .managed-account-info {
   color: var(--muted);

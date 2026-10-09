@@ -109,11 +109,34 @@ test('removes credential fields from settings without mutating runtime state', (
   assert.equal(hasCredentialSettings(clean), false);
 });
 
+test('saved Claude Web logins live in the credential store and replace the single cookie in one write', (t) => {
+  const dataDir = tempDataDir(t);
+  const store = new CredentialStore(dataDir);
+  store.replaceSettingsCredentials({ claudeWebCookie: 'sessionKey=sk-ant-legacy' });
+
+  const claudeWebAccounts = [
+    { id: 'a', cookie: 'sessionKey=sk-ant-legacy', accountKey: 'sha256:a', accountEmail: 'a@example.com' },
+    { id: 'b', cookie: 'sessionKey=sk-ant-b', accountKey: 'sha256:b', accountEmail: 'b@example.com' }
+  ];
+  // What the widget saves once the legacy cookie has become the first account.
+  store.replaceSettingsCredentials({ claudeWebCookie: '', claudeWebAccounts });
+
+  const document = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials.json'), 'utf8'));
+  assert.deepEqual(document.credentials.providers.claude, { webAccounts: claudeWebAccounts });
+  assert.deepEqual(store.settingsCredentials(), { claudeWebAccounts });
+  assert.deepEqual(stripCredentialSettings({ language: 'auto', claudeWebAccounts }), { language: 'auto' });
+
+  // Removing the last login leaves nothing behind for Claude at all.
+  store.replaceSettingsCredentials({ claudeWebAccounts: [] });
+  assert.deepEqual(store.settingsCredentials(), {});
+});
+
 test('renderer redaction defaults new credential fields to hidden with explicit exceptions', () => {
   const settings = {
     hubHostSecret: 'host-secret',
     secret: 'client-secret',
     claudeWebCookie: 'sessionKey=claude-secret',
+    claudeWebAccounts: [{ id: 'a', cookie: 'sessionKey=claude-account-secret', accountEmail: 'a@example.com' }],
     deepseekApiKey: 'provider-secret',
     opencodeProfiles: { work: { cookie: 'auth=secret' } },
     openrouterProfiles: { personal: { apiKey: 'sk-or-secret' } },
@@ -125,6 +148,7 @@ test('renderer redaction defaults new credential fields to hidden with explicit 
   assert.equal(redacted.hubHostSecret, 'host-secret');
   assert.equal(redacted.secret, 'client-secret');
   assert.equal(redacted.claudeWebCookie, '');
+  assert.equal(redacted.claudeWebAccounts, '');
   assert.equal(redacted.deepseekApiKey, '');
   assert.equal(redacted.opencodeProfiles, '');
   assert.equal(redacted.openrouterProfiles, '');
