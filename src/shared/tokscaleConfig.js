@@ -17,7 +17,14 @@ function profileHomeDir(homeDir) {
   return typeof homeDir === 'string' && homeDir.length > 0 ? homeDir : os.homedir();
 }
 
-function tokscaleHomeDir({ env, platform, profileHome }) {
+// Mirror tokscale-core home_dir(): on Windows an absolute $HOME wins over the
+// user profile, everywhere else the profile is the home. Home-rooted tokscale
+// paths must resolve through here rather than os.homedir() directly, or the
+// redirect holds for some roots and not others.
+function tokscaleHomeDir(options = {}) {
+  const env = options.env || process.env;
+  const platform = options.platform || process.platform;
+  const profileHome = profileHomeDir(options.homeDir);
   if (platform === 'win32' && windowsNativeAbsolutePath(env.HOME)) return env.HOME.trim();
   return profileHome;
 }
@@ -44,41 +51,8 @@ function tokscaleConfigDir(options = {}) {
   return path.join(configHome, 'tokscale');
 }
 
-// Mirror tokscale-core's canonical cache root plus its two pre-#470 legacy
-// fallbacks. An explicit TOKSCALE_CONFIG_DIR is hermetic upstream, so it must
-// never reach back into a real profile's legacy cache.
-function tokscaleCacheDirs(options = {}) {
-  const env = options.env || process.env;
-  const platform = options.platform || process.platform;
-  const profileHome = profileHomeDir(options.homeDir);
-  const tokscaleHome = tokscaleHomeDir({ env, platform, profileHome });
-  const canonical = path.join(tokscaleConfigDir({ env, platform, homeDir: profileHome }), 'cache');
-  const override = env.TOKSCALE_CONFIG_DIR;
-  if (typeof override === 'string' && override.length > 0) return [canonical];
-
-  let platformCache;
-  if (platform === 'darwin') {
-    platformCache = path.join(profileHome, 'Library', 'Caches', 'tokscale');
-  } else if (platform === 'win32') {
-    const localAppData = (typeof env.LOCALAPPDATA === 'string' && env.LOCALAPPDATA.length > 0)
-      ? env.LOCALAPPDATA
-      : path.join(profileHome, 'AppData', 'Local');
-    platformCache = path.join(localAppData, 'tokscale');
-  } else {
-    const xdg = env.XDG_CACHE_HOME;
-    const cacheHome = (typeof xdg === 'string' && path.isAbsolute(xdg)) ? xdg : path.join(profileHome, '.cache');
-    platformCache = path.join(cacheHome, 'tokscale');
-  }
-
-  return [...new Set([
-    canonical,
-    platformCache,
-    path.join(tokscaleHome, '.cache', 'tokscale')
-  ])];
-}
-
 function customPricingPath(opts) {
   return path.join(tokscaleConfigDir(opts), 'custom-pricing.json');
 }
 
-module.exports = { tokscaleCacheDirs, tokscaleConfigDir, customPricingPath };
+module.exports = { tokscaleConfigDir, tokscaleHomeDir, customPricingPath };

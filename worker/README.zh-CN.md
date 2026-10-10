@@ -102,7 +102,7 @@ npx wrangler secret put PUBLIC_STATS_ENABLED   # enter 1
 
 ### Widgy
 
-选 **async / no main()** 模板。使用 `?secret=` 查询字符串鉴权：Widgy 那个隐藏的 WKWebView 可能会卡在 `Authorization: Bearer` 触发的 CORS 预检上，而 URL 会留在设备本地的 Widgy 配置里，所以密钥不会进入外部日志。
+选 **async / no main()** 模板。使用 `?secret=` 查询字符串鉴权：Widgy 那个隐藏的 WKWebView 可能会卡在 `Authorization: Bearer` 触发的 CORS 预检上。这是有限兼容路径：URL 里的密钥可能进入代理、平台或历史日志。能设 Header 的客户端请走 Header。
 
 最简版本，只要一个数字：
 
@@ -240,16 +240,16 @@ iOS 小部件没有省电的推送通道，所以运行时会自行每隔几分�
 | GET    | `/api/health`              | 无     | 存活探针 + 设备数                          |
 | GET    | `/api/public/stats`        | 无     | `PUBLIC_STATS_ENABLED=1` 时提供不含 devices/账号 id 的公开聚合统计 |
 | GET    | `/api/stats`               | 密钥   | 聚合统计（today / month / allTime）        |
-| GET    | `/api/stats/stream`        | 密钥   | SSE 流，每次 ingest 都推送                 |
+| GET    | `/api/stats/stream`        | 密钥   | SSE 快照与合并后的实时变更                 |
 | GET    | `/api/devices`             | 密钥   | 原始的每设备记录                          |
 | POST   | `/api/ingest`              | 密钥   | 更新某个设备的用量摘要                    |
 | DELETE | `/api/devices/{deviceId}`  | 密钥   | 删除一条设备记录                          |
 
-密钥有三种接受方式（任一即可）：
+密钥有三种接受方式（任一即可）。请优先使用 Header；`?secret=` 仅作为有限兼容 / 迁移路径保留：
 
 1. `Authorization: Bearer <secret>`：agent、小部件，以及任何服务器 / 桌面客户端首选。
 2. `x-token-monitor-secret: <secret>`：无法设置 `Authorization` 的客户端的后备方案。
-3. `?secret=<secret>` 查询字符串：针对 iOS 小部件运行时（Widgy、Scriptable）的变通方案，它们的 WKWebView 难以处理 `Authorization` 头的 CORS 预检。只在 URL 留在设备本地的客户端上使用。
+3. `?secret=<secret>` 查询字符串：iOS 小部件运行时（Widgy、Scriptable）的有限兼容 / 迁移路径，它们的 WKWebView 难以处理 `Authorization` 头的 CORS 预检。URL 里的密钥可能进入代理、平台或历史日志。新客户端应改走 Header。
 
 密钥是必需的。当 `TOKEN_MONITOR_SECRET` 未设置时，所有数据路由都返回 `503 secret_required`，只有 `/api/health` 和可选开启的 `/api/public/stats` 会响应。请在部署前（或部署时）设置它。
 
@@ -268,3 +268,10 @@ npm run tail
 ```
 
 实时流式输出 Worker + Durable Object 日志。
+
+
+## 可选共享内容
+
+`wrangler.toml` 中的 `TOKEN_MONITOR_SYNC_SESSION_TITLES = "false"` 是默认关闭的服务端标题接收权限。只有需要允许设备发送标题时才设为 `"true"`；设备仍需单独选择加入，通过身份验证访问 `/api/sync/content`，并与 `/api/sync/titles/:deviceId` 协商。关闭权限会清除离线设备已保存的标题，并使已启用的代次令牌失效。公开统计始终不包含标题、共享设置及其版本标记。
+
+经过身份验证的 `/api/sync/settings/modelAliases` 和 `/api/sync/settings/customPricing` 只保存有大小限制的共享分组，使用整数 `baseRevision` 进行比较并交换（CAS）。从未初始化的值为 `null`；主动清空的分组具有正数修订版本。过期写入返回 `409` 和当前分组，客户端必须先刷新并处理冲突。私有统计和 SSE 通过 `syncSettingsRevisions` 通知变化。设置和标题策略使用独立于 `dev:` 的存储前缀；删除设备仍会保留已禁用的策略记录，防止旧上传恢复标题。完整请求格式见主项目的 `docs/API.md`。

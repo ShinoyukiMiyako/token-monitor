@@ -7,24 +7,23 @@
 // which can refuse to descend into an ignored directory. A root with nothing to
 // prune — the session trees, which are the ones with tens of thousands of
 // entries — is far better served by a single recursive kernel watch.
-// recursiveWatchCandidates() draws that line; this joins the two halves back
-// into something the existing hosts can treat as one watcher.
+// recursiveWatchCandidates() draws that line and openWatch() applies it; this
+// joins the two halves back into something the hosts can treat as one watcher.
 //
 // The surface is deliberately the subset of chokidar's that the hosts already
-// use — on/once('all'|'error'|'ready') and an awaitable close() — so the worker
-// host keeps its revision fencing and close serialisation untouched.
+// use — on/once('all'|'error'|'ready') and an awaitable close() — so the watch
+// process keeps its revision fencing and close serialisation untouched.
 
 const { EventEmitter } = require('node:events');
 
-function createCompositeWatcher(dirs, clientsCsv, usePolling, deps = {}) {
-  // Required lazily for the same reason the hosts do it: a run that never needs
-  // chokidar should not pay to load it.
-  const chokidar = deps.chokidar || require('chokidar');
-  const { watcherOptions, watchIgnoreMatcher, recursiveWatchCandidates } = deps.collector || require('./collector');
+// `walked` and `options` are what chokidar.watch would have been handed for the
+// roots that keep the per-directory walk; `recursive` are the roots that go to
+// the kernel. The caller decides the split, so this module needs nothing from
+// the collector and the two can be required in either order.
+function createCompositeWatcher({ chokidar, recursive = [], walked = [], options = {} }, deps = {}) {
   const { createRecursiveWatcher } = deps.recursiveWatcher || require('./recursiveWatcher');
 
   const emitter = new EventEmitter();
-  const { recursive, walked } = recursiveWatchCandidates(dirs, clientsCsv, { usePolling });
   const closers = [];
 
   // Ready means every half is up. Firing on the first one would let a caller
@@ -45,7 +44,7 @@ function createCompositeWatcher(dirs, clientsCsv, usePolling, deps = {}) {
   }
 
   if (walked.length > 0) {
-    const watcher = chokidar.watch(walked, watcherOptions(usePolling === true, watchIgnoreMatcher(clientsCsv)));
+    const watcher = chokidar.watch(walked, options);
     watcher.on('all', (event, filePath) => emitter.emit('all', event, filePath));
     watcher.on('error', (error) => emitter.emit('error', error));
     watcher.on('ready', settleReady);
@@ -55,8 +54,8 @@ function createCompositeWatcher(dirs, clientsCsv, usePolling, deps = {}) {
   // No roots at all still has to reach ready, or a caller waiting on it hangs.
   if (pendingReady === 0) setImmediate(() => emitter.emit('ready'));
 
-  // Awaited by the worker host before it opens the next watcher, so a chokidar
-  // close (the async, descriptor-owning one) must be awaited here too.
+  // Awaited by the watch process before it opens the next watcher, so a
+  // chokidar close (the async, descriptor-owning one) must be awaited here too.
   emitter.close = async () => {
     const pending = closers.splice(0, closers.length);
     for (const closeOne of pending) {

@@ -12,7 +12,7 @@ const {
   runManualDeviceRefresh,
   settingsLimitInvalidationPlan
 } = require('../../src/electron/deviceRuntimeCoordinator');
-const { createLimitsRuntime } = require('../../src/shared/limitsRuntime');
+const { createLimitsRuntime } = require('../../src/shared/limits/runtime');
 
 function deferred() {
   let resolve;
@@ -22,9 +22,13 @@ function deferred() {
 
 test('targeted rescans stay strict while Cursor credential refresh is best effort', () => {
   const main = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'electron', 'main.js'), 'utf8');
+  const preload = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'electron', 'preload.js'), 'utf8');
   const clientSourceIpc = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'electron', 'clientSourceIpc.js'), 'utf8');
   assert.match(clientSourceIpc, /if \(!canRescanClient\(client\) \|\| !canRunRescan\(\)\) return false/);
   assert.match(main, /rescanClient: \(client\) => refreshUsageClient\(client, \{ forceSync: true \}\)/);
+  assert.match(main, /repairClientSyncLock: \(\) => repairAntigravitySyncLock/);
+  assert.match(main, /lockPath: antigravitySyncLockPath\(os\.homedir\(\)\)/);
+  assert.match(preload, /repairClientSyncLock: \(clientId\) => ipcRenderer\.invoke\('usage:repairClientSyncLock', clientId\)/);
   assert.match(
     clientSourceIpc,
     /const key = `\$\{root\.id\}\\0\$\{root\.dir\}`;[\s\S]*!seen\.has\(key\) && seen\.add\(key\)/
@@ -36,11 +40,15 @@ test('targeted rescans stay strict while Cursor credential refresh is best effor
   );
   assert.match(
     main,
-    /function bestEffortTrackedUsageRefresh[\s\S]*!canRefreshUsageRuntime\(mode, isExternalAgentActive\)/
+    /function bestEffortTrackedUsageRefresh[\s\S]*settings\?\.hubMode !== 'icloud'[\s\S]*!canRefreshUsageRuntime\(mode, isExternalAgentActive\)/
   );
   assert.match(
     main,
-    /function drainPendingUsageClientRefreshes[\s\S]*enabled: canRefreshUsageRuntime\(mode, isExternalAgentActive\)/
+    /function drainPendingUsageClientRefreshes[\s\S]*enabled: settings\?\.hubMode === 'icloud' \|\| canRefreshUsageRuntime\(mode, isExternalAgentActive\)/
+  );
+  assert.match(
+    main,
+    /function ownsUsageRuntime[\s\S]*settings\?\.hubMode === 'icloud'[\s\S]*canRefreshUsageRuntime\(mode, isExternalAgentActive\)/
   );
 });
 

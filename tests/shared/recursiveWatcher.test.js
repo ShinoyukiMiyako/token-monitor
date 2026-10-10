@@ -192,3 +192,43 @@ test('recursiveWatchCandidates sends an unpruned session tree to the kernel', ()
   assert.deepEqual(split.recursive, [claudeProjects]);
   assert.deepEqual(split.walked, []);
 });
+
+test('openWatch hands unpruned usage roots to the kernel and only the rest to chokidar', async () => {
+  const { openWatch } = require('../../src/shared/collector');
+  const fs = require('node:fs');
+  const usageRoot = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'tm-recursive-usage-'));
+  const activityRoot = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'tm-recursive-activity-'));
+  const chokidarCalls = [];
+  const chokidar = {
+    watch: (dirs, options) => {
+      const watcher = new EventEmitter();
+      watcher.close = async () => {};
+      chokidarCalls.push({ dirs, options });
+      setImmediate(() => watcher.emit('ready'));
+      return watcher;
+    }
+  };
+  const config = { dirs: [usageRoot, activityRoot], usageDirs: [usageRoot], clients: 'claude', activitySources: [] };
+  let watcher;
+  try {
+    watcher = withRecursiveEnv('1', () => openWatch(chokidar, config));
+    assert.deepEqual(watcher.watchedRootCounts, { recursive: 1, walked: 1 });
+    assert.deepEqual(chokidarCalls.map(({ dirs }) => dirs), [[activityRoot]]);
+    // A walked root that happens to sit above a recursive one must not walk
+    // back into it and buy back the descriptors the kernel watch saved.
+    const { ignored } = chokidarCalls[0].options;
+    assert.equal(ignored(path.join(usageRoot, 'project', 'session.jsonl')), true);
+    assert.equal(ignored(path.join(activityRoot, 'state.json')), false);
+    await new Promise((resolve) => watcher.once('ready', resolve));
+
+    // Polling has no recursive mode, so every root goes to chokidar.
+    chokidarCalls.length = 0;
+    const polled = withRecursiveEnv('1', () => openWatch(chokidar, { ...config, usePolling: true }));
+    assert.deepEqual(chokidarCalls.map(({ dirs }) => dirs), [[usageRoot, activityRoot]]);
+    await polled.close();
+  } finally {
+    if (watcher) await watcher.close();
+    fs.rmSync(usageRoot, { recursive: true, force: true });
+    fs.rmSync(activityRoot, { recursive: true, force: true });
+  }
+});

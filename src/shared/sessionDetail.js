@@ -2,8 +2,50 @@
 
 const fs = require('node:fs');
 const { resolveSessionFile } = require('./sessionFiles');
-const opencodeSession = require('./opencodeSession');
-const { readReasonixSessionEvents } = require('./reasonixSessionDetail');
+const {
+  isUserPromptRecord,
+  messageIdOf,
+  usageTokens,
+  buddyUsageTokens,
+  userPromptText
+} = require('./providers/codebuddy/transcript');
+const codebuddyExtension = require('./providers/codebuddy/extension');
+const opencodeSession = require('./providers/opencode/session');
+const { readReasonixSessionEvents } = require('./providers/reasonix/sessionDetail');
+const { createLocalUsageStore } = require('./providers/codex/localUsageStore');
+
+function* readTranscriptLines(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  let parts = [];
+  let lineBytes = 0;
+  try {
+    for (;;) {
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      const chunk = buffer.subarray(0, bytesRead);
+      let start = 0;
+      while (start < chunk.length) {
+        const newline = chunk.indexOf(10, start);
+        const end = newline === -1 ? chunk.length : newline;
+        lineBytes += end - start;
+        // Bound each record before decoding; never silently drop oversized usage.
+        if (lineBytes > 16 * 1024 * 1024) {
+          throw Object.assign(new Error('Session detail record exceeds 16 MiB'), { code: 'SESSION_DETAIL_LINE_TOO_LARGE' });
+        }
+        parts.push(chunk.subarray(start, end));
+        if (newline === -1) break;
+        yield Buffer.concat(parts, lineBytes).toString('utf8');
+        parts = [];
+        lineBytes = 0;
+        start = newline + 1;
+      }
+    }
+    if (lineBytes) yield Buffer.concat(parts, lineBytes).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 function num(value) {
   const n = Number(value);
@@ -71,7 +113,31 @@ function codexPromptText(raw) {
   return cleanPromptText(idx >= 0 ? text.slice(idx + marker.length) : text);
 }
 
+function codexResponseItemPrompt(payload) {
+  if (payload?.type !== 'message' || payload.role !== 'user') return null;
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds;
+  const hasKinds = Array.isArray(kinds);
+  const selected = content.filter((part, index) => !hasKinds || String(kinds[index] || '').startsWith('user.'));
+  // Current Codex records injected instructions as role=user too, but gives each content item a
+  // semantic kind. A message with metadata and no user.* items is context, not a prompt boundary.
+  if (hasKinds && selected.length === 0) return null;
+  const text = codexPromptText(selected
+    .filter((part) => part?.type === 'input_text')
+    .map((part) => part.text || '')
+    .join('\n'));
+  const imageCount = selected.filter((part) => part?.type === 'input_image').length;
+  const imageMarker = imageCount > 1 ? `[${imageCount} images]` : (imageCount === 1 ? '[image]' : '');
+  const audioCount = selected.filter((part) => part?.type === 'input_audio').length;
+  const audioMarker = audioCount > 1 ? `[${audioCount} audio clips]` : (audioCount === 1 ? '[audio]' : '');
+  return [imageMarker, audioMarker, text].filter(Boolean).join(' ') || null;
+}
+
 function parseClaudeTranscript(text) {
+  return parseClaudeTranscriptLines(String(text || '').split(/\r?\n/));
+}
+
+function parseClaudeTranscriptLines(lines) {
   const events = [];
   // Claude Code inflates a transcript two ways, both of which would otherwise multiply token counts:
   //   1. Resume replay — on resume it re-appends prior transcript entries verbatim, copying their
@@ -81,7 +147,7 @@ function parseClaudeTranscript(text) {
   //      usage once and merge the tool names so a single reply is one turn, not N.
   const seenLineUuids = new Set();
   const turnByMessageId = new Map();
-  for (const line of String(text || '').split(/\r?\n/)) {
+  for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     let obj;
@@ -130,15 +196,27 @@ function codexToolName(payload) {
   return payload.name || payload.tool_name || payload.tool || '';
 }
 
-function parseCodexTranscript(text) {
+function parseCodexTranscriptData(lines) {
   const events = [];
+  let canonicalSessionId = '';
+  let sawSessionMeta = false;
   let pendingTools = [];
-  for (const line of String(text || '').split(/\r?\n/)) {
+  let adjacentPrompt = null;
+  for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    // Codex can persist the same prompt in either schema order. Snapshot and clear the candidate
+    // for every physical JSONL record so only adjacent, equivalent prompt records are coalesced.
+    const previousPrompt = adjacentPrompt;
+    adjacentPrompt = null;
     let obj;
     try { obj = JSON.parse(trimmed); } catch (_) { continue; }
     const payload = obj.payload || {};
+    if (obj.type === 'session_meta' && !sawSessionMeta) {
+      sawSessionMeta = true;
+      const id = typeof payload.id === 'string' ? payload.id.trim() : '';
+      if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) canonicalSessionId = id;
+    }
     if (obj.type === 'response_item' && (payload.type === 'function_call' || payload.type === 'custom_tool_call' || payload.type === 'tool_search_call')) {
       const name = codexToolName(payload);
       if (name) pendingTools.push(name);
@@ -152,7 +230,30 @@ function parseCodexTranscript(text) {
       const marker = imageCount > 1 ? `[${imageCount} images]` : (imageCount === 1 ? '[image]' : '');
       const label = [marker, text].filter(Boolean).join(' '); // image-bearing prompts keep an [image] marker like Claude
       // empty + no image → degenerate user_message; skip so its turns fold into the real prompt
-      if (label) events.push({ kind: 'prompt', timestamp: obj.timestamp || '', text: label });
+      if (label) {
+        const prompt = { kind: 'prompt', timestamp: obj.timestamp || '', text: label };
+        // Keep event_msg as the canonical renderer text when it follows its response_item twin.
+        if (previousPrompt?.source === 'response_item'
+          && previousPrompt.index === events.length - 1
+          && previousPrompt.text === label) {
+          events[previousPrompt.index] = prompt;
+        } else {
+          events.push(prompt);
+        }
+        adjacentPrompt = { source: 'event_msg', index: events.length - 1, text: label };
+      }
+    } else if (obj.type === 'response_item') {
+      const label = codexResponseItemPrompt(payload);
+      if (label) {
+        // External-session imports persist event_msg first. Its response_item twin is model
+        // history, not a second user-visible boundary, so retain the canonical event_msg.
+        if (previousPrompt?.source !== 'event_msg'
+          || previousPrompt.index !== events.length - 1
+          || previousPrompt.text !== label) {
+          events.push({ kind: 'prompt', timestamp: obj.timestamp || '', text: label });
+        }
+        adjacentPrompt = { source: 'response_item', index: events.length - 1, text: label };
+      }
     } else if (obj.type === 'event_msg' && payload.type === 'token_count') {
       const u = payload.info && payload.info.last_token_usage;
       if (!u) continue; // session-start / idle tick with no turn usage — not a reply
@@ -171,6 +272,109 @@ function parseCodexTranscript(text) {
       if (tokens.total === 0) { pendingTools = []; continue; } // empty bookkeeping tick — skip
       events.push({ kind: 'turn', timestamp: obj.timestamp || '', tokens, tools: uniqueTools(pendingTools) });
       pendingTools = [];
+    }
+  }
+  return { events, canonicalSessionId };
+}
+
+function parseCodexTranscript(text) {
+  return parseCodexTranscriptData(String(text || '').split(/\r?\n/)).events;
+}
+
+// CodeBuddy timestamps are epoch milliseconds; every other transcript here
+// stamps ISO strings, and the shared grouping compares timestamps as text, so
+// they are normalized on the way in.
+function codebuddyTimestamp(value) {
+  const ms = Number(value);
+  const date = new Date(Number.isFinite(ms) && ms > 0 ? ms : (typeof value === 'string' ? value : NaN));
+  return Number.isNaN(date.getTime()) ? '' : date.toISOString();
+}
+
+// CodeBuddy persists one model response per `providerData.messageId`, as either
+// a `function_call` (the response asked for a tool) or an assistant message
+// (it answered in text), and puts the response's token usage on whichever of
+// the two records it wrote — overwhelmingly the call, so reading only assistant
+// messages would find usage for a fifth of the turns. Emitting one turn per
+// messageId also keeps the response count aligned with the message count
+// tokscale reports for this client, and folding the same records reproduces the
+// session's input, output and cache-read totals exactly.
+function parseCodebuddyTranscript(text) {
+  return parseCodebuddyTranscriptLines(String(text || '').split(/\r?\n/));
+}
+
+function parseCodebuddyTranscriptLines(lines) {
+  const events = [];
+  // The turn object is pushed on first sight and filled in place: a response's
+  // records are adjacent, and its usage may arrive on the call while its text
+  // arrives on the message (or the other way round).
+  const turns = new Map();
+  // Tool calls a response cannot claim — older WorkBuddy builds wrote no
+  // grouping id at all, so a call before a usage-bearing reply cannot be
+  // attached to one. They ride the next emitted turn, the way the Codex
+  // parser consumes its pending calls.
+  const pendingTools = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let entry;
+    try { entry = JSON.parse(trimmed); } catch (_) { continue; }
+
+    if (isUserPromptRecord(entry)) {
+      // Ungrouped calls cannot belong to a response after a new prompt.
+      pendingTools.length = 0;
+      const prompt = userPromptText(entry);
+      events.push({ kind: 'prompt', timestamp: codebuddyTimestamp(entry.timestamp), text: prompt });
+      continue;
+    }
+    const isResponse = entry.type === 'function_call'
+      || (entry.type === 'message' && entry.role === 'assistant');
+    if (!isResponse) continue;
+    const messageId = messageIdOf(entry);
+    const usage = usageTokens(entry);
+
+    if (!messageId) {
+      // Older builds recorded usage without the grouping id, so the record is
+      // its own response. One with usage becomes a turn on its own; a call
+      // without usage joins the next turn's tools, since nothing ties it to a
+      // response of its own.
+      if (usage) {
+        const tools = [...pendingTools];
+        pendingTools.length = 0;
+        if (entry.type === 'function_call') tools.push(entry.name || entry.tool_name || '');
+        events.push({
+          kind: 'turn',
+          timestamp: codebuddyTimestamp(entry.timestamp),
+          tokens: usage,
+          tokensAvailable: true,
+          tools
+        });
+      } else if (entry.type === 'function_call') {
+        const name = entry.name || entry.tool_name;
+        if (typeof name === 'string' && name) pendingTools.push(name);
+      }
+      continue;
+    }
+
+    let turn = turns.get(messageId);
+    if (!turn) {
+      turn = { kind: 'turn', timestamp: '', tokens: emptyTokens(), tokensAvailable: false, tools: [] };
+      turns.set(messageId, turn);
+      events.push(turn);
+    }
+    if (!turn.timestamp) turn.timestamp = codebuddyTimestamp(entry.timestamp);
+    if (entry.type === 'function_call') {
+      const name = entry.name || entry.tool_name;
+      if (typeof name === 'string' && name) turn.tools.push(name);
+    }
+    // A response whose usage never arrived keeps `tokensAvailable: false`, which
+    // the shared grouping and the detail view both understand: the reply is
+    // still shown, with its tools, and only its token numbers are missing.
+    // Tokscale keeps the largest usage for a repeated response, replacing it
+    // on a tie. Its period follows that usage record, not an earlier companion.
+    if (usage && (!turn.tokensAvailable || usage.total >= turn.tokens.total)) {
+      turn.tokens = usage;
+      turn.tokensAvailable = true;
+      turn.timestamp = codebuddyTimestamp(entry.timestamp) || turn.timestamp;
     }
   }
   return events;
@@ -202,12 +406,14 @@ function newExchange(promptPreview, timestamp) {
 }
 
 function finalizeExchange(ex) {
-  // Paid background usage such as a DSH compaction summary stays in `turns`
-  // for period filtering, token totals and cost allocation, but it is not an
-  // assistant reply and must not inflate the user-facing conversation count.
-  ex.turnCount = ex.turns.filter((turn) => turn.type !== 'compaction-summary').length;
+  // Paid non-reply usage such as a DSH compaction summary or failed/retried
+  // assistant attempt stays in `turns` for period filtering, token totals and
+  // cost allocation, but must not inflate the user-facing conversation count.
+  ex.turnCount = ex.turns.filter((turn) => turn.type !== 'compaction-summary' && turn.type !== 'assistant-attempt').length;
   ex.tools = uniqueTools(ex.turns.flatMap((t) => t.tools));
   ex.tokensAvailable = ex.turns.every((turn) => turn.tokensAvailable !== false);
+  const unpriced = ex.turns.reduce((sum, turn) => sum + num(turn.unpricedTokens), 0);
+  if (unpriced > 0) ex.unpricedTokens = unpriced;
   return ex;
 }
 
@@ -228,7 +434,9 @@ function groupEvents(events) {
         tokens: event.tokens,
         tokensAvailable: event.tokensAvailable !== false,
         tools: event.tools,
-        costEstimate: num(event.cost)
+        costEstimate: num(event.cost),
+        ...(event.model ? { model: event.model } : {}),
+        ...(event.unpricedTokens > 0 ? { unpricedTokens: num(event.unpricedTokens) } : {})
       };
       current.turns.push(turnEntry);
       addTokens(current.tokens, event.tokens);
@@ -279,12 +487,6 @@ function distributeCost(exchanges, sessionCost) {
     }
   }
   return exchanges;
-}
-
-function parseByClient(client, text) {
-  if (client === 'claude') return parseClaudeTranscript(text);
-  if (client === 'codex') return parseCodexTranscript(text);
-  return [];
 }
 
 function totalsOf(exchanges, sessionCost) {
@@ -342,26 +544,114 @@ function readReasonixSessionDetail({ sessionId, period = 'total', home, deps = {
   };
 }
 
+// CodeBuddy conversations from the VS Code extension live in the extension's
+// own store, not in a transcript file, so the generic file path below answers
+// nothing for them. One reported trace id is one request: its user messages
+// are the exchange's prompts and the request's own usage is its single turn —
+// the client counts the same way (one usage-bearing request, one message).
+function readCodebuddyExtensionSessionDetail({ sessionId, period, sessionCost, home, env, deps = {} }) {
+  const session = codebuddyExtension.findExtensionSession(sessionId, {
+    homeDir: home,
+    env,
+    platform: deps.platform,
+    fs: deps.fs,
+    dataRoots: deps.codebuddyExtensionDataRoots
+  });
+  if (!session) {
+    return { found: false, client: 'codebuddy', sessionId, period, exchanges: [], totals: totalsOf([], sessionCost) };
+  }
+
+  const events = [];
+  for (const entry of session.entries) {
+    if (entry.role !== 'user') continue;
+    // The client keeps the prompt the user actually saw beside the
+    // context-wrapped payload; the fallback is that payload's own text.
+    const prompt = cleanPromptText(entry.displayText || entry.text);
+    if (!prompt) continue;
+    events.push({ kind: 'prompt', timestamp: codebuddyTimestamp(entry.createdAt), text: prompt });
+  }
+  const tokens = buddyUsageTokens(session.usage);
+  const timestamp = codebuddyTimestamp(session.startedAt)
+    || session.entries.reduce((latest, entry) => {
+      const candidate = codebuddyTimestamp(entry.createdAt);
+      return candidate > latest ? candidate : latest;
+    }, '');
+  events.push({
+    kind: 'turn',
+    timestamp,
+    tokens: tokens || emptyTokens(),
+    tokensAvailable: Boolean(tokens),
+    tools: []
+  });
+
+  const now = new Date((deps.now || Date.now)());
+  const grouped = filterExchangesByPeriod(groupEvents(events), period, now);
+  distributeCost(grouped, sessionCost);
+  return { found: true, client: 'codebuddy', sessionId, period, exchanges: grouped, totals: totalsOf(grouped, sessionCost) };
+}
+
 function readSessionDetail({ client, sessionId, period = 'total', sessionCost = 0, home, env, useEnvRoots, deps = {} }) {
   if (client === 'opencode') return readOpenCodeSessionDetail({ sessionId, period, deps });
   if (client === 'reasonix') return readReasonixSessionDetail({ sessionId, period, home, deps });
   const filePath = resolveSessionFile(client, sessionId, home, { env, useEnvRoots });
-  if (!filePath) return { found: false, client, sessionId, period, exchanges: [], totals: totalsOf([], sessionCost) };
-  let text;
-  try { text = fs.readFileSync(filePath, 'utf8'); } catch (_) {
-    return { found: false, client, sessionId, period, exchanges: [], totals: totalsOf([], sessionCost) };
+  if (!filePath && client === 'codebuddy') {
+    return readCodebuddyExtensionSessionDetail({ sessionId, period, sessionCost, home, env, deps });
   }
-  const events = parseByClient(client, text);
+  if (!filePath && client === 'codex') {
+    const store = createLocalUsageStore({ homeDir: home, env, ...(deps.codexLocalUsageOptions || {}) });
+    try {
+      const rows = store.rows().filter((row) => row.threadId === sessionId && !row.nativeBacked);
+      if (rows.length) {
+        const events = rows.map((row) => ({
+          kind: 'turn', type: 'assistant-attempt', timestamp: row.observedAt,
+          tokens: makeTokens(row.usage), tools: [], model: row.model, unpricedTokens: row.usage.total
+        }));
+        const grouped = filterExchangesByPeriod(groupEvents(events), period, new Date((deps.now || Date.now)()));
+        // A session subtotal cannot price unknown requests. The parent process
+        // may resolve catalog rates for these per-request models after the
+        // worker returns; until then every ledger request is explicitly unpriced.
+        const unpricedTokens = grouped.reduce((sum, ex) => sum + num(ex.unpricedTokens), 0);
+        return { found: true, client, sessionId, canonicalSessionId: sessionId, period,
+          usageSource: 'codex-dots-local', usageCoverage: 'observed-only',
+          exchanges: grouped, totals: { ...totalsOf(grouped, 0), unpricedTokens } };
+      }
+    } catch (_) { /* A damaged supplemental ledger must not break native details. */ }
+    finally { store.close(); }
+  }
+  if (!filePath) return { found: false, client, sessionId, period, exchanges: [], totals: totalsOf([], sessionCost) };
+  let parsed;
+  let events;
+  try {
+    const lines = readTranscriptLines(filePath);
+    // The filename is a lookup key, not necessarily Codex's conversation identity.
+    parsed = client === 'codex' ? parseCodexTranscriptData(lines) : null;
+    // WorkBuddy writes the same transcript family as CodeBuddy Code.
+    events = parsed ? parsed.events
+      : (client === 'codebuddy' || client === 'workbuddy')
+        ? parseCodebuddyTranscriptLines(lines)
+        : parseClaudeTranscriptLines(lines);
+  } catch (error) {
+    if (error.code === 'ENOENT') return { found: false, client, sessionId, period, exchanges: [], totals: totalsOf([], sessionCost) };
+    return {
+      found: false, client, sessionId, period, exchanges: [], totals: totalsOf([], sessionCost),
+      error: error.code === 'SESSION_DETAIL_LINE_TOO_LARGE' ? 'line-too-large' : 'read-failed'
+    };
+  }
   const now = new Date((deps.now || Date.now)());
   const grouped = filterExchangesByPeriod(groupEvents(events), period, now);
   distributeCost(grouped, sessionCost);
-  return { found: true, client, sessionId, period, exchanges: grouped, totals: totalsOf(grouped, sessionCost) };
+  return {
+    found: true, client, sessionId, period, exchanges: grouped, totals: totalsOf(grouped, sessionCost),
+    ...(parsed ? { canonicalSessionId: parsed.canonicalSessionId } : {})
+  };
 }
 
 module.exports = {
   parseClaudeTranscript,
+  parseCodebuddyTranscript,
   parseCodexTranscript,
   makeTokens,
+  readCodebuddyExtensionSessionDetail,
   groupEvents,
   filterExchangesByPeriod,
   distributeCost,

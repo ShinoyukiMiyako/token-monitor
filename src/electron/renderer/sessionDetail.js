@@ -28,12 +28,14 @@
 
   function turnRow(turn, index, replyIndex) {
     const isCompactionSummary = turn.type === 'compaction-summary';
+    const isAssistantAttempt = turn.type === 'assistant-attempt';
     return {
       key: `turn:${index}`,
-      label: isCompactionSummary ? 'Compaction summary' : `Reply #${replyIndex + 1}`,
+      label: isCompactionSummary ? 'Compaction summary' : (isAssistantAttempt ? 'Model attempt' : `Reply #${replyIndex + 1}`),
       value: finiteNumber(turn.tokens && turn.tokens.total),
       tokensAvailable: turn.tokensAvailable !== false,
       cost: finiteNumber(turn.costEstimate),
+      ...(turn.unpricedTokens > 0 ? { unpricedTokens: finiteNumber(turn.unpricedTokens) } : {}),
       tokens: turn.tokens || {},
       tools: formatToolList(turn.tools)
     };
@@ -43,7 +45,7 @@
     let replyIndex = 0;
     return (turns || []).map((turn, index) => {
       const row = turnRow(turn, index, replyIndex);
-      if (turn.type !== 'compaction-summary') replyIndex += 1;
+      if (turn.type !== 'compaction-summary' && turn.type !== 'assistant-attempt') replyIndex += 1;
       return row;
     });
   }
@@ -73,6 +75,7 @@
         value: finiteNumber(ex.tokens && ex.tokens.total),
         tokensAvailable: ex.tokensAvailable !== false,
         cost: finiteNumber(ex.costEstimate),
+        ...(ex.unpricedTokens > 0 ? { unpricedTokens: finiteNumber(ex.unpricedTokens) } : {}),
         startTime: timeValue(ex.startedAt),
         turnCount,
         turns: turnRows(ex.turns) // usage entries stay chronological; summaries do not consume reply numbers

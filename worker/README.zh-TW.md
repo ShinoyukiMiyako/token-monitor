@@ -102,7 +102,7 @@ npx wrangler secret put PUBLIC_STATS_ENABLED   # enter 1
 
 ### Widgy
 
-選 **async / no main()** 範本。使用 `?secret=` 查詢字串驗證：Widgy 那個隱藏的 WKWebView 可能會卡在 `Authorization: Bearer` 觸發的 CORS 預檢上，而 URL 會留在裝置本機的 Widgy 設定裡，所以密鑰不會進入外部日誌。
+選 **async / no main()** 範本。使用 `?secret=` 查詢字串驗證：Widgy 那個隱藏的 WKWebView 可能會卡在 `Authorization: Bearer` 觸發的 CORS 預檢上。這是有限相容路徑：URL 裡的密鑰可能進入代理、平台或歷史日誌。能設 Header 的客戶端請走 Header。
 
 最簡版本，只要一個數字：
 
@@ -240,16 +240,16 @@ iOS 小工具沒有省電的推送通道，所以執行環境會自行每隔幾�
 | GET    | `/api/health`              | 無     | 存活探針 + 裝置數                          |
 | GET    | `/api/public/stats`        | 無     | `PUBLIC_STATS_ENABLED=1` 時提供不含 devices/帳號 id 的公開聚合統計 |
 | GET    | `/api/stats`               | 密鑰   | 聚合統計（today / month / allTime）        |
-| GET    | `/api/stats/stream`        | 密鑰   | SSE 串流，每次 ingest 都推送               |
+| GET    | `/api/stats/stream`        | 密鑰   | SSE 快照與合併後的即時變更                 |
 | GET    | `/api/devices`             | 密鑰   | 原始的每裝置記錄                          |
 | POST   | `/api/ingest`              | 密鑰   | 更新某個裝置的用量摘要                    |
 | DELETE | `/api/devices/{deviceId}`  | 密鑰   | 刪除一筆裝置記錄                          |
 
-密鑰有三種接受方式（任一即可）：
+密鑰有三種接受方式（任一即可）。請優先使用 Header；`?secret=` 僅作為有限相容 / 遷移路徑保留：
 
 1. `Authorization: Bearer <secret>`：agent、小工具，以及任何伺服器 / 桌面客戶端首選。
 2. `x-token-monitor-secret: <secret>`：無法設定 `Authorization` 的客戶端的後備方案。
-3. `?secret=<secret>` 查詢字串：針對 iOS 小工具執行環境（Widgy、Scriptable）的變通方案，它們的 WKWebView 難以處理 `Authorization` 標頭的 CORS 預檢。只在 URL 留在裝置本機的客戶端上使用。
+3. `?secret=<secret>` 查詢字串：iOS 小工具執行環境（Widgy、Scriptable）的有限相容 / 遷移路徑，它們的 WKWebView 難以處理 `Authorization` 標頭的 CORS 預檢。URL 裡的密鑰可能進入代理、平台或歷史日誌。新客戶端應改走 Header。
 
 密鑰是必需的。當 `TOKEN_MONITOR_SECRET` 未設定時，所有資料路由都回傳 `503 secret_required`，只有 `/api/health` 和可選開啟的 `/api/public/stats` 會回應。請在部署前（或部署時）設定它。
 
@@ -268,3 +268,10 @@ npm run tail
 ```
 
 即時串流輸出 Worker + Durable Object 日誌。
+
+
+## 可選共享內容
+
+`wrangler.toml` 中的 `TOKEN_MONITOR_SYNC_SESSION_TITLES = "false"` 是預設關閉的伺服器端標題接收權限。只有需要允許裝置傳送標題時才設為 `"true"`；裝置仍需個別選擇加入，通過身分驗證存取 `/api/sync/content`，並與 `/api/sync/titles/:deviceId` 協商。關閉權限會清除離線裝置已儲存的標題，並使已啟用的世代權杖失效。公開統計始終不包含標題、共享設定及其版本標記。
+
+經過身分驗證的 `/api/sync/settings/modelAliases` 和 `/api/sync/settings/customPricing` 只儲存有大小限制的共享群組，使用整數 `baseRevision` 進行比較並交換（CAS）。從未初始化的值為 `null`；主動清空的群組具有正數修訂版本。過期寫入會回傳 `409` 和目前群組，用戶端必須先重新整理並處理衝突。私有統計和 SSE 透過 `syncSettingsRevisions` 通知變更。設定和標題策略使用獨立於 `dev:` 的儲存前綴；刪除裝置仍會保留已停用的策略記錄，防止舊上傳恢復標題。完整請求格式見主專案的 `docs/API.md`。

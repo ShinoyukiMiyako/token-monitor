@@ -16,9 +16,11 @@ const {
   usageConfigFingerprint,
   usageConfigFromSettings
 } = require('../../src/electron/runtimeConfig');
+const { alibabaVariant } = require('../../src/shared/providers/alibaba/limits');
 
 const BASE_USAGE_SETTINGS = Object.freeze({
   clients: 'claude',
+  customScanPaths: {},
   allTimeSince: '2024-01-01',
   collectionIntervalMs: 5 * 60 * 1000,
   collectionMode: 'smart',
@@ -122,6 +124,8 @@ test('usage config fingerprint dedupes raw settings with the same effective runt
 test('every usage structural setting maps to an effective fingerprint change', () => {
   const cases = {
     clients: { clients: 'claude,codex' },
+    codexDotsEnabled: { codexDotsEnabled: true },
+    customScanPaths: { customScanPaths: { claude: [path.resolve('tmp', 'claude-sessions')] } },
     allTimeSince: { allTimeSince: '2025-01-01' },
     collectionIntervalMs: {
       previous: { collectionMode: 'fixed' },
@@ -267,13 +271,29 @@ test('runtime config scopes Trae credentials and prefers saved settings over env
   assert.deepEqual(classification.limitScopes, [{ provider: 'trae' }]);
 });
 
+test('runtime config prefers the saved Zed dashboard Cookie and scopes changes to Zed', () => {
+  const settings = { zedCookie: 'zed.session=saved' };
+  const limits = limitsConfigFromSettings(settings, {
+    env: { TOKEN_MONITOR_ZED_COOKIE: 'zed.session=env' }
+  });
+  assert.equal(limits.zedCookie, 'zed.session=saved');
+
+  const classification = classifySettingsChange(settings, {
+    ...settings,
+    zedCookie: 'zed.session=next'
+  });
+  assert.deepEqual(classification.limitScopes, [{ provider: 'zed' }]);
+});
+
 test('limits config resolves managed credentials at dispatch time through context', () => {
   const limits = limitsConfigFromSettings({ codexManagedAccounts: [{ id: 'stale' }] }, {
     env: {},
     codexManagedAccounts: [{ id: 'live', homePath: '/tmp/live' }],
+    antigravityManagedAccounts: [{ id: 'antigravity', credentials: { accessToken: 'oauth' } }],
     mimoManagedAccounts: [{ id: 'mimo', cookieHeader: 'allowlisted' }]
   });
   assert.deepEqual(limits.codexManagedAccounts, [{ id: 'live', homePath: '/tmp/live' }]);
+  assert.deepEqual(limits.antigravityManagedAccounts, [{ id: 'antigravity', credentials: { accessToken: 'oauth' } }]);
   assert.deepEqual(limits.mimoManagedAccounts, [{ id: 'mimo', cookieHeader: 'allowlisted' }]);
 });
 
@@ -313,6 +333,27 @@ test('desktop WorkBuddy Local App monitoring resolves session metadata when its 
   assert.equal(limits.workbuddyEnterpriseId, 'local-enterprise');
   assert.equal(limits.workbuddyAccountType, 'enterprise');
   assert.equal(limits.workbuddyAccessToken, '');
+});
+
+test('desktop WorkBuddy Local App monitoring carries the session read reason', () => {
+  const sealed = limitsConfigFromSettings({}, {
+    env: {},
+    workbuddyDesktopSessionOnly: true,
+    workbuddyDesktopSessionEnabled: true,
+    workbuddyLocalSession: { authenticated: false, reason: 'encrypted' }
+  });
+  assert.equal(sealed.workbuddyLocalSessionReason, 'encrypted');
+
+  const readable = limitsConfigFromSettings({}, {
+    env: {},
+    workbuddyDesktopSessionOnly: true,
+    workbuddyDesktopSessionEnabled: true,
+    workbuddyLocalSession: { userId: 'local-user', accountType: 'personal' }
+  });
+  assert.equal(readable.workbuddyLocalSessionReason, '');
+
+  const inactive = limitsConfigFromSettings({}, { env: {}, workbuddyDesktopSessionOnly: true });
+  assert.equal(inactive.workbuddyLocalSessionReason, '');
 });
 
 test('desktop WorkBuddy auth reads can be disabled without enabling fallback credentials', () => {
@@ -384,6 +425,15 @@ test('display-only settings do not restart producers or probe providers', () => 
   assert.equal(classification.limitsReconfigure, false);
   assert.equal(classification.sinkStructural, false);
   assert.deepEqual(classification.limitScopes, []);
+});
+
+test('Dots visibility changes projection without replacing the observer runtime', () => {
+  const previous = { codexDotsEnabled: true, codexDotsVisible: true };
+  const next = { ...previous, codexDotsVisible: false };
+  assert.equal(classifySettingsChange(previous, next).usageStructural, false);
+  assert.equal(usageConfigFingerprint(usageConfigFromSettings(previous)),
+    usageConfigFingerprint(usageConfigFromSettings(next)));
+  assert.equal(usageConfigFromSettings(next).codexDotsVisible, false);
 });
 
 test('OpenRouter profile changes invalidate only the OpenRouter limits lane', () => {
@@ -499,4 +549,27 @@ test('third-party profile changes invalidate only the third-party limits lane', 
     }
   );
   assert.deepEqual(classification.limitScopes, [{ provider: 'thirdparty' }]);
+});
+
+// The desktop default for this setting is deliberately empty. A concrete default
+// would be merged into settings before any read and would then satisfy the
+// provider's `options || env` fallback, making ALIBABA_TOKEN_PLAN_VARIANT dead in
+// both the settings UI and the collector.
+test('an unset Alibaba variant leaves the env var reachable by the collector', () => {
+  const fromEnv = limitsConfigFromSettings(
+    { alibabaCookie: 'login_aliyunid_pk=abc', alibabaVariant: '' },
+    { env: { ALIBABA_TOKEN_PLAN_VARIANT: 'intl-personal' } }
+  );
+  assert.equal(fromEnv.alibabaVariant, '');
+  assert.equal(alibabaVariant(fromEnv, { ALIBABA_TOKEN_PLAN_VARIANT: 'intl-personal' }), 'intl-personal');
+
+  // An explicit choice still wins over the environment.
+  const explicit = limitsConfigFromSettings(
+    { alibabaCookie: 'login_aliyunid_pk=abc', alibabaVariant: 'cn' },
+    { env: { ALIBABA_TOKEN_PLAN_VARIANT: 'intl-personal' } }
+  );
+  assert.equal(alibabaVariant(explicit, { ALIBABA_TOKEN_PLAN_VARIANT: 'intl-personal' }), 'cn');
+
+  // With neither, the provider falls back to mainland Team.
+  assert.equal(alibabaVariant(limitsConfigFromSettings({}, { env: {} }), {}), 'cn');
 });

@@ -1,10 +1,13 @@
 'use strict';
 
 (function exposeTokenRate(root, factory) {
-  const api = factory();
+  const deviceBreakdownApi = typeof module === 'object' && module.exports
+    ? require('./deviceBreakdown')
+    : root?.TokenMonitorDeviceBreakdown;
+  const api = factory(deviceBreakdownApi);
   if (typeof module === 'object' && module.exports) module.exports = api;
   if (root) root.TokenMonitorTokenRate = api;
-})(typeof window !== 'undefined' ? window : null, function createTokenRateApi() {
+})(typeof window !== 'undefined' ? window : null, function createTokenRateApi(deviceBreakdownApi) {
   const TOKEN_RATE_BOOST_DOUBLING_MS = 520;
   const TOKEN_RATE_HOLD_THRESHOLD_MS = 180;
   const TOKEN_RATE_SETTLE_MS = 720;
@@ -56,6 +59,277 @@
     const timed = positiveNumber(period?.timedTokens);
     if (!durationMs || !timed) return 0;
     return cappedTokenRate(timed * 60000 / durationMs);
+  }
+
+  function usageCounters(period) {
+    if (period?.capabilities?.throughput === false) return null;
+    const counter = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+    };
+    const counters = {
+      timedTokens: counter(period?.timedTokens),
+      timedOutputTokens: counter(period?.timedOutputTokens),
+      timedDurationMs: counter(period?.timedDurationMs)
+    };
+    return Object.values(counters).every((value) => value !== null) ? counters : null;
+  }
+
+  function modelCounters(period) {
+    return Object.fromEntries(Object.entries(period.modelThroughput || {})
+      .map(([model, counters]) => [model, usageCounters(counters)])
+      .filter(([, counters]) => counters));
+  }
+
+  // A period is cumulative, so its ratio is necessarily an average. Live rate is the ratio
+  // of the counters added by one successful snapshot: the duration comes from the same
+  // tokscale performance entries as both token numerators, never from watcher or wall time.
+  // Equal snapshots keep the last sample (limits-only and final-after-preview pushes are
+  // common); any regression is a new baseline boundary such as midnight or reconfiguration.
+  function createLiveTokenRateTracker({ now = defaultNow } = {}) {
+    if (typeof now !== 'function') throw new TypeError('now must be a function');
+    let baseline = null;
+    let modelBaseline = null;
+    let sample = null;
+    let revision = 0;
+
+    function reset(period) {
+      baseline = period ? usageCounters(period) : null;
+      modelBaseline = period?.modelThroughput ? modelCounters(period) : null;
+      sample = null;
+    }
+
+    function observe(period) {
+      const current = usageCounters(period);
+      const models = period?.modelThroughput ? modelCounters(period) : null;
+      const previousModels = modelBaseline;
+      modelBaseline = models;
+      if (!current) {
+        baseline = null;
+        sample = null;
+        return null;
+      }
+      if (!baseline) {
+        baseline = current;
+        return null;
+      }
+
+      const delta = {
+        timedTokens: current.timedTokens - baseline.timedTokens,
+        timedOutputTokens: current.timedOutputTokens - baseline.timedOutputTokens,
+        timedDurationMs: current.timedDurationMs - baseline.timedDurationMs
+      };
+      baseline = current;
+
+      if (Object.values(delta).some((value) => value < 0)) {
+        sample = null;
+        return null;
+      }
+      if (!(delta.timedDurationMs > 0)) return sample;
+
+      revision += 1;
+      sample = {
+        speed: tokenRatePerSecond(delta),
+        burn: tokenBurnPerMinute(delta),
+        sampledAt: Number(now()) || 0,
+        revision,
+        models: Object.entries(models || {}).flatMap(([model, counters]) => {
+          // Missing attribution is unknown, not an exact zero baseline.
+          if (!previousModels) return [];
+          const previous = previousModels[model] || { timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 };
+          const change = Object.fromEntries(Object.keys(counters).map((field) => [field, counters[field] - previous[field]]));
+          // A renamed/retroactively attributed model may appear with historical
+          // counters. It cannot have added more than this snapshot's entire delta.
+          if (Object.keys(change).some((field) => change[field] < 0 || change[field] > delta[field])
+            || !(change.timedDurationMs > 0)) return [];
+          return [{ model, speed: tokenRatePerSecond(change), burn: tokenBurnPerMinute(change) }];
+        }),
+        ...delta
+      };
+      return sample;
+    }
+
+    function getSample() {
+      return sample;
+    }
+
+    function value(mode) {
+      if (!sample) return null;
+      return mode === 'burn' ? sample.burn : sample.speed;
+    }
+
+    return { getSample, observe, reset, value };
+  }
+
+  // Hub devices publish independently. Taking one delta from the aggregate would make the
+  // headline jump between whichever device happened to upload last, and dividing summed
+  // tokens by summed model-busy time would be an average rather than fleet throughput. Keep
+  // one matched-counter tracker per device, then add only samples that are still live.
+  function createLiveTokenRateGroupTracker({ now = defaultNow, activeMs = 8000, clearMs = 180000 } = {}) {
+    if (typeof now !== 'function') throw new TypeError('now must be a function');
+    const lifetime = positiveNumber(activeMs);
+    if (!lifetime) throw new TypeError('activeMs must be a positive number');
+    const clearAfter = positiveNumber(clearMs);
+    if (!clearAfter || clearAfter <= lifetime) throw new TypeError('clearMs must be greater than activeMs');
+    const trackers = new Map();
+    let revision = 0;
+    let lastDisplaySample = null;
+
+    function normalizedEntries(entries) {
+      const result = [];
+      const seen = new Set();
+      for (const entry of Array.isArray(entries) ? entries : []) {
+        const id = String(entry?.id || '').trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        result.push({ id, name: String(entry?.name || id), period: entry?.period });
+      }
+      return result;
+    }
+
+    function reset(entries = []) {
+      trackers.clear();
+      lastDisplaySample = null;
+      for (const entry of normalizedEntries(entries)) {
+        const tracker = createLiveTokenRateTracker({ now });
+        tracker.reset(entry.period);
+        trackers.set(entry.id, { tracker, name: entry.name });
+      }
+    }
+
+    function observe(entries = []) {
+      const nextEntries = normalizedEntries(entries);
+      const present = new Set(nextEntries.map((entry) => entry.id));
+      let changed = false;
+      let fresh = false;
+      let invalidated = false;
+
+      for (const [id, { tracker }] of trackers) {
+        if (present.has(id)) continue;
+        if (tracker.getSample()) {
+          changed = true;
+        }
+        trackers.delete(id);
+      }
+
+      for (const entry of nextEntries) {
+        const device = trackers.get(entry.id);
+        if (!device) {
+          const tracker = createLiveTokenRateTracker({ now });
+          tracker.reset(entry.period);
+          trackers.set(entry.id, { tracker, name: entry.name });
+          continue;
+        }
+        device.name = entry.name;
+        const { tracker } = device;
+        const previous = tracker.getSample();
+        const sample = tracker.observe(entry.period);
+        if (sample === previous) continue;
+        changed = true;
+        if (sample) fresh = true;
+        else if (previous) invalidated = true;
+      }
+
+      if (invalidated) lastDisplaySample = null;
+      if (fresh) revision += 1;
+      return { changed, sample: getSample() };
+    }
+
+    function activeSamples() {
+      const timestamp = Number(now()) || 0;
+      return [...trackers.entries()]
+        .map(([id, { tracker, name }]) => {
+          const sample = tracker.getSample();
+          return sample ? { ...sample, id, name } : null;
+        })
+        .filter((sample) => sample && timestamp < sample.sampledAt + lifetime);
+    }
+
+    function getSample() {
+      const samples = activeSamples();
+      if (samples.length) {
+        lastDisplaySample = {
+          speed: cappedTokenRate(samples.reduce((sum, sample) => sum + sample.speed, 0)),
+          burn: cappedTokenRate(samples.reduce((sum, sample) => sum + sample.burn, 0)),
+          sampledAt: Math.max(...samples.map((sample) => sample.sampledAt)),
+          devices: samples.filter((sample) => sample.models?.length)
+            .map(({ id, name, models }) => ({ id, name, models })),
+          deviceCount: samples.length,
+          revision
+        };
+        return {
+          ...lastDisplaySample,
+          expiresAt: Math.min(...samples.map((sample) => sample.sampledAt + lifetime)),
+          idle: false
+        };
+      }
+
+      // The retained aggregate is presentation-only: expired device samples no longer
+      // contribute to live throughput, but the last useful reading stays visible in the
+      // dimmed state until it is old enough to be genuinely unavailable.
+      const timestamp = Number(now()) || 0;
+      const expiresAt = lastDisplaySample?.sampledAt + clearAfter;
+      if (!lastDisplaySample || timestamp >= expiresAt) return null;
+      return { ...lastDisplaySample, expiresAt, idle: true };
+    }
+
+    function nextExpiryAt() {
+      return getSample()?.expiresAt || null;
+    }
+
+    return { getSample, nextExpiryAt, observe, reset };
+  }
+
+  function isSharedSyncMode(hubMode) {
+    return hubMode === 'client' || hubMode === 'host' || hubMode === 'icloud';
+  }
+
+  function selectLiveTokenRatePeriods(stats, deviceId, hubMode = 'local', scope = 'all') {
+    const normalizedDeviceId = String(deviceId || '').trim();
+    const syncMode = isSharedSyncMode(hubMode);
+    const devices = Array.isArray(stats?.devices) ? stats.devices : [];
+
+    if (syncMode && scope !== 'device') {
+      return {
+        entries: devices
+          .filter((device) => device?.stale !== true && device?.periods?.today && typeof device.periods.today === 'object')
+          .map((device) => ({ id: `device:${String(device.deviceId || 'unknown')}`, name: deviceBreakdownApi.deviceLabel(device), period: device.periods.today })),
+        source: 'devices:all'
+      };
+    }
+
+    const localDevice = normalizedDeviceId
+      ? devices.find((device) => String(device?.deviceId || '') === normalizedDeviceId)
+      : null;
+    // Local mode owns the aggregate snapshot, so it remains a valid same-device
+    // source while startup anchors or a device-id change leave `devices` empty.
+    // Sync mode must stay strict: its aggregate may contain other machines.
+    const localPeriod = localDevice?.periods?.today
+      || (!syncMode ? stats?.periods?.today : null);
+    if (localPeriod && typeof localPeriod === 'object') {
+      return {
+        entries: [{ id: `device:${normalizedDeviceId}`, name: deviceBreakdownApi.deviceLabel(localDevice || { deviceId: normalizedDeviceId }), period: localPeriod }],
+        source: `device:${normalizedDeviceId}`
+      };
+    }
+    return { entries: [], source: `device:${normalizedDeviceId || 'unavailable'}` };
+  }
+
+  function liveTokenRateTooltipEntries(sample, mode, formatRate) {
+    const burn = mode === 'burn';
+    const unit = burn ? 'TPM' : 'tok/s';
+    const devices = sample?.devices || [];
+    const grouped = (sample?.deviceCount || devices.length) > 1;
+    const entries = [];
+    for (const device of devices) {
+      if (!device.models?.length) continue;
+      if (grouped) entries.push({ full: device.name, separated: entries.length > 0 });
+      const models = device.models.slice().sort((a, b) =>
+        (burn ? b.burn - a.burn : b.speed - a.speed) || a.model.localeCompare(b.model));
+      entries.push(...models.map((entry) => [entry.model, `${formatRate(burn ? entry.burn : entry.speed)} ${unit}`]));
+    }
+    return entries;
   }
 
   function defaultNow() {
@@ -271,8 +545,13 @@
     TOKEN_RATE_MAX_DISPLAY_RATE,
     TOKEN_RATE_SETTLE_MS,
     cappedTokenRate,
+    createLiveTokenRateGroupTracker,
+    createLiveTokenRateTracker,
     createTokenRateBoostController,
+    isSharedSyncMode,
+    liveTokenRateTooltipEntries,
     positiveNumber,
+    selectLiveTokenRatePeriods,
     tokenBurnPerMinute,
     tokenRateBoostValue,
     tokenRatePerSecond,

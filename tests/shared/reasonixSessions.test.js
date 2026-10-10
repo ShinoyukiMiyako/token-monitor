@@ -14,15 +14,15 @@ const {
   REASONIX_META_MAX_BYTES,
   REASONIX_TELEMETRY_USAGE_MAX_BYTES,
   reasonixNativeSessionWatchRoots
-} = require('../../src/shared/reasonixSessions');
+} = require('../../src/shared/providers/reasonix/sessions');
 const {
   readReasonixTelemetryUsage,
   REASONIX_TELEMETRY_TAIL_OVERHEAD_BYTES
-} = require('../../src/shared/reasonixFileIo');
+} = require('../../src/shared/providers/reasonix/fileIo');
 const { collectUsageOnce, projectIdentity, watchIgnoreMatcher, watchPathsForClients } = require('../../src/shared/collector');
 const { syncPayload } = require('../../src/shared/syncPayload');
-const { createDeviceState } = require('../../src/shared/deviceState');
-const { captureSessionUsageArchive } = require('../../src/shared/sessionUsageArchive');
+const { createDeviceState } = require('../../src/shared/usage/deviceState');
+const { captureSessionUsageArchive } = require('../../src/shared/usage/sessionUsageArchive');
 const { localIso, localMs } = require('../helpers/localTime');
 const { projectRowsForPeriod } = require('../../src/electron/renderer/projectRows');
 const { sessionRowsForPeriod } = require('../../src/electron/renderer/sessionRows');
@@ -875,7 +875,7 @@ test('Reasonix native rows use the common session formatter and merge project at
   assert.equal(rows[0].kind, 'session');
   assert.equal(rows[0].key, 'session:reasonix:row-id');
   assert.equal(rows[0].name, 'Reasonix · deepseek-v4');
-  assert.equal(rows[0].subtitle, '11:00');
+  assert.equal(rows[0].subtitle, '11:00 · 20%');
   assert.equal(rows[0].detail, 'row-id');
   assert.equal(Object.hasOwn(rows[0], 'nativeSessionBreakdown'), false);
   assert.equal(rows[0].cost, 0.25);

@@ -9,7 +9,7 @@ const {
   parseVolcengineAgentPlanUsage,
   signVolcengineRequest,
   fetchVolcengineLimits
-} = require('../../src/shared/volcengineLimits');
+} = require('../../src/shared/providers/volcengine/limits');
 
 test('volcengineCredentials accepts Volcengine Ark Coding Plan credentials', () => {
   assert.deepEqual(
@@ -113,8 +113,8 @@ test('signVolcengineRequest signs host without sending it as a wire header', () 
   );
 });
 
-test('fetchVolcengineLimits returns notConfigured without AK/SK credentials', async () => {
-  const [provider] = await fetchVolcengineLimits({}, { env: {}, now: () => Date.parse('2026-07-06T00:00:00Z') });
+test('fetchVolcengineLimits returns notConfigured with CLI detection disabled', async () => {
+  const [provider] = await fetchVolcengineLimits({}, { env: { TOKEN_MONITOR_VOLCENGINE_ARKCLI: '0' }, now: () => Date.parse('2026-07-06T00:00:00Z') });
   assert.equal(provider.provider, 'volcengine');
   assert.equal(provider.source, 'api');
   assert.equal(provider.status, 'notConfigured');
@@ -350,28 +350,44 @@ test('fetchVolcengineLimits keeps the response body read inside the deadline', a
 // share the AK/SK, so fetchVolcengineLimits reports them as two rows of a single
 // provider rather than as two providers.
 
-test('parseVolcengineAgentPlanUsage maps the Agent Plan windows the schema carries', () => {
+test('parseVolcengineAgentPlanUsage maps a real Agent Plan Medium response', () => {
   const usage = parseVolcengineAgentPlanUsage({
+    ResponseMetadata: {
+      Action: 'GetAFPUsage',
+      Version: '2024-01-01',
+      Service: 'ark',
+      Region: 'cn-beijing'
+    },
     Result: {
-      PlanType: 'Medium',
-      AFPFiveHour: { Quota: 200, Used: 50, ResetTime: 1_783_314_000 },
-      AFPDaily: { Quota: 1000, Used: 250, ResetTime: 1_783_382_400 },
-      AFPWeekly: { Quota: 5000, Used: 1000, ResetTime: 1_783_900_800 },
-      AFPMonthly: { Quota: 20000, Used: 2000, ResetTime: 1_785_542_400 }
+      PlanType: 'medium',
+      AFPFiveHour: { Quota: 10000, Used: 0, SubscribeTime: -1, ResetTime: -1 },
+      AFPWeekly: { Quota: 35000, Used: 11239.7161, SubscribeTime: 1787500800000, ResetTime: 1788105600000 },
+      AFPMonthly: { Quota: 100000, Used: 11239.7161, SubscribeTime: 1787708301000, ResetTime: 1790438399000 },
+      AFPDaily: { Quota: 50000, Used: 0, SubscribeTime: 1787846400000, ResetTime: 1787932800000 }
     }
   });
 
   assert.equal(usage.plan, 'Medium');
-  // AFPDaily is intentionally absent: normalizeWindowKind only accepts
-  // session/weekly/billing, so a daily row would be dropped downstream anyway.
-  assert.deepEqual(usage.windows.map((w) => w.kind), ['session', 'weekly', 'billing']);
-  assert.deepEqual(usage.windows.map((w) => w.label), ['5-hour', 'Weekly', 'Monthly']);
-  const weekly = usage.windows[1];
-  assert.equal(weekly.used, 1000);
-  assert.equal(weekly.limit, 5000);
-  assert.equal(weekly.remaining, 4000);
-  assert.equal(weekly.usedPercent, 20);
-  assert.equal(weekly.resetsAt, '2026-07-13T00:00:00.000Z');
+  assert.deepEqual(usage.windows.map((w) => w.kind), ['session', 'daily', 'weekly', 'billing']);
+  assert.deepEqual(usage.windows.map((w) => w.label), ['5-hour', 'Daily', 'Weekly', 'Monthly']);
+  const session = usage.windows[0];
+  assert.equal(session.used, 0);
+  assert.equal(session.remaining, 10000);
+  assert.equal(session.resetsAt, null);
+  const daily = usage.windows[1];
+  assert.equal(daily.used, 0);
+  assert.equal(daily.limit, 50000);
+  assert.equal(daily.remaining, 50000);
+  assert.equal(daily.usedPercent, 0);
+  assert.equal(daily.resetsAt, '2026-08-28T16:00:00.000Z');
+  assert.equal(daily.windowMinutes, 1440);
+  const weekly = usage.windows[2];
+  assert.equal(weekly.used, 11239.7161);
+  assert.equal(weekly.limit, 35000);
+  assert.ok(Math.abs(weekly.remaining - 23760.2839) < 1e-9);
+  assert.ok(Math.abs(weekly.usedPercent - 32.11347457142857) < 1e-12);
+  assert.equal(weekly.resetsAt, '2026-08-30T16:00:00.000Z');
+  assert.equal(usage.windows[3].resetsAt, '2026-09-26T15:59:59.000Z');
 });
 
 test('parseVolcengineAgentPlanUsage drops windows the plan tier does not include', () => {

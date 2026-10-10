@@ -4,12 +4,21 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { LIMIT_PROVIDER_IDS } = require('../../src/shared/limitProviders');
+const { LIMIT_PROVIDER_IDS } = require('../../src/shared/limits/providers');
 
 const rootDir = path.join(__dirname, '..', '..');
 const read = (file) => fs.readFileSync(path.join(rootDir, file), 'utf8');
 
-const localizedReadmes = ['README.md', 'README.zh-TW.md', 'README.zh-CN.md', 'README.ja.md', 'README.ko.md'];
+const localizedReadmes = ['README.md', 'README.zh-TW.md', 'README.zh-CN.md', 'README.ja.md', 'README.ko.md', 'README.pt-BR.md'];
+
+const nativeMacWidgetCopy = {
+  'README.md': '- **Native macOS Widgets** — View token usage and cost, trends, AI tool quota remaining and reset times, activity heatmaps, and breakdowns by tool or model in Small, Medium, and Large layouts on macOS 14+',
+  'README.zh-TW.md': '- **原生 macOS 小工具**：在 macOS 14+ 上透過小型、中型與大型版面查看 Token 用量與成本、趨勢、各 AI 工具的剩餘額度與重設時間、活動熱圖，以及依工具或模型分類的明細',
+  'README.zh-CN.md': '- **原生 macOS 小部件**：在 macOS 14+ 上通过小号、中号和大号布局查看 Token 用量与成本、趋势、各 AI 工具的剩余额度与重置时间、活动热力图，以及按工具或模型分类的明细',
+  'README.ja.md': '- **ネイティブ macOS ウィジェット** — macOS 14 以降で、小・中・大サイズのレイアウトにトークン使用量とコスト、推移、AI ツールごとのクォータ残量とリセット時刻、アクティビティヒートマップ、ツール・モデル別の内訳を表示します',
+  'README.ko.md': '- **네이티브 macOS 위젯** — macOS 14 이상에서 소형·중형·대형 레이아웃으로 토큰 사용량과 비용, 추세, AI 도구별 잔여 할당량과 재설정 시간, 활동 히트맵, 도구·모델별 분석을 확인할 수 있습니다',
+  'README.pt-BR.md': '- **Widgets nativos do macOS** — veja uso de tokens e custo, tendências, cota restante das ferramentas de IA e horários de reset, mapas de calor de atividade e detalhamentos por ferramenta ou modelo nos layouts Pequeno, Médio e Grande no macOS 14+'
+};
 
 // The supported-tools table is what a reader can actually verify, so the prose counts are
 // checked against it — not against LIMIT_PROVIDER_IDS, where zai/zaiteam are two ids but
@@ -48,18 +57,22 @@ const supportedToolOrder = [
   'OpenCode',
   'Hermes Agent',
   'OpenClaw',
-  'Cursor IDE / Cursor CLI',
+  'Cursor IDE / Cursor CLI / Grok Bot',
   'Antigravity',
   'Cline',
+  'Amp',
+  'Factory Droid',
   'Kimi CLI / Kimi Code / Kimi Work',
   'Qwen CLI',
   'Grok Build',
   'GitHub Copilot',
-  'Pi / Oh My Pi',
+  'Pi',
+  'Oh My Pi',
   'Zed',
-  'Kilo Code',
+  'Kilo',
   'Command Code',
-  'MiMo Code',
+  'MiMo Code / MiMo Desktop',
+  'Muse Code',
   'ZCode / GLM',
   'Kiro',
   'CodeBuddy',
@@ -69,11 +82,18 @@ const supportedToolOrder = [
   'Reasonix',
   'DeepSeek / DeepSeek Harness',
   'Cherry Studio',
+  'LM Studio',
+  'Unsloth Studio',
+  'Devin CLI / Devin Desktop',
+  'fx',
+  'MiniMax / MiniMax Code',
+  'TypeSafe',
   'OpenRouter',
-  'Minimax',
   'Volcengine',
   'Ollama',
   'Trae CN',
+  'Alibaba Cloud',
+  'StepFun',
   'Third-party APIs'
 ];
 
@@ -86,15 +106,19 @@ const supportedToolIdOrder = [
   'cursor',
   'antigravity',
   'cline',
+  'amp',
+  'droid',
   'kimi',
   'qwen',
   'xai',
   'copilot',
   'pi',
+  'omp',
   'zed',
-  'kilocode',
+  'kilo',
   'commandcode',
-  'mimo-code',
+  'mimo',
+  'muse',
   'zcode',
   'kiro',
   'codebuddy',
@@ -104,11 +128,18 @@ const supportedToolIdOrder = [
   'reasonix',
   'deepseek',
   'cherrystudio',
-  'openrouter',
+  'lmstudio',
+  'unsloth',
+  'devin',
+  'fx',
   'minimax',
+  'typesafe',
+  'openrouter',
   'volcengine',
   'ollama',
   'trae',
+  'alibaba',
+  'stepfun',
   'thirdparty'
 ];
 
@@ -139,6 +170,11 @@ const countClaims = {
     tools: /(\d+)개 이상의 AI 코딩 도구/,
     usage: /(\d+)개 이상의 AI 도구/,
     limits: /(\d+)개 이상 공급자/
+  },
+  'README.pt-BR.md': {
+    tools: /em (\d+)\+ ferramentas de programação com IA/,
+    usage: /e (\d+)\+ ferramentas de IA/,
+    limits: /e (\d+)\+ provedores/
   }
 };
 
@@ -167,6 +203,30 @@ test('localized READMEs list the same supported tools', () => {
   }
 });
 
+test('localized READMEs describe native macOS Widget data and layouts', () => {
+  for (const [file, copy] of Object.entries(nativeMacWidgetCopy)) {
+    const text = read(file);
+    assert.ok(text.includes(copy), file);
+    assert.doesNotMatch(text, /source-only preview|源码预览|原始碼預覽|소스 코드 미리보기|ソースコード上のプレビュー/, file);
+  }
+});
+
+test('localized READMEs disclose the LM Studio server-log tracking boundary', () => {
+  for (const file of localizedReadmes) {
+    const text = read(file);
+    const rowEnd = text.indexOf('\n', text.indexOf('tools-icon/lmstudio.png'));
+    const detailsStart = text.indexOf('<details>', rowEnd);
+    const detailsEnd = text.indexOf('</details>', detailsStart);
+    const beforeDetails = text.slice(rowEnd, detailsStart);
+    const notes = text.slice(detailsStart, detailsEnd);
+
+    assert.doesNotMatch(beforeDetails, /\/api\/v1\/chat/, file);
+    assert.match(notes, /\/v1\/chat\/completions/, file);
+    assert.match(notes, /\/v1\/responses/, file);
+    assert.match(notes, /\/api\/v1\/chat/, file);
+  }
+});
+
 // The provider list is ordered to match the README table, so a reader comparing
 // the two sees the same sequence. Nothing enforced that before: the order test
 // pins LIMIT_PROVIDERS against its own hard-coded copy and the table test pins
@@ -176,10 +236,31 @@ test('localized READMEs list the same supported tools', () => {
 // The table's icon id is not always the provider id (a tool row is named after
 // its artwork), and GLM/GLM Team share one row, so the two are bridged here.
 const README_ICON_TO_LIMIT_PROVIDERS = {
+  droid: ['factory'],
   xai: ['grok'],
-  'mimo-code': ['mimo'],
   zcode: ['zai', 'zaiteam']
 };
+
+test('localized READMEs disclose the Unsloth database and inference scope', () => {
+  for (const file of localizedReadmes) {
+    const text = read(file);
+    assert.match(text, /Unsloth Studio \| `~\/\.unsloth\/studio\/studio\.db` \| ✅ \| — \| — \|/, file);
+    assert.ok(text.includes('`$UNSLOTH_STUDIO_HOME`'), file);
+    assert.ok(text.includes('(docs/providers/unsloth.md)'), file);
+  }
+});
+
+// Devin's ✅ means a local source exists, not that a default install produces
+// numbers: Desktop only counts agents that write `usage_update` locally, and the
+// stock `devin-cloud` agent meters server-side. Without this note a reader sees
+// the ✅ and a discovered acp-events directory reporting zero tokens.
+test('localized READMEs disclose the Devin Desktop agent boundary', () => {
+  for (const file of localizedReadmes) {
+    const text = read(file);
+    assert.ok(text.includes('`devin-cloud`'), file);
+    assert.ok(text.includes('(docs/providers/devin.md)'), file);
+  }
+});
 
 test('limit provider order follows the supported-tools table', () => {
   const text = read('README.md');
@@ -217,7 +298,8 @@ test('localized README settings lists keep provider credentials inside AI Tool L
     'README.zh-TW.md': 'AI 工具額度（供應商選擇、額度與憑證）',
     'README.zh-CN.md': 'AI 工具额度（提供方选择、额度与凭据）',
     'README.ja.md': 'AI ツール制限（プロバイダー選択、制限、認証情報）',
-    'README.ko.md': 'AI 도구 한도(공급자 선택, 한도, 자격 증명)'
+    'README.ko.md': 'AI 도구 한도(공급자 선택, 한도, 자격 증명)',
+    'README.pt-BR.md': 'Limites de Ferramentas de IA (seleção de provedores, limites e credenciais)'
   };
 
   for (const [file, copy] of Object.entries(mergedSectionCopy)) {
@@ -235,24 +317,55 @@ test('configuration reference keeps provider accounts inside AI Tool Limits', ()
 });
 
 test('localized README WSL claims disclose the SQLite agent boundary', () => {
-  const files = ['README.md', 'README.zh-TW.md', 'README.zh-CN.md', 'README.ja.md', 'README.ko.md'];
+  const files = ['README.md', 'README.zh-TW.md', 'README.zh-CN.md', 'README.ja.md', 'README.ko.md', 'README.pt-BR.md'];
 
   for (const file of files) {
     const line = read(file).split('\n').find((value) => value.includes('**WSL')) || '';
     assert.match(line, /SQLite/, file);
-    assert.match(line, /docs\/wsl-sqlite-setup(?:\.zh-CN)?\.md/, file);
+    assert.match(line, /docs\/wsl-sqlite-setup(?:\.zh-(?:CN|TW))?\.md/, file);
   }
 });
 
-test('WSL SQLite guides keep English and Chinese entry points connected', () => {
-  assert.match(read('docs/wsl-sqlite-setup.md'), /\[简体中文\]\(wsl-sqlite-setup\.zh-CN\.md\)/);
-  assert.match(read('docs/wsl-sqlite-setup.zh-CN.md'), /\[English\]\(wsl-sqlite-setup\.md\)/);
+test('translated guides link every locale from their language switcher', () => {
+  const locales = ['', '.zh-CN', '.zh-TW'];
+  for (const guide of ['headless-agent', 'wsl-sqlite-setup']) {
+    for (const current of locales) {
+      const file = `docs/${guide}${current}.md`;
+      const switcher = read(file).split('\n').slice(0, 3).join('\n');
+      for (const other of locales) {
+        if (other === current) continue;
+        assert.ok(switcher.includes(`href="./${guide}${other}.md"`), `${file} → ${guide}${other}.md`);
+      }
+    }
+  }
 });
 
 test('WSL SQLite guides state and verify the Node.js prerequisite', () => {
-  for (const file of ['docs/wsl-sqlite-setup.md', 'docs/wsl-sqlite-setup.zh-CN.md']) {
+  for (const file of ['docs/wsl-sqlite-setup.md', 'docs/wsl-sqlite-setup.zh-CN.md', 'docs/wsl-sqlite-setup.zh-TW.md']) {
     const guide = read(file);
     assert.match(guide, /Node\.js 22\.15\.0/, file);
     assert.match(guide, /node --version\nnpm --version\n/, file);
+  }
+});
+
+// A localized README translates its headings, so its internal links have to point at
+// the localized anchor. Copying the English one from the source README leaves a link
+// that reads fine in the diff and scrolls nowhere — `#session-data-retention` against a
+// translated "Retenção de dados de sessão" — and nothing else here checks it.
+const githubSlug = (heading) => heading
+  .trim()
+  .toLowerCase()
+  .replace(/[^\p{L}\p{N}\s_-]/gu, '')
+  .replace(/\s+/g, '-');
+
+test('localized README internal links resolve to their own heading anchors', () => {
+  for (const file of localizedReadmes) {
+    const text = read(file);
+    const anchors = new Set([...text.matchAll(/^#{2,3} (.+)$/gm)].map((match) => githubSlug(match[1])));
+    const targets = [...text.matchAll(/\]\(#([^)]+)\)/g)].map((match) => match[1]);
+    assert.ok(targets.length > 0, `${file}: no internal anchor links found`);
+    for (const target of targets) {
+      assert.ok(anchors.has(target), `${file}: #${target} does not match any heading in this README`);
+    }
   }
 });

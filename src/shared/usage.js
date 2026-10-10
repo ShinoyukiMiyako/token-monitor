@@ -1,14 +1,17 @@
 'use strict';
 
+const { isSessionActivityClient } = require('./sessionActivityProviders');
+
 const PERIODS = ['today', 'month', 'allTime'];
-const { aggregateLimits, normalizeLimitsSummary } = require('./limits');
+const { normalizeLiveActivity, canReplaceLiveActivity, sessionWithActivity } = require('./sessionLive');
+const { aggregateLimits, normalizeLimitsSummary } = require('./limits/core');
 const { normalizeClientHealth } = require('./clientHealth');
 const {
   coerceHistory, dayKeyAddDays, hasDisjointReasoning, localDayKey, mergeHistories,
-  normalizeTokscaleClientName
+  normalizeTokscaleClientName, normalizeTokscaleModelNameForClient
 } = require('./history');
-const { REASONIX_CLIENT } = require('./reasonixPaths');
-const { filterReasonixSyntheticSessions, isReasonixSyntheticSession } = require('./reasonixSessionGuard');
+const { REASONIX_CLIENT } = require('./providers/reasonix/paths');
+const { filterReasonixSyntheticSessions, isReasonixSyntheticSession } = require('./providers/reasonix/sessionGuard');
 const { canonicalProjectKey, deterministicProjectLabel } = require('./projectKey');
 const { normalizeSyncUploadIntervalMs, staleAfterMsForSyncUpload } = require('./syncUploadInterval');
 const TOKEN_KEYS = ['totalTokens', 'total_tokens', 'totalTokenCount', 'total_token_count', 'tokens', 'tokenCount', 'token_count'];
@@ -40,7 +43,14 @@ const TIMED_DURATION_KEYS = ['totalDurationMs', 'total_duration_ms', 'timedDurat
 const TIMED_TOKEN_KEYS = ['timedTokens', 'timed_tokens'];
 const STARTED_AT_KEYS = ['startedAt', 'started_at', 'createdAt', 'created_at'];
 const LAST_USED_AT_KEYS = ['lastUsedAt', 'last_used_at', 'updatedAt', 'updated_at', 'lastActivityAt', 'last_activity_at', 'timestamp'];
-const GUI_SECRET_LIMIT_PROVIDERS = new Set(['copilot', 'deepseek', 'minimax']);
+const SESSION_TITLE_KEYS = ['sessionTitle', 'session_title'];
+const SESSION_TITLE_MAX_LENGTH = 160;
+const SESSION_TEXT_KEYS = [
+  'title', 'sessionTitle', 'session_title',
+  'name', 'preview', 'firstUserMessage', 'first_user_message',
+  'customTitle', 'custom_title', 'aiTitle', 'ai_title'
+];
+const GUI_SECRET_LIMIT_PROVIDERS = new Set(['copilot', 'deepseek', 'factory', 'minimax']);
 
 function asNumber(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -118,9 +128,61 @@ function normalizeIsoTimestamp(value) {
   return ms > 0 ? new Date(ms).toISOString() : '';
 }
 
+function normalizeSessionTitle(value) {
+  return Array.from(String(value || '').replace(/\s+/g, ' ').trim())
+    .slice(0, SESSION_TITLE_MAX_LENGTH)
+    .join('');
+}
+
+function normalizeSessionKind(value) {
+  return String(value || '').trim() === 'background-review' ? 'background-review' : '';
+}
+
+function stripSessionTextFromPeriod(period, { preserveSessionTitles = false } = {}) {
+  if (!period || typeof period !== 'object' || !period.sessions || typeof period.sessions !== 'object') {
+    return period;
+  }
+  const sessions = {};
+  for (const [key, value] of Object.entries(period.sessions)) {
+    if (!value || typeof value !== 'object') {
+      sessions[key] = value;
+      continue;
+    }
+    const session = { ...value };
+    for (const field of SESSION_TEXT_KEYS) delete session[field];
+    if (preserveSessionTitles && typeof value.title === 'string' && value.title) {
+      session.title = normalizeSessionTitle(value.title);
+    }
+    sessions[key] = session;
+  }
+  return { ...period, sessions };
+}
+
+// Hub ingress is a trust boundary. Only explicitly permitted canonical titles
+// may survive; compatibility title fields, previews and messages never do.
+// Preserve non-text classification such as `sessionKind`.
+function stripSessionTextFromDeviceRecord(record, { preserveSessionTitles = false } = {}) {
+  if (!record || typeof record !== 'object') return record;
+  const stripped = { ...record };
+  for (const periodName of PERIODS) {
+    if (hasOwn(stripped, periodName)) {
+      stripped[periodName] = stripSessionTextFromPeriod(stripped[periodName], { preserveSessionTitles });
+    }
+  }
+  if (stripped.periods && typeof stripped.periods === 'object') {
+    stripped.periods = { ...stripped.periods };
+    for (const periodName of PERIODS) {
+      if (hasOwn(stripped.periods, periodName)) {
+        stripped.periods[periodName] = stripSessionTextFromPeriod(stripped.periods[periodName], { preserveSessionTitles });
+      }
+    }
+  }
+  return stripped;
+}
+
 function emptyPeriod() {
   return {
-    capabilities: { tokenComponents: true },
+    capabilities: { tokenComponents: true, throughput: true },
     totalTokens: 0,
     costUsd: 0,
     cacheReadTokens: 0,
@@ -148,6 +210,7 @@ function emptyPeriod() {
     timedTokens: 0,
     timedOutputTokens: 0,
     timedDurationMs: 0,
+    modelThroughput: Object.create(null),
     clients: {},
     clientCosts: {},
     clientCacheReads: {},
@@ -176,15 +239,22 @@ function normalizeClientName(value) {
   if (raw.includes('gemini')) return 'gemini';
   if (raw.includes('cursor')) return 'cursor';
   if (raw.includes('antigravity')) return 'antigravity';
+  if (raw === 'amp') return 'amp';
   if (raw.includes('kimi')) return 'kimi';
   if (raw.includes('qwen')) return 'qwen';
   if (raw.includes('grok')) return 'grok';
+  if (raw === 'droid') return 'droid';
   if (raw.includes('copilot')) return 'copilot';
+  // Oh My Pi before the generic Pi test: its display name contains "Pi" as a
+  // word, so the Pi heuristic would otherwise capture it. Tokscale reports the
+  // id `omp`; these spellings only appear when a caller passes a display name.
+  if (raw === 'omp' || /^oh[\s_-]*my[\s_-]*pi$/.test(raw)) return 'omp';
   if (/\bpi\b/.test(raw)) return 'pi';
   if (raw.includes('zed')) return 'zed';
-  if (raw.includes('kilocode')) return 'kilocode';
+  if (/^kilo[\s_-]*code$/.test(raw)) return 'kilo';
   if (/command[\s_-]*code/.test(raw)) return 'commandcode';
-  if (raw.includes('micode')) return 'micode';
+  if (raw.includes('micode') || raw.includes('mimo')) return 'mimo';
+  if (raw === 'muse' || /^muse[\s_-]*code$/.test(raw)) return 'muse';
   if (raw.includes('zcode')) return 'zcode';
   if (raw.includes('kiro')) return 'kiro';
   if (raw.includes('codebuddy')) return 'codebuddy';
@@ -193,7 +263,14 @@ function normalizeClientName(value) {
   if (raw.includes('qodercn') || raw === 'qoder-cn' || raw === 'qoder cn') return 'qodercn';
   if (raw.includes('reasonix')) return 'reasonix';
   if (/cherry[\s_-]*studio/.test(raw)) return 'cherrystudio';
+  if (/lm[\s_-]*studio/.test(raw)) return 'lmstudio';
+  if (/^unsloth(?:[\s_-]+(?:studio|api))?$/.test(raw)) return 'unsloth';
   if (raw.includes('dsh')) return 'dsh';
+  if (raw.includes('devin')) return 'devin';
+  if (raw === 'fx') return 'fx';
+  // Tokscale's id for MiniMax Code. The bare vendor name stays a model vendor
+  // and limits provider, so only the product spellings map here.
+  if (raw === 'mcode' || /^minimax[\s_-]*code$/.test(raw)) return 'mcode';
   if (raw.includes('opencode')) return 'opencode';
   if (raw.includes('openclaw') || raw.includes('clawd') || raw.includes('moltbot') || raw.includes('moldbot')) return 'openclaw';
   return raw.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || null;
@@ -210,7 +287,7 @@ function normalizeModelName(value) {
 }
 
 function normalizeModelNameForClient(value, client) {
-  const normalized = normalizeModelName(value);
+  const normalized = normalizeModelName(normalizeTokscaleModelNameForClient(value, client));
   if (!normalized || normalizeClientName(client) !== REASONIX_CLIENT) return normalized;
   const qualified = normalized.match(/^(?:deepseek|deepseek-flash)\/(.+)$/);
   return qualified?.[1] || normalized;
@@ -239,6 +316,61 @@ function emptyProject(label = '') {
   };
 }
 
+// costUsd remains the known subtotal. Missing prices are explicit token counts,
+// never inferred from a zero cost (which can be a valid rate).
+function addUnpricedTokens(target, source, maximum = Infinity) {
+  const count = Math.min(maximum, Math.max(0, Math.round(asNumber(source?.unpricedTokens))));
+  if (count > 0) target.unpricedTokens = (target.unpricedTokens || 0) + count;
+}
+
+function unpricedMapTotal(map) {
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return 0;
+  return Object.values(map).reduce(
+    (sum, value) => sum + Math.max(0, Math.round(asNumber(value))),
+    0
+  );
+}
+
+function mergeUnpricedMaps(target, source) {
+  for (const field of ['clientUnpricedTokens', 'modelUnpricedTokens']) {
+    const existingMap = target[field] || Object.create(null);
+    let remaining = Math.max(0, (target.unpricedTokens || 0) - unpricedMapTotal(existingMap));
+    for (const [rawKey, value] of Object.entries(source[field] || {})) {
+      const key = field === 'clientUnpricedTokens' ? normalizeClientName(rawKey) : normalizeModelName(rawKey);
+      if (!key) continue;
+      const count = Math.min(remaining, Math.max(0, Math.round(asNumber(value))));
+      if (!count) continue;
+      const map = target[field] ||= Object.create(null);
+      map[key] = (map[key] || 0) + count;
+      remaining -= count;
+    }
+  }
+  const existingClientModels = target.clientModelUnpricedTokens || Object.create(null);
+  let remaining = Math.max(
+    0,
+    (target.unpricedTokens || 0)
+      - Object.values(existingClientModels).reduce((sum, models) => sum + unpricedMapTotal(models), 0)
+  );
+  for (const [rawClient, models] of Object.entries(source.clientModelUnpricedTokens || {})) {
+    const client = normalizeClientName(rawClient);
+    if (!client) continue;
+    const existingModels = existingClientModels[client] || Object.create(null);
+    let clientRemaining = hasOwn(target.clientUnpricedTokens, client)
+      ? Math.max(0, asNumber(target.clientUnpricedTokens[client]) - unpricedMapTotal(existingModels))
+      : remaining;
+    for (const [rawModel, value] of Object.entries(models || {})) {
+      const model = normalizeModelNameForClient(rawModel, client);
+      if (!model) continue;
+      const count = Math.min(remaining, clientRemaining, Math.max(0, Math.round(asNumber(value))));
+      if (!count) continue;
+      const map = (target.clientModelUnpricedTokens ||= Object.create(null))[client] ||= Object.create(null);
+      map[model] = (map[model] || 0) + count;
+      remaining -= count;
+      clientRemaining -= count;
+    }
+  }
+}
+
 function addProjectInto(projects, rawKey, source) {
   if (!source || typeof source !== 'object') return;
   const label = String(source.label || rawKey || '').trim().normalize('NFC');
@@ -249,6 +381,7 @@ function addProjectInto(projects, rawKey, source) {
   target.label = deterministicProjectLabel(target.label, label || rawKey);
   target.tokens += Math.max(0, Math.round(asNumber(source.tokens ?? source.totalTokens)));
   target.costUsd += asNumber(source.costUsd ?? source.cost);
+  addUnpricedTokens(target, source, Math.max(0, asNumber(source.tokens ?? source.totalTokens)));
   for (const [client, tokens] of Object.entries(source.clients || {})) {
     const clientKey = normalizeClientName(client);
     if (!clientKey) continue;
@@ -277,6 +410,7 @@ function projectRollupFromSessions(sessions) {
     const tokens = Math.max(0, Math.round(asNumber(session.totalTokens)));
     project.tokens += tokens;
     project.costUsd += asNumber(session.costUsd);
+    addUnpricedTokens(project, session, tokens);
     const client = normalizeClientName(session.client);
     if (client && tokens > 0) {
       project.clients[client] = (hasOwn(project.clients, client) ? project.clients[client] : 0) + tokens;
@@ -426,10 +560,29 @@ function emptySession(client, id) {
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     reasoningTokens: 0,
+    // The session's share of the period throughput counters: raw sums, gated
+    // per tokscale entry exactly as the period's are, so a row divides them at
+    // display time into its own tok/s. 0/0 means the client reported no
+    // durations for this session, not that it generated nothing.
+    timedOutputTokens: 0,
+    timedDurationMs: 0,
     startedAt: '',
     lastUsedAt: '',
+    // What the session's context window currently holds and how big it is.
+    // Both are read from the client's own transcript (tokscale reports
+    // neither) and only for a session recent enough to still be open, so 0/0
+    // is the normal value for everything else.
+    contextTokens: 0,
+    contextWindow: 0,
+    // `turnEnded` is deliberately absent here. True once the client's own
+    // transcript said the current turn finished, which is how a session stops
+    // reading as running without waiting out the time window — but a default of
+    // `false` would make "this reading carries no boundary" indistinguishable
+    // from "a turn is in progress", and the former must not clear the latter.
     projectId: '',
     projectLabel: '',
+    title: '',
+    sessionKind: '',
     models: {},
     modelCosts: {},
     providers: {}
@@ -439,26 +592,90 @@ function emptySession(client, id) {
 const sessionsWithLiveSource = new WeakSet();
 
 function mergeSession(target, source) {
-  target.totalTokens += Math.max(0, Math.round(asNumber(source.totalTokens)));
+  const sourceTokens = Math.max(0, Math.round(asNumber(source.totalTokens)));
+  target.totalTokens += sourceTokens;
   target.costUsd += asNumber(source.costUsd);
+  addUnpricedTokens(target, source, sourceTokens);
   target.messageCount += Math.max(0, Math.round(asNumber(source.messageCount)));
   target.inputTokens += Math.max(0, Math.round(asNumber(source.inputTokens)));
   target.outputTokens += Math.max(0, Math.round(asNumber(source.outputTokens)));
   target.cacheReadTokens += Math.max(0, Math.round(asNumber(source.cacheReadTokens)));
   target.cacheWriteTokens += Math.max(0, Math.round(asNumber(source.cacheWriteTokens)));
   target.reasoningTokens += Math.max(0, Math.round(asNumber(source.reasoningTokens)));
+  target.timedOutputTokens += Math.max(0, Math.round(asNumber(source.timedOutputTokens)));
+  target.timedDurationMs += Math.max(0, Math.round(asNumber(source.timedDurationMs)));
   const sourceStarted = timestampMs(source.startedAt);
   const targetStarted = timestampMs(target.startedAt);
   if (sourceStarted && (!targetStarted || sourceStarted < targetStarted)) target.startedAt = new Date(sourceStarted).toISOString();
   const sourceLastUsed = timestampMs(source.lastUsedAt);
   const targetLastUsed = timestampMs(target.lastUsedAt);
   if (sourceLastUsed && sourceLastUsed > targetLastUsed) target.lastUsedAt = new Date(sourceLastUsed).toISOString();
+  if (hasOwn(source, 'promptCache') && sourceLastUsed >= targetLastUsed) {
+    target.promptCache = normalizePromptCache(source.promptCache);
+  }
   const sourceProjectId = String(source.projectId || '');
   if (!target.projectId && sourceProjectId) {
     target.projectId = sourceProjectId;
     target.projectLabel = String(source.projectLabel || '');
   } else if (target.projectId === sourceProjectId && !target.projectLabel && source.projectLabel) {
     target.projectLabel = String(source.projectLabel);
+  }
+  // Occupancy is a snapshot, not a sum. The two halves move together and must
+  // never be mixed across sources, so a source carrying a window replaces both
+  // and one carrying none leaves both alone.
+  //
+  // A snapshot also has a time, so it is freshest-wins rather than
+  // last-merge-wins. The same session arrives from several periods and devices
+  // (in month and in today, from this device and from a synced one), and
+  // without this the older reading won whenever it happened to be merged last,
+  // which made the gauge depend on iteration order. The source's own
+  // `lastUsedAt` is that time, because the reading is taken from the transcript
+  // the timestamp describes. A tie accepts, since both describe the same bytes,
+  // and a target that has no reading at all takes the source's: absent means
+  // this device never read a transcript, not that the reading is empty.
+  const sourceContextWindow = Math.max(0, Math.round(asNumber(source.contextWindow)));
+  if (sourceContextWindow > 0) {
+    const targetContextWindow = Math.max(0, Math.round(asNumber(target.contextWindow)));
+    if (targetContextWindow <= 0 || sourceLastUsed >= targetLastUsed) {
+      target.contextWindow = sourceContextWindow;
+      target.contextTokens = Math.max(0, Math.round(asNumber(source.contextTokens)));
+    }
+  }
+  // A turn end is a transcript reading, not a sum, so it is freshest-wins: the
+  // same session can appear in several periods, and a turn that started after
+  // one of them was decorated has to be able to clear it. Absent means "this
+  // client reports no boundary", which never overwrites a real reading.
+  if (hasOwn(source, 'turnEnded')) {
+    const sourceEnded = source.turnEnded === true;
+    // Strictly newer wins. At the same timestamp a positive claim beats a
+    // negative one: both readings describe the same bytes, and one of them
+    // found a boundary the other did not have in its window. A negative
+    // reading is also what a client with no evidence sends, so letting it win
+    // on a tie would drop the only real answer available.
+    if (sourceLastUsed > targetLastUsed) target.turnEnded = sourceEnded;
+    else if (sourceEnded && sourceLastUsed === targetLastUsed) target.turnEnded = true;
+  }
+  // Question state follows transcript activity. At equal timestamps a cleared
+  // request wins, preventing an older period from resurrecting an answered call.
+  if (source.client === 'codex' && typeof source.waitingForInput === 'boolean') {
+    if (sourceLastUsed > targetLastUsed || (sourceLastUsed === targetLastUsed
+      && (target.waitingForInput !== false || source.waitingForInput === false))) {
+      target.waitingForInput = source.waitingForInput;
+    }
+  }
+  // Registry observations have their own clock: waiting can change without a
+  // token or transcript write. An explicit unknown reading clears old evidence.
+  if (isSessionActivityClient(source.client)) {
+    const reading = normalizeLiveActivity(source.liveActivity);
+    if (reading && canReplaceLiveActivity(target.liveActivity, reading)) {
+      target.liveActivity = reading;
+    }
+  }
+  if (!target.title && source.title) target.title = normalizeSessionTitle(source.title);
+  if (!target.sessionKind && source.sessionKind) target.sessionKind = normalizeSessionKind(source.sessionKind);
+  if (source.usageSource === 'codex-dots-local') {
+    target.usageSource = 'codex-dots-local';
+    target.usageCoverage = 'observed-only';
   }
   for (const [model, tokens] of Object.entries(source.models || {})) {
     const key = normalizeModelNameForClient(model, target.client);
@@ -498,20 +715,30 @@ function sessionFromRow(row) {
   const session = emptySession(client, id);
   session.totalTokens = Math.max(0, Math.round(tokenValueForClient(row, client)));
   session.costUsd = costValue(row);
+  addUnpricedTokens(session, row, session.totalTokens);
   session.messageCount = Math.max(0, Math.round(firstNumber(row, MESSAGE_COUNT_KEYS)));
   Object.assign(session, sessionTokenComponents(row));
   session.outputTokens = Math.max(0, Math.round(outputValueForClient(row, client)));
+  Object.assign(session, entryThroughput(row, session.outputTokens));
   session.startedAt = normalizeIsoTimestamp(firstString(row, STARTED_AT_KEYS));
   session.lastUsedAt = normalizeIsoTimestamp(firstString(row, LAST_USED_AT_KEYS));
   session.projectId = String(row.projectId || row.project_id || '').trim();
   session.projectLabel = String(row.projectLabel || row.project_label || '').trim();
-  let model = detectModel(row, client);
-  if (client === 'cursor' && model === 'auto') model = 'cursor-auto';
+  session.title = normalizeSessionTitle(firstString(row, SESSION_TITLE_KEYS));
+  session.sessionKind = normalizeSessionKind(row.sessionKind || row.session_kind);
+  const model = detectModel(row, client);
   if (model && session.totalTokens > 0) session.models[model] = (session.models[model] || 0) + session.totalTokens;
   if (model && session.costUsd > 0) session.modelCosts[model] = (session.modelCosts[model] || 0) + session.costUsd;
   const provider = normalizeProviderName(row.provider);
   if (provider && session.totalTokens > 0) session.providers[provider] = (session.providers[provider] || 0) + session.totalTokens;
   return session;
+}
+
+function normalizePromptCache(input) {
+  const observedAt = normalizeIsoTimestamp(input?.observedAt);
+  const ttlSeconds = input?.ttlSeconds;
+  return observedAt && [300, 1800, 3600].includes(ttlSeconds)
+    ? { observedAt, ttlSeconds } : null;
 }
 
 function normalizeSession(input, fallbackKey) {
@@ -526,11 +753,38 @@ function normalizeSession(input, fallbackKey) {
   const componentTotal = components.inputTokens + components.outputTokens + components.cacheReadTokens + components.cacheWriteTokens; // reasoning is a subset of output — see TOKEN_COMPONENT_KEYS
   session.totalTokens = Math.max(0, Math.round(asNumber(input.totalTokens ?? input.total_tokens ?? input.tokens ?? componentTotal)));
   session.costUsd = asNumber(input.costUsd ?? input.cost_usd ?? input.cost ?? 0);
+  addUnpricedTokens(session, input, session.totalTokens);
   session.messageCount = Math.max(0, Math.round(firstNumber(input, MESSAGE_COUNT_KEYS)));
+  session.timedDurationMs = Math.max(0, Math.round(asNumber(input.timedDurationMs ?? input.timed_duration_ms ?? 0)));
+  session.timedOutputTokens = normalizeTimedOutputTokens(
+    input.timedOutputTokens ?? input.timed_output_tokens, session.outputTokens, session.timedDurationMs
+  );
   session.startedAt = normalizeIsoTimestamp(firstString(input, STARTED_AT_KEYS));
   session.lastUsedAt = normalizeIsoTimestamp(firstString(input, LAST_USED_AT_KEYS));
+  if (hasOwn(input, 'promptCache')) session.promptCache = normalizePromptCache(input.promptCache);
+  session.contextTokens = Math.max(0, Math.round(asNumber(input.contextTokens ?? input.context_tokens ?? 0)));
+  session.contextWindow = Math.max(0, Math.round(asNumber(input.contextWindow ?? input.context_window ?? 0)));
+  // Carried rather than summed, and only when the source actually states it:
+  // `undefined` means "this reading carries no boundary", which is different
+  // from `false` ("a turn is in progress") and must not clear a real reading
+  // when the same session arrives from a source that had no evidence.
+  if (input.turnEnded === true) session.turnEnded = true;
+  else if (input.turnEnded === false) session.turnEnded = false;
+  if (client === 'codex' && typeof input.waitingForInput === 'boolean') {
+    session.waitingForInput = input.waitingForInput;
+  }
+  if (isSessionActivityClient(client)) {
+    const activity = normalizeLiveActivity(input.liveActivity);
+    if (activity) session.liveActivity = activity;
+  }
   session.projectId = String(input.projectId || input.project_id || '').trim();
   session.projectLabel = String(input.projectLabel || input.project_label || '').trim();
+  session.title = normalizeSessionTitle(input.title || input.sessionTitle || input.session_title);
+  session.sessionKind = normalizeSessionKind(input.sessionKind || input.session_kind);
+  if (client === 'codex' && input.usageSource === 'codex-dots-local') {
+    session.usageSource = 'codex-dots-local';
+    session.usageCoverage = 'observed-only';
+  }
   if (input.models && typeof input.models === 'object') {
     for (const [model, value] of Object.entries(input.models)) {
       const key = normalizeModelNameForClient(model, client);
@@ -553,9 +807,72 @@ function normalizeSession(input, fallbackKey) {
   return session;
 }
 
+function cursorAutoRawModels(source, roundTokens) {
+  const totals = new Map();
+  for (const [client, models] of Object.entries(source || {})) {
+    if (normalizeClientName(client) !== 'cursor' || !models || typeof models !== 'object') continue;
+    for (const [model, value] of Object.entries(models)) {
+      const raw = normalizeModelName(model);
+      if (raw !== 'auto' && raw !== 'default') continue;
+      const next = Math.max(0, roundTokens ? Math.round(asNumber(value)) : asNumber(value));
+      totals.set(raw, (totals.get(raw) || 0) + next);
+    }
+  }
+  return totals;
+}
+
+function reconcileCursorAutoGlobalModels(period, input) {
+  for (const [raw, moved] of cursorAutoRawModels(input.clientModels, true)) {
+    const available = Math.max(0, Math.round(asNumber(period.models[raw])));
+    if (moved <= 0 || moved > available) continue;
+    const exclusive = moved === available;
+    period.models[raw] = available - moved;
+    if (period.models[raw] === 0) delete period.models[raw];
+    period.models['cursor-auto'] = (period.models['cursor-auto'] || 0) + moved;
+    if (exclusive) {
+      for (const key of [
+        'modelCacheReads',
+        'modelCacheWrites',
+        'modelOutputs',
+        'modelUnclassifiedTokens',
+        'modelUnpricedTokens'
+      ]) {
+        if (!period[key]?.[raw]) continue;
+        period[key]['cursor-auto'] = (period[key]['cursor-auto'] || 0) + period[key][raw];
+        delete period[key][raw];
+      }
+    } else {
+      // The source period has one global component bucket for multiple
+      // clients. Keep the token split, but do not invent a cache/output split.
+      for (const key of ['modelCacheReads', 'modelCacheWrites', 'modelOutputs']) delete period[key][raw];
+      period.modelUnclassifiedTokens[raw] = period.models[raw];
+      period.modelUnclassifiedTokens['cursor-auto'] = Math.min(
+        period.models['cursor-auto'],
+        (period.modelUnclassifiedTokens['cursor-auto'] || 0) + moved
+      );
+      period.capabilities.tokenComponents = false;
+    }
+  }
+  for (const [raw, requested] of cursorAutoRawModels(input.clientModelCosts, false)) {
+    const available = Math.max(0, asNumber(period.modelCosts[raw]));
+    if (requested <= 0 || requested > available + 1e-9) continue;
+    const moved = Math.min(requested, available);
+    period.modelCosts[raw] = available - moved;
+    if (period.modelCosts[raw] === 0) delete period.modelCosts[raw];
+    period.modelCosts['cursor-auto'] = (period.modelCosts['cursor-auto'] || 0) + moved;
+  }
+}
+
 function normalizePeriod(input, options = {}) {
   const period = emptyPeriod();
-  if (!input || typeof input !== 'object') return period;
+  if (!input || typeof input !== 'object') {
+    // `emptyPeriod()` is also the exact neutral value used by current producers and
+    // merge targets, so it is throughput-capable by construction. Missing wire input
+    // is different: its zero counters are synthetic and must never seed a live delta.
+    period.capabilities.throughput = false;
+    delete period.modelThroughput;
+    return period;
+  }
   const projectsEnabled = options.projectsEnabled !== false;
   period.totalTokens = Math.max(0, Math.round(asNumber(input.totalTokens ?? input.total_tokens ?? 0)));
   const componentCapability = input.capabilities?.tokenComponents;
@@ -574,6 +891,8 @@ function normalizePeriod(input, options = {}) {
   period.capabilities.tokenComponents = componentCapability === true
     || (componentCapability !== false && (period.totalTokens === 0 || hasLegacyComponentShape));
   period.costUsd = asNumber(input.costUsd ?? input.cost_usd ?? input.cost ?? 0);
+  addUnpricedTokens(period, input, period.totalTokens);
+  mergeUnpricedMaps(period, input);
   period.cacheReadTokens = Math.max(0, Math.round(asNumber(input.cacheReadTokens ?? input.cache_read_tokens ?? 0)));
   period.cacheWriteTokens = Math.max(0, Math.round(asNumber(input.cacheWriteTokens ?? input.cache_write_tokens ?? 0)));
   period.outputTokens = Math.max(0, Math.round(asNumber(input.outputTokens ?? input.output_tokens ?? 0)));
@@ -589,6 +908,16 @@ function normalizePeriod(input, options = {}) {
       ?? (period.capabilities.tokenComponents ? 0 : period.totalTokens - knownComponentTokens)
     )))
   );
+  const throughputCapability = input.capabilities?.throughput;
+  const hasThroughputShape = [
+    ['timedTokens', 'timed_tokens'],
+    ['timedOutputTokens', 'timed_output_tokens'],
+    ['timedDurationMs', 'timed_duration_ms']
+  ].every((keys) => keys.some((key) => hasOwn(input, key)));
+  // Older producers did not carry these counters. Preserve that provenance instead of
+  // turning their normalized zero defaults into a baseline for a later all-day delta.
+  period.capabilities.throughput = throughputCapability === true
+    || (throughputCapability !== false && hasThroughputShape);
   period.timedTokens = Math.max(0, Math.round(asNumber(input.timedTokens ?? input.timed_tokens ?? 0)));
   // Capped at outputTokens because the gate makes that a physical bound: output is counted
   // whole or not at all, so a period cannot have timed more output than it produced. The
@@ -655,6 +984,8 @@ function normalizePeriod(input, options = {}) {
       }
     }
   }
+  period.modelThroughput = normalizeModelThroughput(input.modelThroughput, period);
+  if (!period.modelThroughput) delete period.modelThroughput;
   if (input.modelCosts && typeof input.modelCosts === 'object') {
     for (const [model, value] of Object.entries(input.modelCosts)) {
       const key = normalizeModelName(model);
@@ -685,9 +1016,10 @@ function normalizePeriod(input, options = {}) {
       }
     }
   }
+  reconcileCursorAutoGlobalModels(period, input);
   if (input.sessions && typeof input.sessions === 'object') {
     for (const [key, value] of Object.entries(input.sessions)) {
-      const session = normalizeSession(value, key);
+      const session = normalizeSession(sessionWithActivity(input, key, value), key);
       if (!session) continue;
       if (!projectsEnabled) {
         session.projectId = '';
@@ -711,6 +1043,46 @@ function normalizePeriod(input, options = {}) {
 
 const UNATTRIBUTED_USAGE_CLIENT = '__unattributed';
 
+function normalizeTimedOutputTokens(value, outputTokens, durationMs) {
+  return durationMs > 0 ? Math.min(outputTokens, Math.max(0, Math.round(asNumber(value)))) : 0;
+}
+
+function normalizeModelThroughput(value, period) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const result = Object.create(null);
+  for (const [model, counters] of Object.entries(value)) {
+    const key = normalizeModelName(model);
+    if (!key || !counters || typeof counters !== 'object' || Array.isArray(counters)
+      || !['timedTokens', 'timedOutputTokens', 'timedDurationMs'].every((field) => hasOwn(counters, field))) continue;
+    const durationMs = Math.max(0, Math.round(asNumber(counters.timedDurationMs)));
+    const target = result[key] ||= { timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 };
+    target.timedTokens += Math.max(0, Math.round(asNumber(counters.timedTokens)));
+    target.timedDurationMs += durationMs;
+    target.timedOutputTokens += normalizeTimedOutputTokens(counters.timedOutputTokens, period.timedOutputTokens, durationMs);
+  }
+  for (const [model, counters] of Object.entries(result)) {
+    counters.timedTokens = Math.min(counters.timedTokens, period.timedTokens);
+    counters.timedDurationMs = Math.min(counters.timedDurationMs, period.timedDurationMs);
+    const outputBound = Math.min(period.timedOutputTokens,
+      hasOwn(period.modelOutputs, model) ? period.modelOutputs[model] : period.outputTokens);
+    counters.timedOutputTokens = normalizeTimedOutputTokens(counters.timedOutputTokens, outputBound, counters.timedDurationMs);
+  }
+  // A malformed map is unavailable; a genuine empty map is an exact zero baseline.
+  if (Object.keys(value).length && !Object.keys(result).length) return undefined;
+  return result;
+}
+
+
+// One tokscale entry's throughput counters. An entry contributes its output to
+// the numerator exactly when it contributes a duration to the denominator, so
+// the two always describe the same entries. Gating rather than scaling by
+// tokscale's `tokenCoverage` keeps both plain counters that merge and delta
+// like every other token field.
+function entryThroughput(row, output) {
+  const performance = row?.performance && typeof row.performance === 'object' ? row.performance : null;
+  const timedDurationMs = Math.max(0, Math.round(firstNumber(performance, TIMED_DURATION_KEYS)));
+  return { timedOutputTokens: timedDurationMs > 0 ? output : 0, timedDurationMs };
+}
 
 function addUsageRowToPeriod(period, row, detectedClient = detectClient(row)) {
   const client = detectedClient;
@@ -721,21 +1093,31 @@ function addUsageRowToPeriod(period, row, detectedClient = detectClient(row)) {
   const output = Math.max(0, Math.round(outputValueForClient(row, client)));
   const performance = row?.performance && typeof row.performance === 'object' ? row.performance : null;
   const timedTokens = Math.max(0, Math.round(firstNumber(performance, TIMED_TOKEN_KEYS)));
-  const timedDurationMs = Math.max(0, Math.round(firstNumber(performance, TIMED_DURATION_KEYS)));
-  // A row contributes its output to the throughput numerator exactly when it contributes to
-  // the denominator. Gating rather than scaling by tokscale's `tokenCoverage` keeps this a
-  // plain counter, which is what lets it merge and delta like every other token field.
-  const timedOutputTokens = timedDurationMs > 0 ? output : 0;
-  let model = detectModel(row, client);
-  if (client === 'cursor' && model === 'auto') model = 'cursor-auto';
+  const { timedOutputTokens, timedDurationMs } = entryThroughput(row, output);
+  const model = detectModel(row, client);
   period.totalTokens += Math.max(0, Math.round(tokens));
   period.costUsd += cost;
+  const unpriced = Math.min(Math.max(0, Math.round(tokens)), Math.max(0, Math.round(asNumber(row.unpricedTokens))));
+  addUnpricedTokens(period, { unpricedTokens: unpriced });
+  if (unpriced > 0) {
+    mergeUnpricedMaps(period, {
+      clientUnpricedTokens: client ? { [client]: unpriced } : {},
+      modelUnpricedTokens: model ? { [model]: unpriced } : {},
+      clientModelUnpricedTokens: client && model ? { [client]: { [model]: unpriced } } : {}
+    });
+  }
   period.cacheReadTokens += cacheRead;
   period.cacheWriteTokens += cacheWrite;
   period.outputTokens += output;
   period.timedTokens += timedTokens;
   period.timedOutputTokens += timedOutputTokens;
   period.timedDurationMs += timedDurationMs;
+  if (model && timedDurationMs > 0) {
+    const counters = period.modelThroughput[model] ||= { timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 };
+    counters.timedTokens += timedTokens;
+    counters.timedOutputTokens += timedOutputTokens;
+    counters.timedDurationMs += timedDurationMs;
+  }
   if (client && tokens > 0) {
     period.clients[client] = (period.clients[client] || 0) + Math.round(tokens);
     if (cacheRead > 0) period.clientCacheReads[client] = (period.clientCacheReads[client] || 0) + cacheRead;
@@ -770,6 +1152,7 @@ function fallbackUsagePeriod(json) {
   // across cache read/write and output. Preserve that distinction through the
   // hub instead of letting normalizePeriod's zero defaults imply a cache miss.
   period.capabilities.tokenComponents = period.totalTokens === 0;
+  period.capabilities.throughput = period.totalTokens === 0;
   period.unclassifiedTokens = period.totalTokens;
   return period;
 }
@@ -827,14 +1210,38 @@ function normalizeDeviceOsName(value) {
   return String(value || '').trim().slice(0, 64);
 }
 
+// The fields History aggregation reads from a device record, normalized exactly
+// as normalizeDeviceRecord() does. aggregateHistory() used to normalize the whole
+// record for these, which also walks every session of every period: on a long
+// history that was most of its cost and none of its output.
+function normalizeRecordHistoryFields(record, nowIso = new Date().toISOString()) {
+  const fields = {
+    updatedAt: record.updatedAt || nowIso,
+    receivedAt: record.receivedAt || nowIso
+  };
+  if (hasOwn(record, 'historyAvailable')) fields.historyAvailable = record.historyAvailable === true;
+  if (hasOwn(record, 'history')) {
+    // An explicit null means History is disabled/unavailable. Preserve that
+    // wire distinction; an omitted field means "no History update this tick"
+    // and an object is the retained History payload.
+    fields.history = record.history === null ? null : coerceHistory(record.history);
+  }
+  if (hasOwn(record, 'periodWindows')) {
+    const windows = normalizePeriodWindows(record.periodWindows);
+    if (windows) fields.periodWindows = windows;
+  }
+  return fields;
+}
+
 function normalizeDeviceRecord(record) {
   const nowIso = new Date().toISOString();
+  const historyFields = normalizeRecordHistoryFields(record, nowIso);
   const normalized = {
     deviceId: String(record.deviceId || record.id || 'unknown'),
     hostname: record.hostname ? String(record.hostname) : '',
     platform: record.platform ? String(record.platform) : '',
-    updatedAt: record.updatedAt || nowIso,
-    receivedAt: record.receivedAt || nowIso,
+    updatedAt: historyFields.updatedAt,
+    receivedAt: historyFields.receivedAt,
     agentVersion: record.agentVersion || '',
     agentRuntime: record.agentRuntime ? String(record.agentRuntime) : '',
     periods: {},
@@ -864,17 +1271,9 @@ function normalizeDeviceRecord(record) {
     if (omitted) normalized.periodProjectsOmitted = omitted;
   }
   if (hasOwn(record, 'syncUploadIntervalMs')) normalized.syncUploadIntervalMs = normalizeSyncUploadIntervalMs(record.syncUploadIntervalMs);
-  if (hasOwn(record, 'historyAvailable')) normalized.historyAvailable = record.historyAvailable === true;
-  if (hasOwn(record, 'history')) {
-    // An explicit null means History is disabled/unavailable. Preserve that
-    // wire distinction; an omitted field means "no History update this tick"
-    // and an object is the retained History payload.
-    normalized.history = record.history === null ? null : coerceHistory(record.history);
-  }
-  if (hasOwn(record, 'periodWindows')) {
-    const windows = normalizePeriodWindows(record.periodWindows);
-    if (windows) normalized.periodWindows = windows;
-  }
+  if (hasOwn(historyFields, 'historyAvailable')) normalized.historyAvailable = historyFields.historyAvailable;
+  if (hasOwn(historyFields, 'history')) normalized.history = historyFields.history;
+  if (hasOwn(historyFields, 'periodWindows')) normalized.periodWindows = historyFields.periodWindows;
   for (const periodName of PERIODS) {
     normalized.periods[periodName] = normalizePeriod(record[periodName] || record.periods?.[periodName], {
       projectsEnabled: normalized.projectsEnabled !== false
@@ -969,6 +1368,23 @@ function preserveUntrackedClientUsage(existingRecord, incomingRecord, trackedCli
       target.clients[client] = tokens;
       preservedClients.add(client);
       if (cost > 0) target.clientCosts[client] = cost;
+      // Global model buckets may include live clients too. Restore only this
+      // client's explicit missing-price attribution, not the global bucket.
+      const unpriced = Math.min(tokens, asNumber(source.clientUnpricedTokens?.[client]));
+      addUnpricedTokens(target, { unpricedTokens: unpriced }, tokens);
+      const modelUnpriced = Object.create(null);
+      let remainingUnpriced = unpriced;
+      for (const [model, count] of Object.entries(source.clientModelUnpricedTokens?.[client] || {})) {
+        const retained = Math.min(remainingUnpriced, asNumber(source.clientModels?.[client]?.[model]), count);
+        if (retained <= 0) continue;
+        modelUnpriced[model] = retained;
+        remainingUnpriced -= retained;
+      }
+      mergeUnpricedMaps(target, {
+        clientUnpricedTokens: { [client]: unpriced },
+        modelUnpricedTokens: modelUnpriced,
+        clientModelUnpricedTokens: { [client]: modelUnpriced }
+      });
       const cacheRead = Math.min(tokens, asNumber(source.clientCacheReads?.[client]));
       const cacheWrite = Math.min(tokens - cacheRead, asNumber(source.clientCacheWrites?.[client]));
       const output = Math.min(tokens - cacheRead - cacheWrite, asNumber(source.clientOutputs?.[client]));
@@ -1096,6 +1512,27 @@ function mergeDeviceRecord(existing, incoming) {
   return normalizedIncoming;
 }
 
+// Sync ingress always revokes saved text before preserving usage. A limits-only
+// update may still carry a current usage snapshot, so restore just its admitted
+// titles after mergeDeviceRecord has retained the previous usage counters.
+function mergeSyncDeviceRecord(existing, incoming, { preserveSessionTitles = false } = {}) {
+  const safeIncoming = stripSessionTextFromDeviceRecord(incoming, { preserveSessionTitles });
+  const record = mergeDeviceRecord(stripSessionTextFromDeviceRecord(existing), safeIncoming);
+  if (preserveSessionTitles && safeIncoming?.limitsOnly === true) {
+    for (const periodName of PERIODS) {
+      const period = safeIncoming[periodName] || safeIncoming.periods?.[periodName];
+      for (const [key, value] of Object.entries(period?.sessions || {})) {
+        if (!value?.title) continue;
+        const session = normalizeSession(value, key);
+        if (!session) continue;
+        const retained = record.periods[periodName]?.sessions?.[sessionKey(session.client, session.sessionId)];
+        if (retained) retained.title = session.title;
+      }
+    }
+  }
+  return record;
+}
+
 // History rides along only on interval-gated collector ticks, so a later
 // history-less tick would otherwise blank the local snapshot (and the trends
 // dashboard with it). Carry the prior snapshot's history forward when the
@@ -1198,7 +1635,7 @@ function aggregateHistory(devices, options = {}) {
   const histories = [];
   let reportedToday = '';
   for (const record of devices) {
-    const normalized = normalizeDeviceRecord(record);
+    const normalized = normalizeRecordHistoryFields(record);
     if (!hasOwn(normalized, 'history') || normalized.history === null) continue;
     histories.push(normalized.history);
     if (!normalized.history.daily.length) continue;
@@ -1220,8 +1657,12 @@ function aggregateHistory(devices, options = {}) {
 function addPeriodInto(target, source) {
   target.capabilities.tokenComponents = target.capabilities.tokenComponents === true
     && source.capabilities?.tokenComponents === true;
+  target.capabilities.throughput = target.capabilities.throughput === true
+    && source.capabilities?.throughput === true;
   target.totalTokens += source.totalTokens;
   target.costUsd += source.costUsd;
+  addUnpricedTokens(target, source, source.totalTokens);
+  mergeUnpricedMaps(target, source);
   target.cacheReadTokens += source.cacheReadTokens;
   target.cacheWriteTokens += source.cacheWriteTokens;
   target.outputTokens += source.outputTokens;
@@ -1229,6 +1670,15 @@ function addPeriodInto(target, source) {
   target.timedTokens += source.timedTokens;
   target.timedOutputTokens += source.timedOutputTokens;
   target.timedDurationMs += source.timedDurationMs;
+  // Absence is unknown attribution, not an exact empty map. It stays unknown
+  // through partition/WSL merges and device aggregation, regardless of input order.
+  if (!source.modelThroughput) delete target.modelThroughput;
+  if (target.modelThroughput) {
+    for (const [model, counters] of Object.entries(source.modelThroughput)) {
+      const merged = target.modelThroughput[model] ||= { timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 };
+      for (const field of ['timedTokens', 'timedOutputTokens', 'timedDurationMs']) merged[field] += counters[field];
+    }
+  }
   for (const [client, tokens] of Object.entries(source.clients)) {
     target.clients[client] = (target.clients[client] || 0) + tokens;
     if (source.clientCacheReads?.[client]) target.clientCacheReads[client] = (target.clientCacheReads[client] || 0) + source.clientCacheReads[client];
@@ -1292,14 +1742,17 @@ function isPeriodExpired(record, periodName, nowMs) {
   return false;
 }
 
-function aggregateDevices(devices, staleAfterMs, nowMs = Date.now()) {
+// `options.normalizeRecord` lets a caller that re-aggregates an unchanged record
+// many times reuse its normalization. Whatever it returns is read, never mutated.
+function aggregateDevices(devices, staleAfterMs, nowMs = Date.now(), options = {}) {
+  const normalizeRecord = options.normalizeRecord || normalizeDeviceRecord;
   const aggregate = { updatedAt: new Date().toISOString(), periods: {}, devices: [], projectsIncomplete: false };
   const sessionDetailsOmitted = {};
   const periodProjectsOmitted = {};
   for (const periodName of PERIODS) aggregate.periods[periodName] = emptyPeriod();
   const now = nowMs;
   for (const record of devices) {
-    const normalized = normalizeDeviceRecord(record);
+    const normalized = normalizeRecord(record);
     const ageMs = now - Date.parse(normalized.receivedAt || normalized.updatedAt || 0);
     const deviceStaleAfterMs = staleAfterMsForSyncUpload(normalized.syncUploadIntervalMs, staleAfterMs);
     const stale = Number.isFinite(ageMs) && deviceStaleAfterMs > 0 ? ageMs > deviceStaleAfterMs : false;
@@ -1346,9 +1799,12 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now()) {
       if (isPeriodExpired(normalized, periodName, now)) continue;
       periodProjectsOmitted[periodName] = (periodProjectsOmitted[periodName] || 0) + count;
     }
+    // normalizeDeviceRecord() has already normalized each period, and
+    // normalizePeriod() is idempotent (see the test that pins it), so a second
+    // pass here only re-walked every session again.
     for (const periodName of PERIODS) {
       if (isPeriodExpired(normalized, periodName, now)) continue;
-      addPeriodInto(aggregate.periods[periodName], normalizePeriod(normalized.periods[periodName]));
+      addPeriodInto(aggregate.periods[periodName], normalized.periods[periodName]);
     }
   }
   aggregate.limits = aggregateLimits(aggregate.devices, staleAfterMs, now);
@@ -1391,6 +1847,9 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now()) {
 // grow (clients/models/clientModels/sessions/...) without per-field bookkeeping.
 function applyPeriodDelta(base, freshToday, anchorToday) {
   const result = deltaValue(base, freshToday, anchorToday, '');
+  if (result && (!base?.modelThroughput || !freshToday?.modelThroughput || !anchorToday?.modelThroughput)) {
+    delete result.modelThroughput;
+  }
   // Older anchors may still contain the pre-native Reasonix stats-path rows.
   // They are not authoritative session detail and must not survive a warm tick
   // merely because the aggregate totals remain valid.
@@ -1401,11 +1860,20 @@ function applyPeriodDelta(base, freshToday, anchorToday) {
 }
 
 function deltaValue(base, fresh, anchor, key) {
+  // Cache observations are snapshots, never additive accounting. Missing
+  // metadata retains the base; only an explicit null clears an observation.
+  if (key === 'promptCache') return fresh === undefined ? base : normalizePromptCache(fresh);
   if (key === 'tokenComponents') {
     // A warm tick may introduce aggregate-only fallback data. Boolean
     // provenance is not arithmetically subtractable, so retain exactness only
     // while both the durable base and the fresh replacement prove it.
     return base === true && fresh === true;
+  }
+  if (key === 'throughput') {
+    // Throughput drives a live delta, so the value being subtracted must also
+    // prove its provenance. Otherwise an unavailable anchor's zero defaults
+    // make the whole fresh Today snapshot look like one new delta.
+    return base === true && fresh === true && anchor === true;
   }
   if (key === 'startedAt') {
     const baseMs = timestampMs(base);
@@ -1452,11 +1920,14 @@ module.exports = {
   extractUsageBundleFromTokscale,
   extractUsageFromTokscale,
   mergeDeviceRecord,
+  mergeSyncDeviceRecord,
   mergePeriods,
   normalizeClientName,
   normalizeModelName,
   normalizeModelNameForClient,
   normalizeDeviceRecord,
   normalizePeriod,
-  projectRollupFromSessions
+  projectRollupFromSessions,
+  stripSessionTextFromDeviceRecord,
+  stripSessionTextFromPeriod
 };

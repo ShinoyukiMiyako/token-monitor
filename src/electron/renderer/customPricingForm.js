@@ -6,6 +6,7 @@
   if (root) root.TokenMonitorCustomPricingForm = api;
 })(typeof window !== 'undefined' ? window : null, function createCustomPricingFormApi() {
   function inUseModelIds(stats) {
+    if (Array.isArray(stats?.modelAliasSourceIds)) return stats.modelAliasSourceIds.slice();
     const periods = (stats && stats.periods) || {};
     const ids = new Set();
     for (const key of ['today', 'month', 'allTime']) {
@@ -29,7 +30,11 @@
     return {
       inputPerM: toPerMillion(p.inputCostPerToken),
       outputPerM: toPerMillion(p.outputCostPerToken),
-      cacheReadPerM: toPerMillion(p.cacheReadInputTokenCost)
+      cacheReadPerM: toPerMillion(p.cacheReadInputTokenCost),
+      cacheWritePerM: toPerMillion(p.cacheCreationInputTokenCost),
+      // The pricing CLI exposes only the regular write rate. Do not infer the
+      // 1-hour rate from it; the user can supply that rate explicitly.
+      cacheWrite1hPerM: undefined
     };
   }
 
@@ -48,7 +53,7 @@
   function hasUsableBasePrice(entry) {
     const validOrUnset = (value) => value === undefined
       || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
-    if (!entry || !validOrUnset(entry.inputPerM) || !validOrUnset(entry.outputPerM) || !validOrUnset(entry.cacheReadPerM)) {
+    if (!entry || !['inputPerM', 'outputPerM', 'cacheReadPerM', 'cacheWritePerM', 'cacheWrite1hPerM'].every((key) => validOrUnset(entry[key]))) {
       return false;
     }
     return entry.inputPerM !== undefined || entry.outputPerM !== undefined;
