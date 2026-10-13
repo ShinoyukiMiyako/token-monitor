@@ -32,20 +32,6 @@ function fakeTokscaleSpawn() {
   };
 }
 
-async function withQoderCollectorMock(mocks, callback) {
-  const collectorPath = require.resolve('../../src/shared/collector');
-  const qoderCnUsage = require('../../src/shared/qoderCnUsage');
-  const originals = Object.fromEntries(Object.keys(mocks).map((key) => [key, qoderCnUsage[key]]));
-  Object.assign(qoderCnUsage, mocks);
-  delete require.cache[collectorPath];
-  try {
-    return await callback(require(collectorPath));
-  } finally {
-    Object.assign(qoderCnUsage, originals);
-    delete require.cache[collectorPath];
-  }
-}
-
 test('reset boundary scheduling caps timers that exceed the Node timeout range', () => {
   const collectorPath = require.resolve('../../src/shared/collector');
   delete require.cache[collectorPath];
@@ -133,131 +119,69 @@ test('collectUsageOnce returns empty usage without spawning tokscale when client
   }
 });
 
-test('collectUsageOnce handles proma-only tracking without spawning tokscale', async () => {
-  const promaPath = require.resolve('../../src/shared/promaUsage');
-  const collectorPath = require.resolve('../../src/shared/collector');
-  const promaUsage = require(promaPath);
-  const originalBuildPromaPeriods = promaUsage.buildPromaPeriods;
-  let tokscaleCalls = 0;
-
-  promaUsage.buildPromaPeriods = () => ({
-    today: { entries: [{ client: 'proma', model: 'm', input: 12, output: 3 }] },
-    month: { entries: [{ client: 'proma', model: 'm', input: 20 }] },
-    allTime: { entries: [{ client: 'proma', model: 'm', input: 30 }] }
+test('collectUsageOnce sends fork-only clients to tokscale like any other client', async () => {
+  const { collectUsageOnce } = require('../../src/shared/collector');
+  const calls = [];
+  const summary = await collectUsageOnce({
+    clients: 'proma,qodercn',
+    allTimeSince: '2024-01-01',
+    commandTimeoutMs: 1000,
+    deviceId: 'test-device',
+    agentVersion: 'test',
+    limitsEnabled: false,
+    projectsEnabled: false,
+    runTokscale: async ({ clients, flags }) => {
+      calls.push({ clients, flags });
+      const input = flags[0] === '--today' ? 12 : flags[0] === '--month' ? 20 : 30;
+      return { entries: [
+        { client: 'proma', model: 'm', input, output: 0 },
+        { client: 'qodercn', model: 'qmodel', input, output: 3 }
+      ] };
+    }
   });
-  delete require.cache[collectorPath];
 
-  try {
-    const { collectUsageOnce } = require(collectorPath);
-    const summary = await collectUsageOnce({
-      clients: 'proma',
-      allTimeSince: '2024-01-01',
-      commandTimeoutMs: 1000,
-      deviceId: 'test-device',
-      agentVersion: 'test',
-      limitsEnabled: false,
-      runTokscale: async () => {
-        tokscaleCalls += 1;
-        throw new Error('tokscale should not run for proma-only tracking');
-      }
-    });
-
-    assert.equal(tokscaleCalls, 0);
-    assert.deepEqual(summary.trackedClients, ['proma']);
-    assert.equal(summary.today.clients.proma, 15);
-    assert.equal(summary.month.clients.proma, 20);
-    assert.equal(summary.allTime.clients.proma, 30);
-  } finally {
-    promaUsage.buildPromaPeriods = originalBuildPromaPeriods;
-    delete require.cache[collectorPath];
-  }
+  assert.deepEqual(calls.map(({ clients }) => clients), ['proma,qodercn', 'proma,qodercn', 'proma,qodercn']);
+  assert.deepEqual(summary.trackedClients, ['proma', 'qodercn']);
+  assert.equal(summary.today.clients.proma, 12);
+  assert.equal(summary.today.clients.qodercn, 15);
+  assert.equal(summary.month.clients.qodercn, 23);
+  assert.equal(summary.allTime.clients.proma, 30);
 });
 
-test('collectUsageOnce handles qodercn-only tracking without spawning tokscale', async () => {
-  let tokscaleCalls = 0;
-
-  await withQoderCollectorMock({
-    collectQoderCnRows: async () => [],
-    buildQoderCnPeriods: () => ({
-      today: { entries: [{ client: 'qodercn', model: 'qmodel', input: 12, output: 3 }] },
-      month: { entries: [{ client: 'qodercn', model: 'qmodel', input: 20 }] },
-      allTime: { entries: [{ client: 'qodercn', model: 'qmodel', input: 30 }] }
-    })
-  }, async ({ collectUsageOnce }) => {
-    const summary = await collectUsageOnce({
-      clients: 'qodercn',
-      allTimeSince: '2024-01-01',
-      commandTimeoutMs: 1000,
-      deviceId: 'test-device',
-      agentVersion: 'test',
-      limitsEnabled: false,
-      runTokscale: async () => {
-        tokscaleCalls += 1;
-        throw new Error('tokscale should not run for qodercn-only tracking');
-      }
-    });
-
-    assert.equal(tokscaleCalls, 0);
-    assert.deepEqual(summary.trackedClients, ['qodercn']);
-    assert.equal(summary.today.clients['qodercn'], 15);
-    assert.equal(summary.month.clients['qodercn'], 20);
-    assert.equal(summary.allTime.clients['qodercn'], 30);
-  });
-});
-
-test('anchored Proma refresh derives broader windows from the combined fresh today period', async () => {
-  const promaPath = require.resolve('../../src/shared/promaUsage');
-  const collectorPath = require.resolve('../../src/shared/collector');
-  const promaUsage = require(promaPath);
-  const originalBuildPromaPeriods = promaUsage.buildPromaPeriods;
-  let receivedAllTimeSince = null;
-
+test('anchored Proma refresh derives broader windows from the fresh tokscale today scan', async () => {
+  const { collectUsageOnce, localTodayKey } = require('../../src/shared/collector');
   const period = (client, input) => extractUsageFromTokscale({
     entries: [{ client, model: 'm', input, output: 0, cost: 0 }]
   });
   const anchor = {
-    dateKey: require('../../src/shared/collector').localTodayKey(),
+    dateKey: localTodayKey(),
     today: mergePeriods(period('claude', 10), period('proma', 5)),
     month: mergePeriods(period('claude', 100), period('proma', 50)),
     allTime: mergePeriods(period('claude', 1000), period('proma', 500))
   };
 
-  promaUsage.buildPromaPeriods = ({ allTimeSince }) => {
-    receivedAllTimeSince = allTimeSince;
-    return {
-      today: { entries: [{ client: 'proma', model: 'm', input: 8 }] },
-      month: { entries: [{ client: 'proma', model: 'm', input: 53 }] },
-      allTime: { entries: [{ client: 'proma', model: 'm', input: 503 }] }
-    };
-  };
-  delete require.cache[collectorPath];
+  const summary = await collectUsageOnce({
+    clients: 'claude,proma',
+    allTimeSince: '2026-01-01',
+    commandTimeoutMs: 1000,
+    deviceId: 'test-device',
+    limitsEnabled: false,
+    todayOnlyAnchor: anchor,
+    runTokscale: async ({ clients, flags }) => {
+      assert.equal(clients, 'claude,proma');
+      assert.deepEqual(flags, ['--today']);
+      return { entries: [
+        { client: 'claude', model: 'm', input: 15 },
+        { client: 'proma', model: 'm', input: 8 }
+      ] };
+    }
+  });
 
-  try {
-    const { collectUsageOnce } = require(collectorPath);
-    const summary = await collectUsageOnce({
-      clients: 'claude,proma',
-      allTimeSince: '2026-01-01',
-      commandTimeoutMs: 1000,
-      deviceId: 'test-device',
-      limitsEnabled: false,
-      todayOnlyAnchor: anchor,
-      runTokscale: async ({ clients, flags }) => {
-        assert.equal(clients, 'claude');
-        assert.deepEqual(flags, ['--today']);
-        return { entries: [{ client: 'claude', model: 'm', input: 15 }] };
-      }
-    });
-
-    assert.equal(receivedAllTimeSince, '2026-01-01');
-    assert.equal(summary.today.totalTokens, 23);
-    assert.equal(summary.month.totalTokens, 158);
-    assert.equal(summary.allTime.totalTokens, 1508);
-    assert.equal(summary.month.clients.proma, 53);
-    assert.equal(summary.allTime.clients.proma, 503);
-  } finally {
-    promaUsage.buildPromaPeriods = originalBuildPromaPeriods;
-    delete require.cache[collectorPath];
-  }
+  assert.equal(summary.today.totalTokens, 23);
+  assert.equal(summary.month.totalTokens, 158);
+  assert.equal(summary.allTime.totalTokens, 1508);
+  assert.equal(summary.month.clients.proma, 53);
+  assert.equal(summary.allTime.clients.proma, 503);
 });
 
 test('collectUsageOnce includes the normalized tracked client list in summaries', async () => {
@@ -286,7 +210,7 @@ test('collectUsageOnce includes the normalized tracked client list in summaries'
   }
 });
 
-test('collectUsageOnce requests session-level tokscale grouping', async () => {
+test('collectUsageOnce requests the workspace-joined session grouping', async () => {
   const childProcess = require('node:child_process');
   const originalSpawn = childProcess.spawn;
   const calls = [];
@@ -322,7 +246,7 @@ test('collectUsageOnce requests session-level tokscale grouping', async () => {
     for (const args of calls) {
       const groupIndex = args.indexOf('--group-by');
       assert.notEqual(groupIndex, -1);
-      assert.equal(args[groupIndex + 1], 'client,session,model');
+      assert.equal(args[groupIndex + 1], 'client,workspace,session,model');
     }
   } finally {
     childProcess.spawn = originalSpawn;
@@ -388,5 +312,162 @@ test('collectUsageOnce enriches session rows with local last-used timestamps', a
     childProcess.spawn = originalSpawn;
     delete require.cache[collectorPath];
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('collectUsageOnce falls back to plain session grouping when the binary rejects the join', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = (_bin, args) => {
+    calls.push(args);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end: () => {} };
+    child.kill = () => {};
+    const groupBy = args[args.indexOf('--group-by') + 1];
+    setImmediate(() => {
+      if (groupBy === 'client,workspace,session,model') {
+        // What an upstream build actually prints for an unknown --group-by.
+        child.stderr.emit('data', Buffer.from("Error: Invalid group-by value: 'client,workspace,session,model'."));
+        child.emit('close', 1);
+        return;
+      }
+      child.stdout.emit('data', Buffer.from(JSON.stringify({ entries: [] })));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const collectorPath = require.resolve('../../src/shared/collector');
+  delete require.cache[collectorPath];
+
+  try {
+    const { collectUsageOnce } = require(collectorPath);
+    await collectUsageOnce({
+      clients: 'claude',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false
+    });
+
+    const groupings = calls.map((args) => args[args.indexOf('--group-by') + 1]);
+    // One rejection teaches the whole tick: the retry and both later scans go
+    // straight to the grouping this binary knows.
+    assert.deepEqual(groupings, [
+      'client,workspace,session,model',
+      'client,session,model',
+      'client,session,model',
+      'client,session,model'
+    ]);
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('resetting the capability cache lets the workspace grouping be tried again', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = (_bin, args) => {
+    calls.push(args);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end: () => {} };
+    child.kill = () => {};
+    const groupBy = args[args.indexOf('--group-by') + 1];
+    setImmediate(() => {
+      if (groupBy === 'client,workspace,session,model') {
+        child.stderr.emit('data', Buffer.from("Error: Invalid group-by value: 'client,workspace,session,model'."));
+        child.emit('close', 1);
+        return;
+      }
+      child.stdout.emit('data', Buffer.from(JSON.stringify({ entries: [] })));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const collectorPath = require.resolve('../../src/shared/collector');
+  delete require.cache[collectorPath];
+
+  try {
+    const { collectUsageOnce, resetTokscaleCapabilityCache } = require(collectorPath);
+    const options = {
+      clients: 'claude',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false
+    };
+
+    await collectUsageOnce(options);
+    const afterFirst = calls.length;
+    // The rejection is remembered, so nothing retries the joined grouping...
+    assert.equal(calls[afterFirst - 1][calls[afterFirst - 1].indexOf('--group-by') + 1], 'client,session,model');
+
+    // ...until the binary's recorded capabilities are dropped, which is what a
+    // replaced binary at the same path needs.
+    resetTokscaleCapabilityCache();
+    await collectUsageOnce(options);
+
+    const firstAfterReset = calls[afterFirst];
+    assert.equal(firstAfterReset[firstAfterReset.indexOf('--group-by') + 1], 'client,workspace,session,model');
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('turning Projects off stops asking the scan to resolve workspaces', async () => {
+  const childProcess = require('node:child_process');
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  childProcess.spawn = (_bin, args) => {
+    calls.push(args);
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { end: () => {} };
+    child.kill = () => {};
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from(JSON.stringify({ entries: [] })));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const collectorPath = require.resolve('../../src/shared/collector');
+  delete require.cache[collectorPath];
+
+  try {
+    const { collectUsageOnce } = require(collectorPath);
+    await collectUsageOnce({
+      clients: 'claude',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false,
+      projectsEnabled: false
+    });
+
+    // Resolving and labelling workspaces is work the scan only does when asked,
+    // so the opt-out has to reach the argument list rather than discard the
+    // answer afterwards. Session titles and activity bounds ride this grouping
+    // too, so the opt-out costs no timestamps.
+    assert.equal(calls.length, 3);
+    for (const args of calls) {
+      assert.equal(args[args.indexOf('--group-by') + 1], 'client,session,model');
+    }
+  } finally {
+    childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
   }
 });

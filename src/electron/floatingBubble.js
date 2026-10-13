@@ -49,7 +49,7 @@ function normalizeInitialRendererViewState(value = {}, fallback = {}) {
   const source = value || {};
   const fallbackSource = fallback || {};
   const fallbackPeriod = normalizedInitialRendererValue(fallbackSource.period, INITIAL_RENDERER_PERIODS, 'today');
-  const fallbackBreakdown = normalizedInitialRendererValue(fallbackSource.breakdown, INITIAL_RENDERER_BREAKDOWNS, 'tool');
+  const fallbackBreakdown = normalizedInitialRendererValue(fallbackSource.breakdown, INITIAL_RENDERER_BREAKDOWNS, 'home');
   return {
     period: normalizedInitialRendererValue(source.period, INITIAL_RENDERER_PERIODS, fallbackPeriod),
     breakdown: normalizedInitialRendererValue(source.breakdown, INITIAL_RENDERER_BREAKDOWNS, fallbackBreakdown)
@@ -58,9 +58,9 @@ function normalizeInitialRendererViewState(value = {}, fallback = {}) {
 
 function initialRendererViewStateQuery(viewState = {}) {
   // Always carry both fields. Omitting a value just because it equals the
-  // default ('today'/'tool') is lossy: the renderer can't then tell "the user
-  // is on tool" from "no view was provided", and falls back to the first
-  // custom-ordered view — silently losing a persisted last view of tool/today.
+  // default ('today'/'home') is lossy: the renderer can't then tell "the user
+  // is on home" from "no view was provided", and falls back to the first
+  // custom-ordered view — silently losing a persisted last view of home/today.
   const normalized = normalizeInitialRendererViewState(viewState);
   return { period: normalized.period, breakdown: normalized.breakdown };
 }
@@ -150,6 +150,39 @@ function expandedFloatingBubbleBounds(collapsedBounds, workArea, previousExpande
   return clampBounds({ x, y, width, height }, workArea, margin);
 }
 
+function liveWindow(win) {
+  if (!win) return null;
+  if (typeof win.isDestroyed === 'function' && win.isDestroyed()) return null;
+  return win;
+}
+
+function applyWindowSizeLimits(win, limits) {
+  if (!liveWindow(win) || !limits) return false;
+  if (typeof win.setMinimumSize === 'function') {
+    win.setMinimumSize(limits.minWidth, limits.minHeight);
+  }
+  if (typeof win.setMaximumSize === 'function') {
+    win.setMaximumSize(limits.maxWidth, limits.maxHeight);
+  }
+  return true;
+}
+
+function restoreFloatingBubbleWindow(win, bounds, limits) {
+  if (!liveWindow(win) || !bounds || !limits || typeof win.setBounds !== 'function') return false;
+  // The order is the fix, and it is not only a window-manager hint: collapsing
+  // pins the window to the handle size and only then marks it non-resizable, so
+  // Electron's Linux window remembers those handle-sized constraints as the
+  // pair it restores the next time anything makes the window resizable again.
+  // Unlocking first lets that restore happen while it is still harmless, and
+  // the real limits and bounds below overwrite it. Restoring the limits first
+  // instead leaves the remembered pair to land after the bounds -- which is
+  // what clamped the window straight back to the handle on Linux.
+  if (typeof win.setResizable === 'function') win.setResizable(true);
+  applyWindowSizeLimits(win, limits);
+  win.setBounds(bounds);
+  return true;
+}
+
 function floatingBubbleCollapsePlan(bounds, workArea, settings = {}, options = {}) {
   if (options.suppressNextCollapse || options.collapsed || !canUseFloatingBubble(settings)) return null;
   const expandedBounds = clampBounds(bounds, workArea);
@@ -213,5 +246,7 @@ module.exports = {
   floatingBubbleSide,
   floatingBubbleWindowChrome,
   normalizeInitialRendererViewState,
-  moveFloatingBubbleBounds
+  moveFloatingBubbleBounds,
+  applyWindowSizeLimits,
+  restoreFloatingBubbleWindow
 };

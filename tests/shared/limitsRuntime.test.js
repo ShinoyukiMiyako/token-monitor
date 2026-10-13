@@ -1,10 +1,19 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const { performance } = require('node:perf_hooks');
 const test = require('node:test');
 
-const { createLimitsRuntime } = require('../../src/shared/limitsRuntime');
+const { createLimitsRuntime } = require('../../src/shared/limits/runtime');
+
+// These cases reach the MiMo provider, whose console ledger defaults to the
+// app's own data directory; a test must never write there. The same isolation
+// the archive tests make with this variable, for the whole file (node runs each
+// test file in its own process).
+const testDataDir = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'mimo-ledger-tests-'));
+process.env.TOKEN_MONITOR_SHARED_DIR = testDataDir;
+test.after(() => fs.rmSync(testDataDir, { recursive: true, force: true }));
 
 function deferred() {
   let resolve;
@@ -499,6 +508,22 @@ test('a mixed full result marks an expected missing identity unavailable without
   runtime.stop();
 });
 
+test('an explicit identity removal drops a disappeared automatic account without publishing a marker', async () => {
+  const results = [
+    [providerRow('mimo', 'A', 'Account A'), providerRow('mimo', 'B', 'Account B')],
+    [providerRow('mimo', 'A', 'Account A'), { provider: 'mimo', accountKey: 'B', removed: true }]
+  ];
+  const runtime = createLimitsRuntime({ limitProviders: ['mimo'] }, runtimeDeps({
+    probeProvider: async () => results.shift()
+  }));
+
+  await runtime.refresh({ provider: 'mimo' }, 'startup');
+  await runtime.refresh({ provider: 'mimo' }, 'interval');
+  assert.deepEqual(runtime.getSnapshot().providers.map((row) => row.accountKey), ['A']);
+  assert.equal(JSON.stringify(runtime.getSnapshot()).includes('removed'), false);
+  runtime.stop();
+});
+
 test('a new identity failure never retains the removed identity windows', async () => {
   const results = [
     [providerRow('mimo', 'A', 'Account A')],
@@ -530,6 +555,22 @@ test('clearing an identity removes old windows synchronously and blocks late com
   job.resolve([providerRow('mimo', 'A', 'Old account')]);
   assert.equal((await pending).superseded, true);
   assert.deepEqual(runtime.getSnapshot().providers, []);
+  runtime.stop();
+});
+
+test('replacing a MiMo membership clears only that member, not the console balance', () => {
+  const member = providerRow('mimo', 'member-A', 'Membership');
+  const consoleAccount = providerRow('mimo', 'console-B', 'Pay-as-you-go', {
+    windows: [{ kind: 'billing', metric: 'credits', label: 'Balance', remaining: 9, currency: 'CNY' }]
+  });
+  const runtime = createLimitsRuntime({
+    limitProviders: ['mimo'],
+    previousLimits: { providers: [member, consoleAccount] }
+  }, runtimeDeps());
+
+  runtime.clear({ provider: 'mimo', accountKey: 'member-A' }, 'credential-save');
+  assert.deepEqual(runtime.getSnapshot().providers.map((row) => row.accountKey), ['console-B']);
+  assert.equal(runtime.getSnapshot().providers[0].windows[0].remaining, 9);
   runtime.stop();
 });
 
@@ -1218,6 +1259,101 @@ test('a retained transient previous row seeds lastGood windows after restart', (
   }, runtimeDeps());
 
   const row = runtime.getSnapshot().providers[0];
+  assert.equal(row.status, 'unavailable');
+  assert.equal(row.windows.length, 1);
+  assert.equal(row.windows[0].usedPercent, 20);
+  runtime.stop();
+});
+
+// Runs the real Claude probe, not a stub: what is under test is that the
+// collector and the lane agree on what an account-scoped refresh returns.
+test('a scoped refresh of one saved Claude Web login leaves the other accounts untouched', async () => {
+  const sessionUsed = { a: 10, b: 20, c: 30 };
+  const claudeWebFetch = async (url, options) => {
+    const login = options.headers.cookie.slice('sessionKey=sk-ant-'.length);
+    const headers = { get: () => '', getSetCookie: () => [] };
+    const json = url.endsWith('/api/organizations')
+      ? [{ uuid: `org-${login}`, name: `Org ${login}`, capabilities: ['chat', 'claude_pro'] }]
+      : url.endsWith('/api/account')
+        ? { uuid: `account-${login}`, email_address: `${login}@example.com` }
+        : { five_hour: { utilization: sessionUsed[login], resets_at: '2026-07-27T10:50:00Z' } };
+    return { ok: true, status: 200, headers, json: async () => json };
+  };
+  const runtime = createLimitsRuntime({
+    limitProviders: ['claude'],
+    claudePrepaidBalanceEnabled: false,
+    claudeWebAccounts: ['a', 'b', 'c'].map((login) => ({ id: login, cookie: `sessionKey=sk-ant-${login}` }))
+  }, runtimeDeps({ claudeWebFetch }));
+  const sessionByEmail = () => Object.fromEntries(runtime.getSnapshot().providers.map((row) => [
+    row.accountEmail,
+    row.windows.find((window) => window.kind === 'session').usedPercent
+  ]));
+
+  await runtime.refresh({ provider: 'claude' }, 'manual');
+  assert.deepEqual(sessionByEmail(), { 'a@example.com': 10, 'b@example.com': 20, 'c@example.com': 30 });
+
+  Object.assign(sessionUsed, { a: 11, b: 21, c: 31 });
+  const accountB = runtime.getSnapshot().providers.find((row) => row.accountEmail === 'b@example.com');
+  await runtime.refresh({ provider: 'claude', accountKey: accountB.accountKey }, 'reset-boundary');
+
+  assert.deepEqual(sessionByEmail(), { 'a@example.com': 10, 'b@example.com': 21, 'c@example.com': 30 });
+  runtime.stop();
+});
+
+test('unauthorized status clears lastGood so UI shows fresh failure state', async () => {
+  const results = [
+    [providerRow('antigravity', 'account', 'Account', { status: 'ok' })],
+    { error: new Error('unauthorized'), errorStatus: 'unauthorized' }
+  ];
+  const runtime = createLimitsRuntime({ limitProviders: ['antigravity'] }, runtimeDeps({
+    probeProvider: async () => {
+      const next = results.shift();
+      if (next.error) {
+        const err = next.error;
+        err.status = next.errorStatus;
+        throw err;
+      }
+      return next;
+    }
+  }));
+
+  await runtime.refresh({ provider: 'antigravity' }, 'startup');
+  let row = runtime.getSnapshot().providers[0];
+  assert.equal(row.status, 'ok');
+  assert.equal(row.windows.length, 1);
+
+  await runtime.refresh({ provider: 'antigravity' }, 'manual');
+  row = runtime.getSnapshot().providers[0];
+  assert.equal(row.status, 'unauthorized');
+  assert.equal(row.windows.length, 0);
+  runtime.stop();
+});
+
+test('transient status (unavailable) preserves lastGood windows so stale data is visible', async () => {
+  const results = [
+    [providerRow('antigravity', 'account', 'Account', { status: 'ok' })],
+    { error: new Error('unavailable'), errorStatus: 'unavailable' }
+  ];
+  const runtime = createLimitsRuntime({ limitProviders: ['antigravity'] }, runtimeDeps({
+    probeProvider: async () => {
+      const next = results.shift();
+      if (next.error) {
+        const err = next.error;
+        err.status = next.errorStatus;
+        throw err;
+      }
+      return next;
+    }
+  }));
+
+  await runtime.refresh({ provider: 'antigravity' }, 'startup');
+  let row = runtime.getSnapshot().providers[0];
+  assert.equal(row.status, 'ok');
+  assert.equal(row.windows.length, 1);
+  assert.equal(row.windows[0].usedPercent, 20);
+
+  await runtime.refresh({ provider: 'antigravity' }, 'manual');
+  row = runtime.getSnapshot().providers[0];
   assert.equal(row.status, 'unavailable');
   assert.equal(row.windows.length, 1);
   assert.equal(row.windows[0].usedPercent, 20);

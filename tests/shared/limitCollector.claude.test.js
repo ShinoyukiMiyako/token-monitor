@@ -2,17 +2,26 @@
 
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 
-const { claudeCommandCandidates, claudeWebCookie, fetchClaudeLimits, mapClaudeCliUsageToProvider, mapClaudeUsageToProvider, normalizeClaudeWebCookieInput } = require('../../src/shared/limitCollector');
+const { aggregateLimits } = require('../../src/shared/limits/core');
+const { claudeCommandCandidates, claudeWebCookie, fetchClaudeLimits, mapClaudeCliUsageToProvider, mapClaudeUsageToProvider, normalizeClaudeWebCookieInput } = require('../../src/shared/limits/collector');
+const { listClaudeWebOrganizations, normalizeClaudeWebAccounts, runClaudeAuthStatus, touchClaudeAuthPath } = require('../../src/shared/providers/claude/limits');
 
-function fakeSpawnForClaudeUsage(expectedCommand = 'claude.cmd') {
-  return (command, args) => {
+function fakeSpawnForClaudeUsage(expectedCommand = 'cmd.exe') {
+  return (command, args, options) => {
     assert.equal(command, expectedCommand);
-    assert.deepEqual(args, ['/usage']);
+    assert.deepEqual(args, ['/d', '/s', '/c', '""claude.cmd" /usage"']);
+    assert.equal(options.shell, false);
+    assert.equal(options.windowsVerbatimArguments, true);
+    assert.equal(options.env.DISABLE_AUTOUPDATER, '1');
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
+    child.stdin = { end() {} };
     child.kill = () => {};
     process.nextTick(() => {
       child.stdout.emit('data', Buffer.from([
@@ -98,7 +107,7 @@ test('Claude Web source takes precedence and carries stable account metadata', a
             json: async () => [{ uuid: 'organization-web', name: 'Example Workspace' }]
           };
         }
-        if (url.endsWith('/api/organizations/organization-web/usage')) {
+        if (url.endsWith('/api/organizations/organization-web/usage?cedar_ember=1')) {
           return {
             ok: true,
             json: async () => ({
@@ -166,7 +175,7 @@ test('Claude Web source takes precedence and carries stable account metadata', a
     'every Claude Web request should carry the browser user-agent'
   );
   assert.equal(first.requests[0].url.endsWith('/api/organizations'), true);
-  assert.equal(first.requests[1].url.endsWith('/api/organizations/organization-web/usage'), true);
+  assert.equal(first.requests[1].url.endsWith('/api/organizations/organization-web/usage?cedar_ember=1'), true);
   assert.equal(first.requests[2].url.endsWith('/api/account'), true);
 });
 
@@ -221,7 +230,7 @@ test('Claude Web follows a renewed sessionKey across sequential requests and rep
           json: async () => [{ uuid: 'organization-web', name: 'Workspace' }]
         };
       }
-      if (url.endsWith('/usage')) {
+      if (url.endsWith('/usage?cedar_ember=1')) {
         return {
           ok: true,
           json: async () => ({
@@ -275,7 +284,7 @@ test('Claude Web reports a renewed sessionKey even when a later request fails', 
             json: async () => [{ uuid: 'organization-web', name: 'Workspace' }]
           };
         }
-        if (url.endsWith('/usage')) {
+        if (url.endsWith('/usage?cedar_ember=1')) {
           return {
             ok: true,
             json: async () => ({
@@ -323,7 +332,7 @@ test('Claude Web retries later rotation from the last persisted sessionKey after
           json: async () => [{ uuid: 'organization-web', name: 'Workspace' }]
         };
       }
-      if (url.endsWith('/usage')) {
+      if (url.endsWith('/usage?cedar_ember=1')) {
         assert.equal(options.headers.cookie, 'sessionKey=sk-ant-first-renewal');
         return {
           ok: true,
@@ -362,10 +371,10 @@ test('Claude Web retries later rotation from the last persisted sessionKey after
   ]);
 });
 
-test('Claude Web prefers chat-capable organizations, then non-API-only organizations', async () => {
-  async function selectedUsageOrganization(organizations, cookie) {
+test('Claude Web lists eligible organizations and reads the selected one', async () => {
+  async function selectedUsageOrganization(organizations, cookie, selectedId) {
     let usageOrganizationId = '';
-    await fetchClaudeLimits({ claudeWebCookie: cookie }, {
+    await fetchClaudeLimits({ claudeWebCookie: cookie, claudeWebOrganizationId: selectedId, claudePrepaidBalanceEnabled: false }, {
       providerRuntimeState: new Map(),
       fetch: async (url) => {
         if (url.endsWith('/api/organizations')) {
@@ -380,7 +389,7 @@ test('Claude Web prefers chat-capable organizations, then non-API-only organizat
             })
           };
         }
-        const match = url.match(/\/api\/organizations\/([^/]+)\/usage$/);
+        const match = url.match(/\/api\/organizations\/([^/]+)\/usage\?cedar_ember=1$/);
         assert.ok(match);
         usageOrganizationId = decodeURIComponent(match[1]);
         return {
@@ -397,28 +406,269 @@ test('Claude Web prefers chat-capable organizations, then non-API-only organizat
     return usageOrganizationId;
   }
 
+  const free = { uuid: 'organization-free', capabilities: ['chat'] };
+  const subscriptions = [
+    { uuid: 'organization-pro', capabilities: [' CHAT ', ' CLAUDE_PRO '] },
+    { uuid: 'organization-max', capabilities: ['chat', 'claude_max'] },
+    { uuid: 'organization-enterprise', capabilities: ['chat', 'raven'], raven_type: 'enterprise' }
+  ];
+  const choicesFor = (organizations) => listClaudeWebOrganizations('sessionKey=sk-ant-subscribed', {
+    fetch: async (url) => {
+      assert.ok(url.endsWith('/api/organizations'));
+      return { ok: true, json: async () => organizations };
+    }
+  });
+  for (const subscription of subscriptions) {
+    const choices = await choicesFor([free, subscription]);
+    assert.deepEqual(choices.map(({ id, plan }) => [id, plan]), [
+      [free.uuid, ''], [subscription.uuid, subscription.uuid.split('-')[1]]
+    ]);
+  }
+  for (const organizations of [subscriptions, subscriptions.toReversed()]) {
+    assert.deepEqual(
+      (await choicesFor(organizations)).map((choice) => choice.id),
+      organizations.map((organization) => organization.uuid),
+      'the picker keeps server order'
+    );
+  }
+  const ineligibleCandidates = [
+    { capabilities: ['chat', 'claude_max'] },
+    { uuid: 'organization-no-chat', capabilities: ['api', 'claude_pro'] },
+    { uuid: 'organization-unknown-raven', capabilities: ['chat', 'raven'], raven_type: null }
+  ];
+  for (const candidate of ineligibleCandidates) {
+    const choices = await choicesFor([free, candidate]);
+    if (!candidate.uuid || !candidate.capabilities.includes('chat')) {
+      assert.deepEqual(choices.map((choice) => choice.id), [free.uuid]);
+    } else {
+      assert.deepEqual(choices.map(({ id, plan }) => [id, plan]), [[free.uuid, ''], [candidate.uuid, '']]);
+    }
+  }
   assert.equal(
     await selectedUsageOrganization([
       { uuid: 'organization-api', capabilities: ['API'] },
       { uuid: 'organization-non-api', capabilities: ['files'] },
       { uuid: 'organization-chat', capabilities: ['CHAT', 'files'] }
-    ], 'sessionKey=sk-ant-chat'),
+    ], 'sessionKey=sk-ant-chat', 'organization-chat'),
     'organization-chat'
   );
   assert.equal(
     await selectedUsageOrganization([
       { uuid: 'organization-api', capabilities: ['api'] },
       { uuid: 'organization-non-api', capabilities: ['files'] }
-    ], 'sessionKey=sk-ant-non-api'),
+    ], 'sessionKey=sk-ant-non-api', 'organization-non-api'),
     'organization-non-api'
   );
   assert.equal(
     await selectedUsageOrganization([
       { uuid: 'organization-api-first', capabilities: ['api'] },
       { uuid: 'organization-api-second', capabilities: ['api'] }
-    ], 'sessionKey=sk-ant-first'),
+    ], 'sessionKey=sk-ant-first', 'organization-api-first'),
     'organization-api-first'
   );
+  assert.equal(
+    await selectedUsageOrganization([
+      { uuid: 'organization-api', capabilities: ['api'] },
+      { uuid: 'organization-chat', capabilities: ['chat'] }
+    ], 'sessionKey=sk-ant-only-chat'),
+    'organization-chat',
+    'one eligible chat organization is selected without prompting'
+  );
+});
+
+test('Claude Web requires a choice for multiple organizations and never falls back from a missing selection', async () => {
+  const organizations = [
+    { uuid: 'free', name: 'Personal', capabilities: ['chat'] },
+    { uuid: 'team', name: 'Workspace', capabilities: ['chat', 'raven'], raven_type: 'team' }
+  ];
+  const deps = {
+    providerRuntimeState: new Map(),
+    fetch: async (url) => {
+      assert.ok(url.endsWith('/api/organizations'));
+      return { ok: true, json: async () => organizations };
+    }
+  };
+  await assert.rejects(
+    fetchClaudeLimits({ claudeWebCookie: 'sessionKey=sk-ant-multi' }, deps),
+    (error) => error.code === 'CLAUDE_WEB_ORGANIZATION_SELECTION_REQUIRED'
+      && error.organizationChoices.map((choice) => choice.id).join(',') === 'free,team'
+  );
+  await assert.rejects(
+    fetchClaudeLimits({ claudeWebCookie: 'sessionKey=sk-ant-multi', claudeWebOrganizationId: 'missing' }, deps),
+    (error) => error.code === 'CLAUDE_WEB_ORGANIZATION_NOT_FOUND'
+  );
+});
+
+test('Claude Web rechecks organizations when an explicit selection is cleared', async () => {
+  const organizations = [
+    { uuid: 'free', name: 'Personal', capabilities: ['chat'] },
+    { uuid: 'team', name: 'Workspace', capabilities: ['chat', 'raven'], raven_type: 'team' }
+  ];
+  const requests = [];
+  const deps = {
+    providerRuntimeState: new Map(),
+    fetch: async (url) => {
+      requests.push(url);
+      if (url.endsWith('/api/organizations')) return { ok: true, json: async () => organizations };
+      if (url.endsWith('/api/account')) return { ok: true, json: async () => ({ uuid: 'account-web' }) };
+      if (url.includes('/usage?')) return { ok: true, json: async () => ({ five_hour: { utilization: 23 } }) };
+      throw new Error(`unexpected endpoint: ${url}`);
+    }
+  };
+  const options = { claudeWebCookie: 'sessionKey=sk-ant-clear-selection', claudePrepaidBalanceEnabled: false };
+  assert.equal((await fetchClaudeLimits({ ...options, claudeWebOrganizationId: 'team' }, deps)).status, 'ok');
+  requests.length = 0;
+  await assert.rejects(
+    fetchClaudeLimits(options, deps),
+    (error) => error.code === 'CLAUDE_WEB_ORGANIZATION_SELECTION_REQUIRED'
+  );
+  assert.deepEqual(requests.map((url) => new URL(url).pathname), ['/api/organizations']);
+});
+
+test('Claude Web does not carry a fallback account key across organizations', async () => {
+  const organizations = [
+    { uuid: 'free', name: 'Personal', capabilities: ['chat'] },
+    { uuid: 'team', name: 'Workspace', capabilities: ['chat', 'raven'], raven_type: 'team' }
+  ];
+  const deps = {
+    providerRuntimeState: new Map(),
+    fetch: async (url) => {
+      if (url.endsWith('/api/organizations')) return { ok: true, json: async () => organizations };
+      if (url.endsWith('/api/account')) return { ok: true, json: async () => ({ email_address: 'owner@example.com' }) };
+      if (url.includes('/usage?')) return { ok: true, json: async () => ({ five_hour: { utilization: 23 } }) };
+      throw new Error(`unexpected endpoint: ${url}`);
+    }
+  };
+  const options = { claudeWebCookie: 'sessionKey=sk-ant-switch-fallback', claudePrepaidBalanceEnabled: false };
+  const free = await fetchClaudeLimits({ ...options, claudeWebOrganizationId: 'free' }, deps);
+  const team = await fetchClaudeLimits({ ...options, claudeWebOrganizationId: 'team' }, deps);
+  assert.equal(free.status, 'ok');
+  assert.equal(team.status, 'ok');
+  assert.notEqual(team.accountKey, free.accountKey);
+});
+
+test('Claude Web keeps two organizations under one account UUID separate across devices', async () => {
+  const organizations = [
+    { uuid: 'free', name: 'Personal', capabilities: ['chat'] },
+    { uuid: 'team', name: 'Workspace', capabilities: ['chat', 'raven'], raven_type: 'team' }
+  ];
+  const collect = (selectedId) => fetchClaudeLimits({
+    claudeWebCookie: 'sessionKey=sk-ant-multi-device',
+    claudeWebOrganizationId: selectedId,
+    claudePrepaidBalanceEnabled: false
+  }, {
+    providerRuntimeState: new Map(),
+    fetch: async (url) => {
+      if (url.endsWith('/api/organizations')) return { ok: true, json: async () => organizations };
+      if (url.endsWith('/api/account')) return { ok: true, json: async () => ({ uuid: 'account-multi' }) };
+      if (url.includes('/usage?')) return { ok: true, json: async () => ({ five_hour: { utilization: selectedId === 'free' ? 12 : 42 } }) };
+      throw new Error(`unexpected endpoint: ${url}`);
+    }
+  });
+  const [free, team, sameTeam] = await Promise.all([collect('free'), collect('team'), collect('team')]);
+  assert.notEqual(free.accountKey, team.accountKey);
+  assert.equal(team.accountKey, sameTeam.accountKey);
+  const oauthTeam = await fetchClaudeLimits({}, {
+    platform: 'linux',
+    claudeCredentialPath: '/home/test/.claude/.credentials.json',
+    stat: async () => ({ mtimeMs: 1 }),
+    readFile: async () => JSON.stringify({ claudeAiOauth: {
+      accessToken: 'access-team',
+      refreshToken: 'refresh-team',
+      expiresAt: Date.now() + 86_400_000,
+      subscriptionType: 'team'
+    } }),
+    fetch: fakeClaudeOauthFetch({ five_hour: { utilization: 42 } }, {
+      account: { uuid: 'account-multi' },
+      organization: { uuid: 'team' }
+    })
+  });
+  assert.equal(oauthTeam.accountKey, team.accountKey);
+  const providers = aggregateLimits([
+    { deviceId: 'mac', limits: { providers: [free] } },
+    { deviceId: 'windows', limits: { providers: [team] } },
+    { deviceId: 'linux', limits: { providers: [sameTeam] } }
+  ], 0, Date.now()).providers.filter((provider) => provider.provider === 'claude');
+  assert.equal(providers.length, 2);
+  assert.deepEqual(new Set(providers.map((provider) => provider.windows[0].usedPercent)), new Set([12, 42]));
+});
+
+test('Claude Web rejects a stored fallback when a chat organization becomes eligible', async () => {
+  for (const capabilities of [['files'], ['api']]) {
+    const fallback = { uuid: 'fallback', name: 'Old workspace', capabilities };
+    const chat = { uuid: 'chat', name: 'Chat workspace', capabilities: ['chat'] };
+    let organizations = [fallback];
+    let nowMs = Date.parse('2026-07-25T00:00:00Z');
+    let usageRequests = 0;
+    const deps = {
+      now: () => nowMs,
+      claudeIdentityCacheTtlMs: 1000,
+      providerRuntimeState: new Map(),
+      fetch: async (url) => {
+        if (url.endsWith('/api/organizations')) return { ok: true, json: async () => organizations };
+        if (url.endsWith('/api/account')) return { ok: true, json: async () => ({ uuid: 'account-web', email_address: 'owner@example.com' }) };
+        if (url.includes('/usage?')) {
+          usageRequests += 1;
+          return { ok: true, json: async () => ({ five_hour: { utilization: 12 } }) };
+        }
+        throw new Error(`unexpected endpoint: ${url}`);
+      }
+    };
+    const options = { claudeWebCookie: 'sessionKey=sk-ant-fallback', claudeWebOrganizationId: 'fallback', claudePrepaidBalanceEnabled: false };
+    assert.equal((await fetchClaudeLimits(options, deps)).status, 'ok');
+    assert.equal(usageRequests, 1);
+    organizations = [fallback, chat];
+    nowMs += 1001;
+    await assert.rejects(fetchClaudeLimits(options, deps), (error) => error.code === 'CLAUDE_WEB_ORGANIZATION_NOT_FOUND');
+    assert.equal(usageRequests, 1, 'the ineligible stored organization must not be queried again');
+  }
+});
+
+test('Claude Web keeps Team usage, identity and prepaid balance together regardless of Free organization order', async () => {
+  const free = { uuid: 'organization-free', name: 'Personal', capabilities: ['chat'] };
+  const team = { uuid: 'organization-team', name: 'Team Workspace', capabilities: ['chat', 'raven'], raven_type: 'team' };
+  for (const organizations of [[free, team], [team, free]]) {
+    const requests = [];
+    const responses = new Map([
+      ['/api/organizations', organizations],
+      ['/api/account', {
+        uuid: 'account-multi',
+        memberships: [
+          { organization: free, seat_tier: null },
+          { organization: team, seat_tier: 'team_standard' }
+        ]
+      }],
+      ['/api/organizations/organization-free/usage?cedar_ember=1', { five_hour: null, seven_day: null }],
+      ['/api/organizations/organization-team/usage?cedar_ember=1', {
+        five_hour: { utilization: 21, resets_at: '2026-07-25T05:00:00Z' },
+        seven_day: { utilization: 35, resets_at: '2026-08-01T00:00:00Z' }
+      }],
+      ['/api/organizations/organization-team/prepaid/credits', { amount: 1234, currency: 'USD' }]
+    ]);
+    const provider = await fetchClaudeLimits({ claudeWebCookie: 'sessionKey=sk-ant-free-team', claudeWebOrganizationId: team.uuid }, {
+      providerRuntimeState: new Map(),
+      fetch: async (url) => {
+        const parsed = new URL(url);
+        const endpoint = parsed.pathname + parsed.search;
+        requests.push(endpoint);
+        assert.ok(responses.has(endpoint), `unexpected endpoint: ${endpoint}`);
+        return { ok: true, json: async () => responses.get(endpoint) };
+      }
+    });
+    assert.deepEqual(requests, [
+      '/api/organizations',
+      '/api/organizations/organization-team/usage?cedar_ember=1',
+      '/api/account',
+      '/api/organizations/organization-team/prepaid/credits'
+    ]);
+    assert.equal(provider.status, 'ok');
+    assert.equal(provider.accountName, team.name);
+    assert.equal(provider.accountLabel, 'Team');
+    assert.deepEqual(provider.windows.map((window) => [window.kind, window.usedPercent]), [
+      ['session', 21], ['weekly', 35], ['billing', null]
+    ]);
+    assert.equal(provider.balance.amount, 12.34);
+  }
 });
 
 test('Claude Web caches stable identity and reuses it when account lookup is transiently unavailable', async () => {
@@ -455,7 +705,7 @@ test('Claude Web caches stable identity and reuses it when account lookup is tra
   assert.equal(cached.accountKey, first.accountKey);
   assert.equal(cached.windows[0].usedPercent, 23);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].endsWith('/usage'), true);
+  assert.equal(requests[0].endsWith('/usage?cedar_ember=1'), true);
 
   requests.length = 0;
   nowMs += 2000;
@@ -466,7 +716,35 @@ test('Claude Web caches stable identity and reuses it when account lookup is tra
   assert.equal(second.accountKey, first.accountKey);
   assert.equal(second.windows[0].usedPercent, 37);
   assert.equal(requests.some((url) => url.endsWith('/api/account')), true);
-  assert.equal(requests.some((url) => url.endsWith('/usage')), true);
+  assert.equal(requests.some((url) => url.endsWith('/usage?cedar_ember=1')), true);
+});
+
+test('Claude Web does not label a newly selected organization with another organization’s stale identity', async () => {
+  const free = { uuid: 'free', name: 'Personal', capabilities: ['chat'] };
+  const team = { uuid: 'team', name: 'Workspace', capabilities: ['chat', 'raven'], raven_type: 'team' };
+  let nowMs = 1000;
+  let accountAvailable = true;
+  const deps = {
+    now: () => nowMs,
+    providerRuntimeState: new Map(),
+    fetch: async (url) => {
+      if (url.endsWith('/api/organizations')) return { ok: true, json: async () => [free, team] };
+      if (url.includes('/usage?')) return { ok: true, json: async () => ({ five_hour: { utilization: 82 } }) };
+      if (url.endsWith('/api/account')) return accountAvailable
+        ? { ok: true, json: async () => ({ uuid: 'account', memberships: [{ organization: free }, { organization: team }] }) }
+        : { ok: false, status: 503 };
+      throw new Error(`unexpected endpoint ${url}`);
+    }
+  };
+  const options = { claudeWebCookie: 'sessionKey=sk-ant-switch', claudePrepaidBalanceEnabled: false };
+  const first = await fetchClaudeLimits({ ...options, claudeWebOrganizationId: 'free' }, deps);
+  assert.equal(first.accountName, 'Personal');
+  accountAvailable = false;
+  nowMs += 1000;
+  await assert.rejects(
+    fetchClaudeLimits({ ...options, claudeWebOrganizationId: 'team' }, deps),
+    (error) => error.code === 'CLAUDE_IDENTITY_UNAVAILABLE'
+  );
 });
 
 test('Claude Web requires the account endpoint on a cold identity cache', async () => {
@@ -477,7 +755,7 @@ test('Claude Web requires the account endpoint on a cold identity cache', async 
         if (url.endsWith('/api/organizations')) {
           return { ok: true, json: async () => [{ uuid: 'organization-web' }] };
         }
-        if (url.endsWith('/usage')) {
+        if (url.endsWith('/usage?cedar_ember=1')) {
           return {
             ok: true,
             json: async () => ({
@@ -544,6 +822,7 @@ test('Claude Web authentication failure does not silently fall back to another l
 test('Claude limits fall back to direct CLI usage on Windows when OAuth usage is unavailable', async () => {
   const provider = await fetchClaudeLimits({}, {
     platform: 'win32',
+    env: {},
     now: () => Date.parse('2026-06-11T00:00:00Z'),
     claudeCredentialPath: 'C:\\Users\\Javis\\.claude\\.credentials.json',
     stat: async () => ({ mtimeMs: 1 }),
@@ -559,6 +838,7 @@ test('Claude limits fall back to direct CLI usage on Windows when OAuth usage is
       status: 500
     }),
     existsSync: () => false,
+    isClaudeCliAuthenticated: async () => true,
     spawn: fakeSpawnForClaudeUsage()
   });
 
@@ -583,6 +863,7 @@ test('Claude limits fall back to CLI usage when OAuth credentials are not discov
       throw error;
     },
     readMacKeychain: false,
+    isClaudeCliAuthenticated: async () => true,
     runClaudeUsageCli: async () => {
       cliCalls += 1;
       return [
@@ -602,6 +883,208 @@ test('Claude limits fall back to CLI usage when OAuth credentials are not discov
   assert.equal(provider.source, 'cli');
   assert.equal(provider.windows[0].usedPercent, 5);
   assert.equal(provider.windows[1].usedPercent, 20);
+});
+
+test('Claude CLI fallback requires a positive non-interactive auth status', async () => {
+  let usageCalls = 0;
+  const provider = await fetchClaudeLimits({}, {
+    platform: 'darwin',
+    env: {},
+    now: () => Date.parse('2026-07-15T00:00:00Z'),
+    claudeCredentialPath: '/tmp/missing-claude-credentials.json',
+    stat: async () => {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    },
+    readMacKeychain: false,
+    runClaudeAuthStatus: async () => [
+      'Claude Code 2.1.0',
+      JSON.stringify({ loggedIn: true, authMethod: 'oauth' })
+    ].join('\n'),
+    runClaudeUsageCli: async () => {
+      usageCalls += 1;
+      return [
+        'Current session',
+        '95% left',
+        'Resets 6pm',
+        'Current week',
+        '80% left',
+        'Resets Jul 22'
+      ].join('\n');
+    }
+  });
+
+  assert.equal(usageCalls, 1);
+  assert.equal(provider.source, 'cli');
+});
+
+test('Claude CLI fallback preserves the original error when auth is not positively confirmed', async () => {
+  for (const authOutput of [JSON.stringify({ loggedIn: false }), 'not-json']) {
+    let usageCalls = 0;
+    await assert.rejects(
+      fetchClaudeLimits({}, {
+        platform: 'darwin',
+        env: {},
+        claudeCredentialPath: '/tmp/missing-claude-credentials.json',
+        stat: async () => {
+          throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        },
+        readMacKeychain: false,
+        runClaudeAuthStatus: async () => authOutput,
+        runClaudeUsageCli: async () => {
+          usageCalls += 1;
+          return '';
+        }
+      }),
+      (error) => error?.status === 'notConfigured'
+        && error?.message === 'Claude credentials not found'
+    );
+    assert.equal(usageCalls, 0);
+  }
+});
+
+test('Claude auth status uses cmd.exe without shell mode on Windows', async () => {
+  let stdinEnded = false;
+  const output = await runClaudeAuthStatus({
+    platform: 'win32',
+    env: {},
+    existsSync: () => false,
+    spawn: (command, args, options) => {
+      assert.equal(command, 'cmd.exe');
+      assert.deepEqual(args, ['/d', '/s', '/c', '""claude.cmd" auth status --json"']);
+      assert.equal(options.shell, false);
+      assert.equal(options.windowsVerbatimArguments, true);
+      assert.equal(options.env.DISABLE_AUTOUPDATER, '1');
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stdin = { end: () => { stdinEnded = true; } };
+      child.kill = () => {};
+      process.nextTick(() => {
+        child.stdout.emit('data', JSON.stringify({ loggedIn: true }));
+        child.emit('close', 0);
+      });
+      return child;
+    }
+  });
+
+  assert.deepEqual(JSON.parse(output), { loggedIn: true });
+  assert.equal(stdinEnded, true);
+});
+
+test('Claude PTY probing preserves the first executable Python failure', async (t) => {
+  const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'token-monitor-claude-python-'));
+  t.after(() => fs.rm(probeDir, { recursive: true, force: true }));
+  const calls = [];
+
+  await assert.rejects(
+    touchClaudeAuthPath({
+      platform: 'darwin',
+      env: { TERM: 'dumb' },
+      claudeProbeDir: probeDir,
+      existsSync: () => false,
+      spawn: (command, args, options) => {
+        calls.push(command);
+        assert.equal(options.env.TERM, 'xterm-256color');
+        assert.equal(options.env.DISABLE_AUTOUPDATER, '1');
+        const script = args[1];
+        assert.match(script, /matched_at = None/);
+        assert.match(script, /matched_at is not None and now - matched_at >= 2/);
+        assert.doesNotMatch(script, /time\.sleep\(2\)/);
+        assert.match(script, /TIOCSWINSZ/);
+        assert.match(script, /handled_prompts/);
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        process.nextTick(() => {
+          child.stderr.emit('data', 'original Python failure');
+          child.emit('close', 1);
+        });
+        return child;
+      }
+    }),
+    (error) => error?.status === 'unavailable'
+      && error?.message === 'original Python failure'
+  );
+
+  assert.deepEqual(calls, ['python3']);
+});
+
+test('Claude PTY prompt matching handles overlapping tokens with one carriage return', async (t) => {
+  const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'token-monitor-claude-prompt-'));
+  t.after(() => fs.rm(probeDir, { recursive: true, force: true }));
+  let script = '';
+
+  await assert.rejects(
+    touchClaudeAuthPath({
+      platform: 'darwin',
+      env: {},
+      claudeProbeDir: probeDir,
+      existsSync: () => false,
+      spawn: (_command, args) => {
+        script = args[1];
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        process.nextTick(() => child.emit('close', 1));
+        return child;
+      }
+    }),
+    (error) => error?.status === 'unavailable'
+  );
+
+  assert.match(script, /sorted\(prompt_tokens, key=len, reverse=True\)/);
+  assert.match(script, /prompt_token\.startswith\(token\)/);
+  assert.doesNotMatch(script, /for token in prompt_tokens:\s*\n\s*if token in scan/);
+  const promptStart = script.indexOf('        prompt_token = next(');
+  const promptEnd = script.indexOf('        if io_closed:', promptStart);
+  assert.ok(promptStart >= 0 && promptEnd > promptStart);
+  const promptBlock = script.slice(promptStart, promptEnd);
+  assert.equal(promptBlock.match(/write_master\(b"\\r"\)/g)?.length, 1);
+});
+
+test('Claude CLI commands execute from a Windows path containing spaces', {
+  skip: process.platform !== 'win32'
+}, async (t) => {
+  const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), 'token monitor claude '));
+  const command = path.join(fixtureDir, 'claude.cmd');
+  t.after(() => fs.rm(fixtureDir, { recursive: true, force: true }));
+  await fs.writeFile(command, [
+    '@echo off',
+    'if /I "%~1"=="auth" goto auth',
+    'if /I "%~1"=="/usage" goto usage',
+    'exit /b 1',
+    ':auth',
+    'echo {"loggedIn":true}',
+    'exit /b 0',
+    ':usage',
+    'echo Current session',
+    'echo 95%% left',
+    'echo Resets 6pm',
+    'echo Current week ^(all models^)',
+    'echo 80%% left',
+    'echo Resets Jun 19',
+    'exit /b 0'
+  ].join('\r\n'));
+
+  const deps = {
+    platform: 'win32',
+    env: { ...process.env, TOKEN_MONITOR_CLAUDE_COMMAND: command },
+    now: () => Date.parse('2026-06-13T07:00:00Z'),
+    claudeCredentialPath: path.join(fixtureDir, 'missing-credentials.json'),
+    stat: async () => {
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    },
+    readdirSync: () => [],
+    readWindowsCredentialSecret: async () => ''
+  };
+
+  assert.deepEqual(JSON.parse(await runClaudeAuthStatus(deps)), { loggedIn: true });
+  const provider = await fetchClaudeLimits({}, deps);
+  assert.equal(provider.source, 'cli');
+  assert.equal(provider.windows.find((window) => window.kind === 'session')?.remainingPercent, 95);
+  assert.equal(provider.windows.find((window) => window.kind === 'weekly')?.remainingPercent, 80);
 });
 
 test('Claude limits read Windows Credential Manager credentials when credential files are absent', async () => {
@@ -691,9 +1174,11 @@ test('Claude OAuth profile provides stable cross-device account identity and met
 
   const mac = await collect('/Users/test/.claude/.credentials.json', 'account-a', 'organization-a');
   const windows = await collect('C:\\Users\\test\\.claude\\.credentials.json', 'account-a', 'organization-changed');
+  const sameOrganization = await collect('/home/same/.claude/.credentials.json', 'account-a', 'organization-a');
   const other = await collect('/home/other/.claude/.credentials.json', 'account-b', 'organization-a');
 
-  assert.equal(mac.accountKey, windows.accountKey);
+  assert.notEqual(mac.accountKey, windows.accountKey);
+  assert.equal(mac.accountKey, sameOrganization.accountKey);
   assert.notEqual(mac.accountKey, other.accountKey);
   assert.equal(mac.accountEmail, 'owner@example.com');
   assert.equal(mac.accountName, 'Example Workspace');
@@ -743,10 +1228,11 @@ test('Claude OAuth profile failures never derive account identity from rotating 
   assert.equal(cliCalls, 0);
 });
 
-test('Claude OAuth keeps fresh quota with cached identity when profile lookup is transiently unavailable', async () => {
+test('Claude OAuth keeps cached identity on a profile failure and adopts a changed organization', async () => {
   const providerRuntimeState = new Map();
   let nowMs = Date.parse('2026-07-25T00:00:00Z');
   let profileAvailable = true;
+  let organizationId = 'organization-default';
   let utilization = 12;
   const deps = {
     platform: 'linux',
@@ -765,7 +1251,10 @@ test('Claude OAuth keeps fresh quota with cached identity when profile lookup is
     fetch: async (url) => {
       if (url.endsWith('/api/oauth/profile')) {
         return profileAvailable
-          ? { ok: true, json: async () => DEFAULT_CLAUDE_PROFILE }
+          ? { ok: true, json: async () => ({
+              ...DEFAULT_CLAUDE_PROFILE,
+              organization: { uuid: organizationId }
+            }) }
           : { ok: false, status: 503 };
       }
       return {
@@ -784,6 +1273,12 @@ test('Claude OAuth keeps fresh quota with cached identity when profile lookup is
   assert.equal(second.accountKey, first.accountKey);
   assert.equal(second.windows[0].usedPercent, 44);
   assert.equal(second.source, 'oauth');
+
+  nowMs += 2000;
+  profileAvailable = true;
+  organizationId = 'organization-changed';
+  const third = await fetchClaudeLimits({}, deps);
+  assert.notEqual(third.accountKey, first.accountKey);
 });
 
 test('Claude OAuth usage mapping accepts camelCase response fields', async () => {
@@ -989,6 +1484,120 @@ test('Claude CLI usage parses compact PTY reset lines', () => {
   assert.equal(typeof weekly.resetsAt, 'string');
 });
 
+test('Claude CLI usage preserves colon-delimited reset lines', () => {
+  const provider = mapClaudeCliUsageToProvider([
+    'Current session',
+    '95% left',
+    'Resets:4pm',
+    'Current week (all models)',
+    '80% left',
+    'Resets:Jun 19'
+  ].join('\n'), {
+    now: new Date('2026-06-13T07:00:00Z'),
+    updatedAt: '2026-06-13T07:00:00Z'
+  });
+
+  const session = provider.windows.find((window) => window.kind === 'session');
+  const weekly = provider.windows.find((window) => window.kind === 'weekly');
+  assert.equal(session.resetDescription, 'Resets:4pm');
+  assert.equal(weekly.resetDescription, 'Resets:Jun 19');
+  assert.equal(typeof session.resetsAt, 'string');
+  assert.equal(typeof weekly.resetsAt, 'string');
+});
+
+test('Claude CLI usage preserves a spaced time reset', () => {
+  const provider = mapClaudeCliUsageToProvider([
+    'Current session',
+    '95% left',
+    'Resets 6pm',
+    'Current week',
+    '80% left',
+    'Resets Jul 22'
+  ].join('\n'), {
+    now: new Date('2026-07-15T00:00:00Z'),
+    updatedAt: '2026-07-15T00:00:00Z'
+  });
+
+  const session = provider.windows.find((window) => window.kind === 'session');
+  assert.equal(session.resetDescription, 'Resets 6pm');
+  assert.equal(typeof session.resetsAt, 'string');
+});
+
+test('Claude CLI usage preserves time-only resets in their own quota sections', () => {
+  const provider = mapClaudeCliUsageToProvider([
+    'Current session',
+    '69% used',
+    'Resets 5am (Europe/Saratov)',
+    'Current week (all models)',
+    '87% used',
+    'Resets 6pm (Europe/Saratov)'
+  ].join('\n'), {
+    now: new Date('2026-07-15T00:00:00Z'),
+    updatedAt: '2026-07-15T00:00:00Z'
+  });
+
+  const session = provider.windows.find((window) => window.kind === 'session');
+  const weekly = provider.windows.find((window) => window.kind === 'weekly');
+  assert.equal(session.resetDescription, 'Resets 5am');
+  assert.equal(typeof session.resetsAt, 'string');
+  assert.equal(weekly.resetDescription, 'Resets 6pm');
+  assert.equal(typeof weekly.resetsAt, 'string');
+});
+
+test('Claude CLI usage never borrows the weekly percentage for a missing session', () => {
+  assert.throws(
+    () => mapClaudeCliUsageToProvider([
+      'Current session',
+      'Current week',
+      '80% left',
+      'Resets Jul 22'
+    ].join('\n'), {
+      now: new Date('2026-07-15T00:00:00Z'),
+      updatedAt: '2026-07-15T00:00:00Z'
+    }),
+    (error) => error?.status === 'unavailable'
+      && error?.message === 'Claude CLI usage missing current session'
+  );
+});
+
+test('Claude CLI usage never borrows Sonnet-only data for a missing all-model weekly window', () => {
+  const provider = mapClaudeCliUsageToProvider([
+    'Current session',
+    '95% left',
+    'Resets 6pm',
+    'Current week (all models)',
+    'Current week (Sonnet only)',
+    '80% left',
+    'Resets Jun 19'
+  ].join('\n'), {
+    now: new Date('2026-06-13T07:00:00Z'),
+    updatedAt: '2026-06-13T07:00:00Z'
+  });
+
+  assert.equal(provider.windows.find((window) => window.kind === 'weekly'), undefined);
+});
+
+test('Claude CLI usage never borrows a Sonnet-only reset for the all-model weekly window', () => {
+  const provider = mapClaudeCliUsageToProvider([
+    'Current session',
+    '95% left',
+    'Resets 6pm',
+    'Current week (all models)',
+    '40% left',
+    'Current week (Sonnet only)',
+    '80% left',
+    'Resets Jun 19'
+  ].join('\n'), {
+    now: new Date('2026-06-13T07:00:00Z'),
+    updatedAt: '2026-06-13T07:00:00Z'
+  });
+
+  const weekly = provider.windows.find((window) => window.kind === 'weekly');
+  assert.equal(weekly.remainingPercent, 40);
+  assert.equal(weekly.resetDescription, '');
+  assert.equal(weekly.resetsAt, null);
+});
+
 test('Claude CLI usage carries account email and organization into the provider identity', () => {
   const provider = mapClaudeCliUsageToProvider([
     'Current session',
@@ -1188,6 +1797,142 @@ test('Claude usage credits honour a non-cent decimal_places', () => {
   assert.equal(window.used, 235);
   assert.equal(window.limit, 2000);
   assert.equal(window.currency, 'JPY');
+});
+
+test('Claude OAuth usage maps cedar_ember reset grants into resetCredits', () => {
+  const provider = mapClaudeUsageToProvider(claudeUsagePayload({
+    cedar_ember: {
+      grants: [
+        {
+          id: 'later-promo',
+          label: 'Later promo reset',
+          resets_left: 2,
+          resets_total: 2,
+          starts_at: '2030-01-01T00:00:00Z',
+          ends_at: '2030-02-01T00:00:00Z',
+          clears: ['seven_day'],
+          usable_now: true,
+          use_requires_limit: false,
+          paused: false
+        },
+        {
+          id: 'launch-promo',
+          label: 'Launch promo reset',
+          resets_left: 1,
+          resets_total: 1,
+          starts_at: '2030-01-01T00:00:00Z',
+          ends_at: '2030-01-15T00:00:00Z',
+          clears: ['five_hour', 'seven_day', 'seven_day_overage_included'],
+          usable_now: true,
+          use_requires_limit: false,
+          paused: false
+        }
+      ]
+    }
+  }));
+
+  const resetCredits = provider.resetCredits;
+  assert.equal(resetCredits.availableCount, 3);
+  assert.equal(resetCredits.nextExpiresAt, '2030-01-15T00:00:00.000Z');
+  assert.deepEqual(resetCredits.expirations, ['2030-01-15T00:00:00.000Z', '2030-02-01T00:00:00.000Z']);
+  assert.equal(resetCredits.grants.length, 2);
+  const launch = resetCredits.grants[1];
+  assert.equal(launch.id, 'launch-promo');
+  assert.equal(launch.label, 'Launch promo reset');
+  assert.equal(launch.resetsLeft, 1);
+  assert.equal(launch.resetsTotal, 1);
+  assert.equal(launch.endsAt, '2030-01-15T00:00:00.000Z');
+  assert.deepEqual(launch.clears, ['five_hour', 'seven_day', 'seven_day_overage_included']);
+  assert.equal(launch.usableNow, true);
+  assert.equal(launch.useRequiresLimit, false);
+  assert.equal(launch.paused, false);
+});
+
+test('Claude OAuth usage drops spent and lapsed reset grants', () => {
+  const provider = mapClaudeUsageToProvider(claudeUsagePayload({
+    cedar_ember: {
+      grants: [
+        {
+          id: 'spent',
+          label: 'Spent reset',
+          resets_left: 0,
+          resets_total: 1,
+          ends_at: '2030-01-15T00:00:00Z',
+          clears: ['five_hour'],
+          usable_now: false
+        },
+        {
+          id: 'lapsed',
+          label: 'Lapsed reset',
+          resets_left: 1,
+          resets_total: 1,
+          ends_at: '2020-01-15T00:00:00Z',
+          clears: ['five_hour'],
+          usable_now: false
+        }
+      ]
+    }
+  }));
+
+  assert.equal(provider.resetCredits, null);
+});
+
+test('Claude OAuth usage without cedar_ember grants carries no resetCredits', () => {
+  for (const cedar_ember of [null, {}, { grants: [] }]) {
+    const provider = mapClaudeUsageToProvider(claudeUsagePayload({ cedar_ember }));
+    assert.equal(provider.resetCredits, null);
+  }
+});
+
+test('Claude OAuth usage asks the usage endpoint for reset grants', async () => {
+  const requested = [];
+  let usageHeaders = null;
+  const provider = await fetchClaudeLimits({}, {
+    platform: 'linux',
+    now: () => Date.parse('2026-07-25T00:00:00Z'),
+    claudeCredentialPath: '/same/path/.credentials.json',
+    stat: async () => ({ mtimeMs: 1 }),
+    readFile: async () => JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'stable-access',
+        refreshToken: 'stable-refresh',
+        expiresAt: Date.parse('2026-07-26T00:00:00Z')
+      }
+    }),
+    fetch: async (url, options) => {
+      requested.push(url);
+      if (url.includes('/api/oauth/usage')) usageHeaders = options?.headers || null;
+      if (url.endsWith('/api/oauth/profile')) {
+        return { ok: true, json: async () => DEFAULT_CLAUDE_PROFILE };
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          five_hour: { utilization: 12, resets_at: '2026-07-25T05:00:00Z' },
+          cedar_ember: {
+            grants: [{
+              id: 'launch-promo',
+              label: 'Launch promo reset',
+              resets_left: 1,
+              resets_total: 1,
+              ends_at: '2030-01-15T00:00:00Z',
+              clears: ['five_hour', 'seven_day'],
+              usable_now: true
+            }]
+          }
+        })
+      };
+    }
+  });
+
+  const usageRequest = requested.find((url) => url.includes('/api/oauth/usage'));
+  assert.equal(new URL(usageRequest).searchParams.get('cedar_ember'), '1');
+  // Anthropic gates cedar_ember on the client surface: any user-agent that
+  // is not Claude Code gets `eligible: false` with no grants, so the OAuth
+  // usage call must present as the CLI.
+  assert.match(usageHeaders?.['user-agent'], /^claude-cli\/\d+\.\d+\.\d+ \(external, cli\)$/);
+  assert.equal(provider.resetCredits.availableCount, 1);
+  assert.equal(provider.resetCredits.grants[0].label, 'Launch promo reset');
 });
 
 const PREPAID_CREDITS = {
@@ -1756,4 +2501,262 @@ test('the prepaid TTL follows the limits refresh interval at twice its length', 
   nowMs += 61_000;
   await fetchClaudeLimits(options, deps);
   assert.equal(requests.filter((url) => url.includes('/prepaid/credits')).length, 1);
+});
+
+// Three claude.ai accounts, each behind its own session cookie. `rejected`
+// names cookies claude.ai no longer accepts.
+const WEB_LOGINS = {
+  'sessionKey=sk-ant-login-a': { account: 'account-a', email: 'a@example.com', organization: 'org-a', capability: 'claude_max', session: 11 },
+  'sessionKey=sk-ant-login-b': { account: 'account-b', email: 'b@example.com', organization: 'org-b', capability: 'claude_pro', session: 52 },
+  'sessionKey=sk-ant-login-c': { account: 'account-c', email: 'c@example.com', organization: 'org-c', capability: 'claude_pro', session: 93 }
+};
+
+function fakeClaudeWebLoginsFetch({ logins = WEB_LOGINS, rejected = [], requests = [] } = {}) {
+  return async (url, options) => {
+    const headers = { get: () => '', getSetCookie: () => [] };
+    const cookie = options.headers.cookie;
+    requests.push({ cookie, url });
+    const login = logins[cookie];
+    if (!login || rejected.includes(cookie)) return { ok: false, status: 401, headers, json: async () => ({}) };
+    if (url.endsWith('/api/organizations')) {
+      return {
+        ok: true,
+        status: 200,
+        headers,
+        json: async () => [{ uuid: login.organization, name: login.organization, capabilities: ['chat', login.capability] }]
+      };
+    }
+    if (url.endsWith('/api/account')) {
+      return { ok: true, status: 200, headers, json: async () => ({ uuid: login.account, email_address: login.email }) };
+    }
+    if (url.includes('/prepaid/credits')) {
+      return { ok: true, status: 200, headers, json: async () => ({ amount: 0, currency: 'USD' }) };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers,
+      json: async () => ({
+        five_hour: { utilization: login.session, resets_at: '2026-07-27T10:50:00Z' },
+        seven_day: { utilization: 5, resets_at: '2026-07-31T10:00:00Z' }
+      })
+    };
+  };
+}
+
+function webLogins(...suffixes) {
+  return suffixes.map((suffix) => ({ id: `login-${suffix}`, cookie: `sessionKey=sk-ant-login-${suffix}` }));
+}
+
+// The identity each login resolves to, as the widget would have stored it after
+// a first successful read.
+async function resolvedWebLogins(...suffixes) {
+  const resolved = new Map();
+  await fetchClaudeLimits({ claudeWebAccounts: webLogins(...suffixes) }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch(),
+    onClaudeWebAccountResolved: ({ id, ...identity }) => resolved.set(id, identity)
+  });
+  return webLogins(...suffixes).map((login) => ({ ...login, ...resolved.get(login.id) }));
+}
+
+function sessionUsedPercent(provider) {
+  return provider.windows.find((window) => window.kind === 'session').usedPercent;
+}
+
+test('the form cookie and the additional logins each report their own account', async () => {
+  const providers = await fetchClaudeLimits(
+    {
+      // The account form's cookie is read first, then every additional login.
+      claudeWebCookie: 'sessionKey=sk-ant-login-a',
+      claudeWebAccounts: webLogins('b', 'c')
+    },
+    { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch() }
+  );
+
+  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'b@example.com', 'c@example.com']);
+  assert.deepEqual(providers.map((provider) => provider.status), ['ok', 'ok', 'ok']);
+  assert.deepEqual(providers.map((provider) => provider.source), ['web', 'web', 'web']);
+  assert.deepEqual(providers.map((provider) => provider.accountLabel), ['Max', 'Pro', 'Pro']);
+  assert.deepEqual(providers.map(sessionUsedPercent), [11, 52, 93]);
+  assert.equal(new Set(providers.map((provider) => provider.accountKey)).size, 3);
+});
+
+test('one saved Claude Web login keeps the single-provider shape and reports its identity once', async () => {
+  const resolutions = [];
+  const deps = {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch(),
+    onClaudeWebAccountResolved: (resolution) => resolutions.push(resolution)
+  };
+
+  const provider = await fetchClaudeLimits({ claudeWebAccounts: webLogins('b') }, deps);
+
+  assert.equal(Array.isArray(provider), false);
+  assert.equal(provider.accountEmail, 'b@example.com');
+  assert.deepEqual(resolutions, [{
+    id: 'login-b',
+    accountKey: provider.accountKey,
+    accountEmail: 'b@example.com',
+    accountName: 'org-b',
+    accountLabel: 'Pro'
+  }]);
+
+  // Once the identity is stored there is nothing new to report.
+  const { id: _id, ...identity } = resolutions[0];
+  await fetchClaudeLimits({ claudeWebAccounts: [{ ...webLogins('b')[0], ...identity }] }, deps);
+  assert.equal(resolutions.length, 1);
+});
+
+test('one rejected Claude Web login still fails the way the single cookie did', async () => {
+  await assert.rejects(
+    fetchClaudeLimits({ claudeWebAccounts: webLogins('b') }, {
+      providerRuntimeState: new Map(),
+      claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
+    }),
+    (error) => error.status === 'unauthorized'
+  );
+});
+
+test('a rejected Claude Web login among several keeps its own account and leaves the others intact', async () => {
+  const accounts = await resolvedWebLogins('a', 'b', 'c');
+  const providers = await fetchClaudeLimits({ claudeWebAccounts: accounts }, {
+    now: () => Date.parse('2026-07-27T00:00:00Z'),
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
+  });
+
+  assert.deepEqual(providers.map((provider) => provider.status), ['ok', 'unauthorized', 'ok']);
+  assert.deepEqual(providers.map((provider) => provider.accountKey), accounts.map((account) => account.accountKey));
+  assert.equal(providers[1].accountEmail, 'b@example.com');
+  assert.equal(providers[1].accountLabel, 'Pro');
+  assert.equal(providers[1].source, 'web');
+  assert.deepEqual(providers[1].windows, []);
+  assert.equal(providers[1].updatedAt, '2026-07-27T00:00:00.000Z');
+  assert.deepEqual([sessionUsedPercent(providers[0]), sessionUsedPercent(providers[2])], [11, 93]);
+});
+
+test('a failing Claude Web login with no resolved identity is left out instead of reported anonymously', async () => {
+  const [known] = await resolvedWebLogins('a');
+  const providers = await fetchClaudeLimits({ claudeWebAccounts: [known, ...webLogins('b')] }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
+  });
+
+  // An unauthorized row with no accountKey is how a provider-wide failure
+  // looks, and LimitsRuntime would spread it over the healthy account too.
+  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com']);
+  assert.equal(providers[0].status, 'ok');
+});
+
+test('an account-scoped Claude refresh reads only the account it names', async () => {
+  const accounts = await resolvedWebLogins('a', 'b', 'c');
+  const requests = [];
+  const read = (limitRefreshScope) => fetchClaudeLimits({ claudeWebAccounts: accounts, limitRefreshScope }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({ requests })
+  });
+
+  const byKey = await read({ provider: 'claude', accountKey: accounts[1].accountKey });
+  assert.deepEqual(byKey.map((provider) => provider.accountEmail), ['b@example.com']);
+  assert.deepEqual([...new Set(requests.map((request) => request.cookie))], ['sessionKey=sk-ant-login-b']);
+
+  const byEmail = await read({ provider: 'claude', accountEmail: 'C@example.com' });
+  assert.deepEqual(byEmail.map((provider) => provider.accountEmail), ['c@example.com']);
+
+  // LimitsRuntime writes every row of a scoped refresh onto the scoped account,
+  // so a scope that names no saved login must not fall back to reading them all.
+  assert.deepEqual(await read({ provider: 'claude', accountKey: 'sha256:unknown' }), []);
+  assert.deepEqual(await read({ provider: 'claude', accountLabel: 'Pro' }), []);
+});
+
+test('a scoped Claude refresh finds a login whose identity is only cached so far', async () => {
+  const deps = { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch() };
+  const claudeWebAccounts = webLogins('a', 'b');
+  const [, second] = await fetchClaudeLimits({ claudeWebAccounts }, deps);
+
+  const scoped = await fetchClaudeLimits({
+    claudeWebAccounts,
+    limitRefreshScope: { provider: 'claude', accountKey: second.accountKey }
+  }, deps);
+
+  assert.deepEqual(scoped.map((provider) => provider.accountEmail), ['b@example.com']);
+});
+
+test('two sessions of one Claude account report a single row', async () => {
+  const providers = await fetchClaudeLimits({
+    claudeWebAccounts: [
+      ...webLogins('a'),
+      // A second cookie for account-a, saved before either identity was known.
+      { id: 'login-a-again', cookie: 'sessionKey=sk-ant-login-a-again' },
+      ...webLogins('c')
+    ]
+  }, {
+    providerRuntimeState: new Map(),
+    claudeWebFetch: fakeClaudeWebLoginsFetch({
+      logins: { ...WEB_LOGINS, 'sessionKey=sk-ant-login-a-again': WEB_LOGINS['sessionKey=sk-ant-login-a'] }
+    })
+  });
+
+  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'c@example.com']);
+});
+
+test('a login saved both in the form and in the list is read once', async () => {
+  const requests = [];
+  const providers = await fetchClaudeLimits({
+    claudeWebCookie: 'sessionKey=sk-ant-login-a',
+    claudeWebAccounts: webLogins('a', 'b')
+  }, { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch({ requests }) });
+
+  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'b@example.com']);
+  assert.equal(requests.filter((request) => request.cookie === 'sessionKey=sk-ant-login-a' && request.url.endsWith('/api/organizations')).length, 1);
+});
+
+test('each additional login reads the organization it was saved with', async () => {
+  // One account in two chat organizations: without a saved choice claude.ai
+  // offers both and nothing is read.
+  const headers = { get: () => '', getSetCookie: () => [] };
+  const usageUrls = [];
+  const claudeWebFetch = async (url) => {
+    const json = url.endsWith('/api/organizations')
+      ? [
+        { uuid: 'org-team', name: 'Team', capabilities: ['chat', 'raven'], raven_type: 'team' },
+        { uuid: 'org-personal', name: 'Personal', capabilities: ['chat', 'claude_pro'] }
+      ]
+      : url.endsWith('/api/account')
+        ? { uuid: 'account-multi', email_address: 'multi@example.com' }
+        : url.includes('/prepaid/credits')
+          ? { amount: 0, currency: 'USD' }
+          : (usageUrls.push(url), { five_hour: { utilization: 1, resets_at: '2026-07-27T10:50:00Z' } });
+    return { ok: true, status: 200, headers, json: async () => json };
+  };
+  const providers = await fetchClaudeLimits({
+    claudeWebAccounts: [
+      { id: 'personal', cookie: 'sessionKey=sk-ant-multi-1', organizationId: 'org-personal' },
+      { id: 'team', cookie: 'sessionKey=sk-ant-multi-2', organizationId: 'org-team' }
+    ]
+  }, { providerRuntimeState: new Map(), claudeWebFetch });
+
+  assert.deepEqual(providers.map((provider) => provider.accountName).sort(), ['Personal', 'Team']);
+  assert.deepEqual(usageUrls.map((url) => url.match(/organizations\/([^/]+)\/usage/)[1]).sort(), ['org-personal', 'org-team']);
+});
+
+test('saved Claude Web logins are deduplicated and invalid ones dropped', () => {
+  assert.deepEqual(
+    normalizeClaudeWebAccounts([
+      { id: 'one', cookie: 'sk-ant-one', organizationId: ' org-1 ', accountKey: 'sha256:one', accountEmail: ' One@Example.com ', accountName: ' Org ', accountLabel: 'Pro' },
+      { id: 'one', cookie: 'sessionKey=sk-ant-same-id' },
+      { id: 'two', cookie: 'sessionKey=sk-ant-one' },
+      { id: 'three', cookie: 'sessionKey=sk-ant-three', accountKey: 'sha256:one' },
+      { id: 'four', cookie: 'not-a-session-key' },
+      { id: '', cookie: 'sessionKey=sk-ant-no-id' },
+      null,
+      { id: 'five', cookie: 'sessionKey=sk-ant-five' }
+    ]),
+    [
+      { id: 'one', cookie: 'sessionKey=sk-ant-one', organizationId: 'org-1', accountKey: 'sha256:one', accountEmail: 'one@example.com', accountName: 'Org', accountLabel: 'Pro' },
+      { id: 'five', cookie: 'sessionKey=sk-ant-five', organizationId: '', accountKey: '', accountEmail: '', accountName: '', accountLabel: '' }
+    ]
+  );
+  assert.deepEqual(normalizeClaudeWebAccounts('sessionKey=sk-ant-one'), []);
 });

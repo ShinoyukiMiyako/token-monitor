@@ -1,0 +1,1369 @@
+'use strict';
+
+const os = require('node:os');
+const path = require('node:path');
+const {
+  EDGE_DOCK_METRICS,
+  createEdgeDockIntent,
+  edgeDockBubbleBounds,
+  edgeDockCellAt,
+  edgeDockCorridorBounds,
+  edgeDockFittingScale,
+  edgeDockHandleBounds,
+  edgeDockHandleZones,
+  edgeDockPeekBounds,
+  edgeDockPlacementForDrop,
+  edgeDockRailBounds,
+  edgeDockRefreshBounds,
+  edgeDockRefreshCorridor,
+  edgeDockScale,
+  edgeDockTriggerBounds,
+  normalizeEdgeDockCustomScale,
+  normalizeEdgeDockDisplayId,
+  normalizeEdgeDockMode,
+  normalizeEdgeDockOffset,
+  normalizeEdgeDockSide,
+  rectContains,
+  scaledEdgeDockMetrics
+} = require('./geometry');
+const { shapeRectsFromPolygons } = require('./mask');
+const { bubbleCommands, peekCommands, railCommands, refreshCommands, toPolygons, toSvgPath } = require('../renderer/edgeDock/shapes');
+
+const SURFACES = Object.freeze(['peek', 'rail', 'bubble']);
+const POLL_IDLE_MS = 90;
+const POLL_ACTIVE_MS = 40;
+const POLL_DRAG_MS = 16;
+// How often `alwaysExceptFullScreen` re-checks for a full-screen app. The macOS
+// Space transition itself takes longer than this, so a faster poll would only
+// spend window-list reads without making the dock react sooner.
+const FULL_SCREEN_POLL_MS = 500;
+const FADE_IN_MS = 150;
+const FADE_OUT_MS = 120;
+const REFRESH_RESULT_HOLD_MS = 900;
+const REFRESH_FADE_OUT_MS = 200;
+const FADE_STEP_MS = 16;
+const WAKE_TOPMOST_RETRY_MS = 500;
+
+function edgeDockSupported(platform = process.platform) {
+  return platform === 'darwin' || platform === 'win32';
+}
+
+function canUseEdgeDock(settings = {}, platform = process.platform) {
+  return edgeDockSupported(platform) && settings?.edgeDockEnabled === true;
+}
+
+// Owns the three dock windows and the cursor poll that drives them. The dock is
+// deliberately independent of the main window: it has its own non-activating
+// windows, so it never steals focus, never enters the app switcher, and works
+// the same whether the widget is a window, a tray popover or a floating bubble.
+//
+// Every surface is a frameless window whose silhouette (rail shoulders, card
+// tail) is drawn by the renderer from edgeDockShapes.js. On macOS the native
+// material behind it is clipped to the same silhouette through a mask. Windows
+// uses a transparent shaped window and lets the renderer paint the tint: both
+// DWM backdrop APIs paint the full BrowserWindow rectangle despite setShape().
+function createEdgeDockController(deps) {
+  const {
+    BrowserWindow,
+    ipcMain,
+    powerMonitor,
+    screen,
+    platform = process.platform,
+    rendererDir,
+    preloadPath,
+    getSettings,
+    nativeGlass,
+    // Returns `{ dark }` when the surfaces should use shaped Liquid Glass, or
+    // null for the classic masked vibrancy.
+    liquidGlass = () => null,
+    createGlass,
+    prefersReducedMotion = () => false,
+    onPlacementChange,
+    applyShapeMask,
+    primaryButtonDown = () => null,
+    onToggleRateMode,
+    onSwitchCodexAccount,
+    canRefreshLimits = () => false,
+    onRefreshLimits,
+    onOpenResetForecastSource,
+    performHaptic = () => false,
+    // (display) => whether another app is full screen on that display.
+    isFullScreen = () => false,
+    logger = () => {}
+  } = deps;
+
+  const windows = { peek: null, rail: null, bubble: null };
+  const ready = { peek: false, rail: false, bubble: false };
+  const fades = new Map();
+  const intent = createEdgeDockIntent();
+  let running = false;
+  let pollTimer = null;
+  let wakeTopmostTimer = null;
+  let cells = [];
+  let appearance = {};
+  let builtGlass = null;
+  let builtMaterial = null;
+  let bubbleCell = null;
+  let bubbleHeight = 0;
+  // The card the bubble window is currently sized and shaped for. The renderer
+  // measures a new card off-screen and only swaps it in once this matches, so a
+  // card never paints into a window still at the previous card's size.
+  let bubblePlaced = null;
+  let bubbleVisible = false;
+  let railVisible = false;
+  const refreshHapticTarget = Symbol('refresh');
+  let hapticTarget = null;
+  // How many times the rail has been revealed, as an event the page can key the
+  // entrance on. See revealRail: the page cannot derive this from `railVisible`,
+  // because the retract that takes the rail away never re-renders it.
+  let railReveal = 0;
+  // Whether the edge is offering its handle. Tracked for the same reason
+  // `railVisible` is: the handle's exit is an effect the page plays, so the
+  // payload has to be able to say which push is the one that takes it away.
+  let peeking = false;
+  // The pointer is near the resting handle, which draws it larger ahead of a
+  // reveal. The growth is the silhouette itself, so the mask and window region
+  // have to move with it: it is stepped here rather than left to a CSS
+  // transition, which could only animate the tint over a material already at
+  // its final size.
+  let peekNear = false;
+  let handleGrowth = 0;
+  let handleGrowthTimer = null;
+  let pointerOnHandle = false;
+  // Whether the Windows region is what clips the handle's hit test.
+  let peekRegionClips = false;
+  let peekMode = 'handle';
+  let peekPaintPending = false;
+  let peekTargetVisible = false;
+  let refreshVisible = false;
+  let refreshHovered = false;
+  let refreshInFlight = null;
+  let refreshInFlightWindow = null;
+  let refreshFeedbackUntil = 0;
+  let refreshFeedbackWindow = null;
+  let drag = null;
+  let placementOverride = null;
+  let fullScreen = false;
+  let fullScreenCheckedAt = -Infinity;
+  let ipcRegistered = false;
+  let displayListenersAttached = false;
+  const shapes = { peek: null, rail: null, bubble: null };
+  const nativeMaterial = { peek: false, rail: false, bubble: false };
+  const glasses = { peek: null, rail: null, bubble: null };
+  const lastSent = { peek: '', rail: '', bubble: '' };
+
+  function settings() {
+    return getSettings() || {};
+  }
+
+  function alwaysVisible() {
+    const mode = normalizeEdgeDockMode(settings().edgeDockMode);
+    return mode === 'always' || (mode === 'alwaysExceptFullScreen' && !fullScreen);
+  }
+
+  // Re-reads the full-screen state when the mode depends on it and the last
+  // read is stale; returns whether it changed.
+  function refreshFullScreen(now, force = false) {
+    const previous = fullScreen;
+    if (normalizeEdgeDockMode(settings().edgeDockMode) !== 'alwaysExceptFullScreen') {
+      fullScreen = false;
+      fullScreenCheckedAt = -Infinity;
+    } else if (force || now - fullScreenCheckedAt >= FULL_SCREEN_POLL_MS) {
+      fullScreenCheckedAt = now;
+      try {
+        fullScreen = isFullScreen(display()) === true;
+      } catch (error) {
+        logger(`[edge-dock] full-screen check failed: ${error.message}`);
+        fullScreen = false;
+      }
+    }
+    return fullScreen !== previous;
+  }
+
+  function syncAlwaysVisible() {
+    const always = alwaysVisible();
+    if (always === intent.snapshot().always) return;
+    applyEffects(intent.setAlways(always));
+    // Leaving always-visible behaves like a pointer that just left.
+    if (!always && !intent.snapshot().pinned) applyEffects(intent.retract());
+  }
+
+  function hapticsEnabled() {
+    return platform === 'darwin' && settings().edgeDockHaptic !== false;
+  }
+
+  function hapticTick(pattern, performanceTime = 'default') {
+    if (!hapticsEnabled()) return;
+    try { performHaptic(pattern, performanceTime); } catch (error) { logger(`[edge-dock] haptic feedback failed: ${error.message}`); }
+  }
+
+  function cellKinds() {
+    return cells.map((cell) => (cell.kind === 'stat' ? 'stat' : 'provider'));
+  }
+
+  function placement() {
+    if (placementOverride) return placementOverride;
+    const current = settings();
+    return {
+      side: normalizeEdgeDockSide(current.edgeDockSide),
+      offset: normalizeEdgeDockOffset(current.edgeDockOffset),
+      displayId: normalizeEdgeDockDisplayId(current.edgeDockDisplayId)
+    };
+  }
+
+  function display() {
+    try {
+      const displayId = normalizeEdgeDockDisplayId(placement().displayId);
+      if (displayId) {
+        const match = screen.getAllDisplays?.().find((entry) => String(entry.id) === displayId);
+        if (match) return match;
+      }
+      return screen.getPrimaryDisplay();
+    } catch (_) { return null; }
+  }
+
+  // The dock's own size, applied to its windows' geometry here and to their
+  // pages as a zoom factor, so a page lays out in the same units at any size.
+  // Lengths that cross between the two (card heights, the drag's grab offset)
+  // are kept in page units and converted at the window's edge. The size is the
+  // one asked for, or the largest that fits the display (edgeDockFittingScale).
+  let scaled = { key: '', scale: 1, metrics: EDGE_DOCK_METRICS };
+  // A size still being dragged on the Settings slider, shown but not yet saved.
+  let previewScale = null;
+  function requestedScale() {
+    return previewScale ?? edgeDockScale(settings());
+  }
+
+  function dockScale() {
+    const requested = requestedScale();
+    const workArea = display()?.workArea || null;
+    const kinds = cellKinds();
+    const key = `${requested}:${workArea?.height ?? ''}:${kinds.join(',')}`;
+    if (key !== scaled.key) {
+      const scale = edgeDockFittingScale({ workArea, cellKinds: kinds, scale: requested });
+      scaled = { key, scale, metrics: scale === scaled.scale ? scaled.metrics : scaledEdgeDockMetrics(scale) };
+    }
+    return scaled.scale;
+  }
+
+  function metrics() {
+    dockScale();
+    return scaled.metrics;
+  }
+
+  // The pages' zoom follows the size whenever the geometry is placed, since the
+  // fitted size moves with the cells and the display as well as the setting.
+  function syncPageZoom() {
+    const scale = dockScale();
+    for (const surface of SURFACES) {
+      const win = windows[surface];
+      if (alive(win) && win.webContents.getZoomFactor?.() !== scale) win.webContents.setZoomFactor(scale);
+    }
+  }
+
+  function maxCardHeight() {
+    const workArea = display()?.workArea;
+    return workArea ? Math.floor((workArea.height - EDGE_DOCK_METRICS.screenMargin * 2) / dockScale()) : null;
+  }
+
+  function layout() {
+    const current = display();
+    if (!current) return null;
+    const { side, offset } = placement();
+    const workArea = current.workArea;
+    const m = metrics();
+    const rail = edgeDockRailBounds({ workArea, side, offset, cellKinds: cellKinds(), metrics: m });
+    const peek = edgeDockPeekBounds({ workArea, side, railBounds: rail, metrics: m });
+    // The handle as drawn takes the pointer; the resting handle alone decides the
+    // fast reveal, so how soon the rail opens never depends on how far the
+    // handle has grown under the pointer.
+    const handle = edgeDockHandleBounds({ side, peekBounds: peek, handle: handleSize(), metrics: m });
+    const restingHandle = edgeDockHandleBounds({ side, peekBounds: peek, metrics: m });
+    const trigger = edgeDockTriggerBounds({ workArea, displayBounds: current.bounds, side, railBounds: rail, metrics: m });
+    const zones = edgeDockHandleZones({ side, peekBounds: peek, metrics: m });
+    const bubble = bubbleCell !== null
+      ? edgeDockBubbleBounds({ railBounds: rail, cellIndex: bubbleCell, height: Math.round(Math.min(bubbleHeight, maxCardHeight() ?? Infinity) * dockScale()), workArea, side, metrics: m })
+      : null;
+    const refresh = edgeDockRefreshBounds({ workArea, displayBounds: current.bounds, railBounds: rail, metrics: m });
+    return { side, workArea, rail, peek, handle, restingHandle, trigger, wake: zones?.wake || null, approach: zones?.approach || null, bubble, refresh };
+  }
+
+  function alive(win) {
+    return Boolean(win && !win.isDestroyed());
+  }
+
+  function send(surface, channel, payload) {
+    const win = windows[surface];
+    if (!alive(win) || !ready[surface]) return;
+    try { win.webContents.send(channel, payload); } catch (_) {}
+  }
+
+  function surfaceFor(sender) {
+    return SURFACES.find((surface) => alive(windows[surface]) && windows[surface].webContents === sender) || null;
+  }
+
+  function cancelFade(win) {
+    const timer = fades.get(win);
+    if (timer) clearInterval(timer);
+    fades.delete(win);
+  }
+
+  function fade(win, to, duration, done) {
+    if (!alive(win)) return;
+    cancelFade(win);
+    if (prefersReducedMotion() || duration <= 0) {
+      win.setOpacity(to);
+      done?.();
+      return;
+    }
+    const from = win.getOpacity();
+    const steps = Math.max(1, Math.round(duration / FADE_STEP_MS));
+    let step = 0;
+    const timer = setInterval(() => {
+      if (!alive(win)) { cancelFade(win); return; }
+      step += 1;
+      const t = step / steps;
+      const eased = 1 - Math.pow(1 - t, 3);
+      win.setOpacity(from + (to - from) * eased);
+      if (step >= steps) {
+        cancelFade(win);
+        done?.();
+      }
+    }, FADE_STEP_MS);
+    fades.set(win, timer);
+  }
+
+  // Surfaces are shown once and then only faded and made click-through, never
+  // hidden. A hidden window keeps its last frame and presents it for a moment
+  // when shown again, which read as a flash of stale content on every reveal.
+  function setVisible(surface, visible, duration) {
+    const win = windows[surface];
+    if (!alive(win)) return;
+    const ignore = !(visible && (surface !== 'peek' || peekTakesPointer()));
+    if (surface === 'peek') setPeekIgnoresMouse(win, ignore, visible);
+    else win.setIgnoreMouseEvents(ignore);
+    if (!win.isVisible()) {
+      win.setOpacity(0);
+      win.showInactive();
+      // Reassert native topmost after showInactive. The floating level can be
+      // demoted when Electron moves the HWND behind a non-topmost taskbar.
+      if (platform === 'win32') win.setAlwaysOnTop(true, 'pop-up-menu');
+    }
+    // The nested refresh circle overlaps the rail's transparent shoulder, but
+    // macOS still hit-tests that rail rectangle. Keep the action above it,
+    // including when the rail finishes loading after the refresh frame.
+    if (visible && peekMode === 'refresh' && !peekPaintPending
+      && (surface === 'peek' || (surface === 'rail' && refreshVisible))) {
+      windows.peek?.moveTop?.();
+    }
+    fade(win, visible ? 1 : 0, duration);
+  }
+
+  // The handle's own visibility, kept beside the fade it drives: the page plays the
+  // handle's exit on the transition, so the render has to run with the flag already
+  // flipped - and before the fade, while the window is still bright enough to show
+  // the motion it is playing.
+  function setPeekVisible(visible, duration) {
+    peeking = visible;
+    render('peek');
+    showPeekWindow(visible, duration);
+  }
+
+  // The handle's window is larger than the handle. On Windows its region clips
+  // the hit test to the handle, but macOS hit-tests the whole window rectangle
+  // whatever is painted in it, so the margin would take clicks meant for the app
+  // beneath. There the window passes the pointer through unless it is on the
+  // handle itself, with the pointer's moves forwarded so the page can report it
+  // arriving before the next cursor poll. Windows forwards through a system-wide
+  // mouse hook, so a Windows window left without its region falls back to the
+  // poll alone.
+  function peekTakesPointer() {
+    return peekMode !== 'handle' || peekRegionClips || pointerOnHandle;
+  }
+
+  function setPeekIgnoresMouse(win, ignore, shown) {
+    if (ignore && shown && peekMode === 'handle' && platform === 'darwin') win.setIgnoreMouseEvents(true, { forward: true });
+    else win.setIgnoreMouseEvents(ignore);
+  }
+
+  function syncPeekPointer() {
+    const win = windows.peek;
+    if (alive(win) && peekMode === 'handle' && peekTargetVisible && !peekPaintPending) setPeekIgnoresMouse(win, !peekTakesPointer(), true);
+  }
+
+  function setPointerOnHandle(on) {
+    if (on === pointerOnHandle) return;
+    pointerOnHandle = on;
+    syncPeekPointer();
+  }
+
+  // The handle's own reading of the pointer, shared by the cursor poll and the
+  // page's pointer reports so the two cannot disagree.
+  function trackHandlePointer(point, current) {
+    const revealed = intent.snapshot().revealed;
+    setPeekNear(!revealed && peekMode === 'handle' && rectContains(current.approach, point));
+    setPointerOnHandle(!revealed && rectContains(current.handle, point));
+  }
+
+  function setPeekNear(near) {
+    if (near === peekNear) return;
+    peekNear = near;
+    growHandle(near ? 1 : 0);
+  }
+
+  function stopHandleGrowth() {
+    clearInterval(handleGrowthTimer);
+    handleGrowthTimer = null;
+  }
+
+  // Eased like the window fades, on the same step.
+  function growHandle(target) {
+    stopHandleGrowth();
+    const placeHandle = () => {
+      if (peekMode === 'handle') placeSurface('peek', layout()?.peek);
+    };
+    if (prefersReducedMotion()) {
+      handleGrowth = target;
+      placeHandle();
+      return;
+    }
+    const from = handleGrowth;
+    const steps = Math.max(1, Math.round(FADE_IN_MS / FADE_STEP_MS));
+    let step = 0;
+    handleGrowthTimer = setInterval(() => {
+      step += 1;
+      handleGrowth = from + (target - from) * (1 - Math.pow(1 - step / steps, 3));
+      placeHandle();
+      if (step >= steps) stopHandleGrowth();
+    }, FADE_STEP_MS);
+  }
+
+  // Quarter-pixel steps: fine enough to read as continuous at 2x, coarse enough
+  // that the mask is not rebuilt for a change no display can show.
+  function handleSize() {
+    const m = metrics();
+    const lerp = (a, b) => Math.round((a + (b - a) * handleGrowth) * 4) / 4;
+    return { width: lerp(m.handleWidth, m.handleNearWidth), length: lerp(m.handleLength, m.handleNearLength) };
+  }
+
+  function showPeekWindow(visible, duration) {
+    peekTargetVisible = visible;
+    setVisible('peek', visible && !peekPaintPending, peekPaintPending ? 0 : duration);
+  }
+
+  function pageCellLayout(layout) {
+    if (!layout) return null;
+    const scale = dockScale();
+    if (scale === 1) return layout;
+    const toPage = (values) => values.map((value) => value / scale);
+    return { ...layout, tops: toPage(layout.tops), heights: toPage(layout.heights), length: layout.length / scale };
+  }
+
+  function renderPayload(surface) {
+    const { side } = placement();
+    const shapedGlass = nativeMaterial[surface] === true && glasses[surface] !== null
+      && (surface !== 'peek' || peekMode === 'refresh');
+    const base = { surface, side, platform, osRelease: os.release(), appearance, glass: nativeMaterial[surface] === true, liquidGlass: shapedGlass, shape: shapes[surface], zoom: dockScale() };
+    if (surface === 'rail') {
+      return {
+        ...base,
+        cells,
+        focusCellId: bubbleCell !== null ? cells[bubbleCell]?.id || null : null,
+        always: alwaysVisible(),
+        // The renderer plays the entrance when this count moves on, so a push that
+        // only repaints an already-visible rail does not replay it. It is a count
+        // rather than `railVisible` because only the reveal renders: the page would
+        // never be told about the retract, and would read the next reveal as no change.
+        reveal: railReveal,
+        cellLayout: pageCellLayout(layout()?.rail?.cells)
+      };
+    }
+    if (surface === 'bubble') {
+      return {
+        ...base,
+        cell: bubbleCell !== null ? cells[bubbleCell] || null : null,
+        placed: bubblePlaced,
+        maxCardHeight: maxCardHeight()
+      };
+    }
+    return { ...base, peeking, peekMode, refreshable: canRefreshLimits() === true };
+  }
+
+  // Stats arrive every few seconds and mostly change nothing a surface shows;
+  // re-rendering on each one rebuilt the card and made it flicker.
+  function render(surface) {
+    if (!ready[surface]) return;
+    const payload = renderPayload(surface);
+    const serialized = JSON.stringify(payload);
+    if (serialized === lastSent[surface]) return;
+    lastSent[surface] = serialized;
+    send(surface, 'edgeDock:render', payload);
+  }
+
+  function createSurface(surface, materialKey) {
+    const mac = platform === 'darwin';
+    const win32 = platform === 'win32';
+    const material = materialKey !== 'none';
+    const macMaterial = mac && material;
+    // A handle this narrow leaves no room for Liquid Glass's own bright edge
+    // highlight: it reads as a second edge beside the display's. The handle keeps
+    // the masked HUD material in both glass styles; the refresh button takes
+    // Liquid Glass when the peek window becomes one (setPeekMode).
+    const macGlass = materialKey === 'mac-glass' && surface !== 'peek';
+    nativeMaterial[surface] = macMaterial;
+    const win = new BrowserWindow({
+      width: surface === 'bubble' ? metrics().bubbleWidth : metrics().railWidth,
+      height: 80,
+      show: false,
+      frame: false,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      focusable: false,
+      alwaysOnTop: true,
+      // The macOS shadow follows the masked material; a transparent Windows
+      // window has no shape-aware shadow to offer.
+      hasShadow: macMaterial,
+      backgroundColor: '#00000000',
+      // DWM's Acrylic and Accent policies both paint the full native rectangle
+      // even after Electron applies a shaped region. Windows therefore keeps
+      // the transparent renderer-backed surface used by the no-glass mode.
+      transparent: true,
+      ...(win32 ? { thickFrame: false } : {}),
+      ...(mac ? { type: 'panel', acceptFirstMouse: true, roundedCorners: false } : {}),
+      // The macOS material stays attached for the window's lifetime rather than
+      // being detached while hidden: re-attaching builds a new effect view,
+      // which would silently drop the shape mask. The active state is set even
+      // for Liquid Glass, so a HUD fallback on these never-focused panels
+      // does not dim as an inactive window.
+      ...(macMaterial ? { visualEffectState: 'active', ...(macGlass ? {} : { vibrancy: 'hud' }) } : {}),
+      webPreferences: {
+        preload: preloadPath,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        backgroundThrottling: false,
+        zoomFactor: dockScale()
+      }
+    });
+    if (mac) {
+      win.setAlwaysOnTop(true, 'floating');
+      win.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+      win.setHiddenInMissionControl?.(true);
+    }
+    if (macGlass) {
+      try {
+        glasses[surface] = createGlass(win);
+      } catch (error) {
+        logger(`[edge-dock] ${surface} Liquid Glass unavailable: ${error.message}`);
+        win.setVibrancy?.('hud');
+      }
+    }
+    win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    win.webContents.on('will-navigate', (event) => event.preventDefault());
+    win.webContents.on('did-finish-load', () => {
+      ready[surface] = true;
+      lastSent[surface] = '';
+      render(surface);
+      if (surface !== 'peek') setVisible(surface, surface === 'rail' ? railVisible : bubbleVisible, 0);
+    });
+    win.on('closed', () => {
+      cancelFade(win);
+      if (windows[surface] === win) disposeGlass(surface, { windowClosed: true });
+      if (windows[surface] === win) {
+        windows[surface] = null;
+        ready[surface] = false;
+      }
+    });
+    win.loadFile(path.join(rendererDir, 'edgeDock', 'index.html'), { query: { surface, platform } })
+      .catch((error) => logger(`[edge-dock] ${surface} load failed: ${error.message}`));
+    return win;
+  }
+
+  function disposeGlass(surface, options) {
+    const glass = glasses[surface];
+    glasses[surface] = null;
+    try {
+      glass?.dispose(options);
+    } catch (error) {
+      logger(`[edge-dock] ${surface} Liquid Glass cleanup failed: ${error.message}`);
+    }
+  }
+
+  // The glass takes the silhouette itself, so it keeps its own rim and
+  // highlights along the real outline instead of being cut by a mask.
+  function shapeGlass(surface, commands, width, height) {
+    const glass = glasses[surface];
+    const wanted = liquidGlass();
+    try {
+      glass.update({ dark: wanted?.dark !== false, shape: { commands, width, height } });
+      return true;
+    } catch (error) {
+      logger(`[edge-dock] ${surface} Liquid Glass shape failed: ${error.message}`);
+      disposeGlass(surface);
+      windows[surface]?.setVibrancy?.('hud');
+      return false;
+    }
+  }
+
+  function destroyWindows() {
+    for (const surface of SURFACES) {
+      const win = windows[surface];
+      windows[surface] = null;
+      ready[surface] = false;
+      lastSent[surface] = '';
+      if (alive(win)) {
+        cancelFade(win);
+        disposeGlass(surface);
+        win.destroy();
+      }
+    }
+    railVisible = false;
+    peeking = false;
+    peekNear = false;
+    pointerOnHandle = false;
+    peekRegionClips = false;
+    stopHandleGrowth();
+    handleGrowth = 0;
+    peekMode = 'handle';
+    peekPaintPending = false;
+    peekTargetVisible = false;
+    refreshVisible = false;
+    refreshHovered = false;
+    bubbleVisible = false;
+    bubbleCell = null;
+    bubblePlaced = null;
+    builtGlass = null;
+    builtMaterial = null;
+    for (const surface of SURFACES) {
+      shapes[surface] = null;
+      nativeMaterial[surface] = false;
+    }
+  }
+
+  function commandsFor(surface, bounds, side) {
+    const m = metrics();
+    if (surface === 'bubble') {
+      return bubbleCommands({
+        width: bounds.width,
+        height: bounds.height,
+        side,
+        tail: m.bubbleTail,
+        tailY: bounds.tailY,
+        neck: m.bubbleNeck,
+        radius: m.bubbleRadius
+      });
+    }
+    if (surface === 'peek') {
+      if (peekMode === 'refresh') return refreshCommands(bounds);
+      const options = {
+        width: bounds.width,
+        height: bounds.height,
+        side,
+        handleWidth: handleSize().width,
+        handleLength: handleSize().length
+      };
+      return { closed: peekCommands(options), outline: peekCommands({ ...options, open: true }) };
+    }
+    const options = { width: bounds.width, height: bounds.height, side, shoulder: m.shoulder, radius: m.railRadius };
+    return { closed: railCommands(options), outline: railCommands({ ...options, open: true }) };
+  }
+
+  // Moves a surface and, when its silhouette changed, re-derives the shape: the
+  // mask is applied in the same tick as the bounds change so the material is
+  // never visible as a rectangle, and the renderer is re-rendered with the path.
+  function placeSurface(surface, bounds) {
+    const win = windows[surface];
+    if (!alive(win) || !bounds) return;
+    const { x, y, width, height } = bounds;
+    const previousBounds = win.getBounds();
+    if (previousBounds.x !== x || previousBounds.y !== y || previousBounds.width !== width || previousBounds.height !== height) {
+      win.setBounds({ x, y, width, height });
+    }
+    const { side } = placement();
+    const currentDisplay = display();
+    const displayKey = `${currentDisplay?.id ?? ''}:${currentDisplay?.scaleFactor ?? ''}`;
+    const key = `${displayKey}:${side}:${width}x${height}:${bounds.tailY ?? ''}:${surface === 'peek' ? `${peekMode}${peekMode === 'handle' ? `:${handleSize().width}x${handleSize().length}` : ''}` : ''}`;
+    if (shapes[surface]?.key === key) return;
+    const built = commandsFor(surface, bounds, side);
+    const closed = Array.isArray(built) ? built : built.closed;
+    const outline = Array.isArray(built) ? built : built.outline;
+    shapes[surface] = { key, width, height, d: toSvgPath(closed), outline: toSvgPath(outline) };
+    if (glasses[surface] && (surface !== 'peek' || peekMode === 'refresh') && shapeGlass(surface, closed, width, height)) {
+      // Shaped Liquid Glass needs no mask.
+    } else if (builtGlass && platform === 'darwin' && nativeMaterial[surface]) {
+      let masked = false;
+      try {
+        masked = applyShapeMask?.(win, closed, width, height, currentDisplay) === true;
+      } catch (error) {
+        logger(`[edge-dock] ${surface} mask failed: ${error.message}`);
+      }
+      if (!masked) {
+        nativeMaterial[surface] = false;
+        win.setVibrancy?.(null);
+        win.setHasShadow?.(false);
+        logger(`[edge-dock] ${surface} native material mask unavailable; showing the tinted silhouette only`);
+      }
+    } else if (platform === 'win32') {
+      let shaped = false;
+      try {
+        if (win.setShape) {
+          win.setShape(shapeRectsFromPolygons(toPolygons(closed), width, height));
+          shaped = true;
+        }
+      } catch (error) {
+        logger(`[edge-dock] ${surface} shape failed: ${error.message}`);
+      }
+      if (surface === 'peek' && shaped !== peekRegionClips) {
+        peekRegionClips = shaped;
+        syncPeekPointer();
+      }
+    }
+    render(surface);
+  }
+
+  function buildWindows() {
+    const glass = Boolean(nativeGlass());
+    const materialKey = !glass || platform !== 'darwin' ? 'none'
+      : liquidGlass() && createGlass ? 'mac-glass' : 'mac';
+    if (builtMaterial === materialKey && SURFACES.every((surface) => alive(windows[surface]))) return;
+    destroyWindows();
+    builtMaterial = materialKey;
+    builtGlass = materialKey !== 'none';
+    for (const surface of SURFACES) windows[surface] = createSurface(surface, materialKey);
+    intent.retract();
+    // An always-visible dock stays revealed across a rebuild; the new rail
+    // window picks this up when its page finishes loading.
+    railVisible = intent.snapshot().revealed;
+    showPeek();
+  }
+
+  function showPeek() {
+    const current = layout();
+    const peek = windows.peek;
+    if (!current || !alive(peek)) return;
+    if (railVisible) {
+      syncRefresh(current);
+      return;
+    }
+    setPeekMode('handle');
+    placeSurface('peek', current.peek);
+    // An always-visible rail has nothing to hide behind a handle, and a revealed
+    // rail is what the handle was hiding behind: a settings push that landed while
+    // the rail was open put the handle back on top of the cells.
+    setPeekVisible(!alwaysVisible() && !railVisible, FADE_IN_MS);
+  }
+
+  // Swap the hidden peek's role in place. Keep the native glass view retained
+  // across hovers, so changing role does not create another renderer or glass.
+  function setPeekMode(mode) {
+    if (peekMode === mode) return;
+    setVisible('peek', false, 0);
+    peekMode = mode;
+    // Wait for the reused renderer's new frame before revealing a different
+    // size and role. Native opacity alone could expose its old handle frame.
+    peekPaintPending = true;
+    peekTargetVisible = false;
+    peeking = false;
+    peekNear = false;
+    pointerOnHandle = false;
+    stopHandleGrowth();
+    handleGrowth = 0;
+    refreshVisible = false;
+    const win = windows.peek;
+    if (builtMaterial === 'mac-glass' && alive(win)) {
+      if (mode === 'refresh') {
+        win.setVibrancy?.(null);
+        nativeMaterial.peek = true;
+        try {
+          if (!glasses.peek) glasses.peek = createGlass(win);
+          glasses.peek.update({ dark: liquidGlass()?.dark !== false, visible: true });
+        } catch (error) {
+          logger(`[edge-dock] refresh Liquid Glass unavailable: ${error.message}`);
+          disposeGlass('peek');
+          win.setVibrancy?.('hud');
+        }
+      } else {
+        try { glasses.peek?.update({ dark: liquidGlass()?.dark !== false, visible: false }); }
+        catch { disposeGlass('peek'); }
+        win.setVibrancy?.('hud');
+        nativeMaterial.peek = true;
+      }
+    }
+  }
+
+  function refreshKeepsButtonVisible() {
+    return (Boolean(refreshInFlight) && windows.peek === refreshInFlightWindow)
+      || (Date.now() < refreshFeedbackUntil && windows.peek === refreshFeedbackWindow);
+  }
+
+  function syncRefresh(current = layout()) {
+    if (!current || !alive(windows.peek)) return;
+    const visible = settings().edgeDockRefreshEnabled === true
+      && railVisible && !drag && canRefreshLimits() === true
+      && (!alwaysVisible() || refreshHovered || refreshKeepsButtonVisible());
+    if (!visible) {
+      if (!windows.peek.isVisible() || refreshVisible) {
+        showPeekWindow(false, alwaysVisible() ? REFRESH_FADE_OUT_MS : FADE_OUT_MS);
+      }
+      refreshVisible = false;
+      if (settings().edgeDockRefreshEnabled !== true) {
+        refreshFeedbackUntil = 0;
+        refreshFeedbackWindow = null;
+      }
+      if (hapticTarget === refreshHapticTarget) hapticTarget = null;
+      return;
+    }
+    setPeekMode('refresh');
+    placeSurface('peek', current.refresh);
+    render('peek');
+    if (!refreshVisible) showPeekWindow(true, FADE_IN_MS);
+    refreshVisible = true;
+  }
+
+  function positionRail(current = layout()) {
+    if (!current || !alive(windows.rail)) return;
+    syncPageZoom();
+    placeSurface('rail', current.rail);
+    if (peekMode === 'handle' && !railVisible) placeSurface('peek', current.peek);
+    if (railVisible) syncRefresh(current);
+    if (bubbleCell !== null) placeBubble();
+  }
+
+  function revealRail(withHaptic = false) {
+    const rail = windows.rail;
+    if (!alive(rail)) return;
+    // The flag flips before the render so this payload is the one that carries
+    // the entrance; `entering` keeps the fade itself to the reveal.
+    const entering = !railVisible;
+    railVisible = true;
+    // Counted rather than reported as state, because the state has two edges and only
+    // one of them renders: `retractRail` fades the window out without re-rendering the
+    // page, so a page told the state alone still believes the rail is up and reads the
+    // next reveal as no change at all - which is what left the entrance playing once
+    // per page load. The count only moves on a real transition, so a hover that
+    // re-reveals an already-visible rail does not replay the slide.
+    if (entering) {
+      railReveal += 1;
+      hapticTarget = null;
+    }
+    render('rail');
+    positionRail();
+    if (entering) {
+      setVisible('rail', true, FADE_IN_MS);
+      if (withHaptic) hapticTick('generic');
+    }
+    if (peekMode === 'handle') setPeekVisible(false, 0);
+    syncRefresh();
+  }
+
+  function retractRail() {
+    const rail = windows.rail;
+    hideBubble();
+    if (!alive(rail) || !railVisible) {
+      showPeek();
+      return;
+    }
+    railVisible = false;
+    hapticTarget = null;
+    setVisible('rail', false, FADE_OUT_MS);
+    showPeek();
+  }
+
+  function showBubble(cellIndex) {
+    bubbleCell = cellIndex;
+    // Reopening the card that was last shown produces the same payload as the
+    // one already sent, which the render de-duplication would swallow, and then
+    // nothing would ever report a size to reveal it. Send it again, and reveal
+    // straight away when the window is already sized for this card.
+    lastSent.bubble = '';
+    render('bubble');
+    render('rail');
+    const cellId = cells[cellIndex]?.id;
+    if (cellId && bubblePlaced?.cellId === cellId) {
+      bubbleHeight = bubblePlaced.height;
+      placeBubble();
+    }
+    // Positioned and revealed once the renderer reports its content height, so
+    // the card never appears at a stale size or position.
+  }
+
+  function invalidateBubblePlacement() {
+    bubblePlaced = null;
+    bubbleHeight = 0;
+    lastSent.bubble = '';
+    if (!bubbleVisible) return;
+    bubbleVisible = false;
+    setVisible('bubble', false, 0);
+  }
+
+  function hideBubble() {
+    const bubble = windows.bubble;
+    const hadCell = bubbleCell !== null;
+    bubbleCell = null;
+    if (hadCell) render('rail');
+    if (!alive(bubble) || !bubbleVisible) return;
+    bubbleVisible = false;
+    setVisible('bubble', false, FADE_OUT_MS);
+  }
+
+  function placeBubble() {
+    const bubble = windows.bubble;
+    const current = layout();
+    if (!alive(bubble) || !current?.bubble || bubbleHeight <= 0 || !railVisible) return;
+    placeSurface('bubble', current.bubble);
+    if (!bubbleVisible) {
+      bubbleVisible = true;
+      setVisible('bubble', true, FADE_IN_MS);
+    }
+  }
+
+  function applyEffects(effects, options = {}) {
+    for (const effect of effects || []) {
+      if (effect.type === 'reveal') revealRail(options.hapticReveal === true);
+      else if (effect.type === 'retract') retractRail();
+      else if (effect.type === 'bubble') {
+        if (effect.cell === null) hideBubble();
+        else showBubble(effect.cell);
+      }
+    }
+  }
+
+  function schedulePoll() {
+    if (!running) return;
+    clearTimeout(pollTimer);
+    const snapshot = intent.snapshot();
+    // The approach zone is on the way to the handle, and only the poll lets the
+    // handle take the pointer, so it runs at the active rate from there on.
+    const delay = drag ? POLL_DRAG_MS : (snapshot.revealed || peekNear ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    pollTimer = setTimeout(poll, delay);
+  }
+
+  function poll() {
+    pollTimer = null;
+    if (!running) return;
+    try {
+      const point = screen.getCursorScreenPoint();
+      const current = layout();
+      // The renderer can miss the pointerup of a drag, because the window it is
+      // dragging moves out from under the captured pointer; the OS button
+      // state is the authoritative end of the gesture.
+      if (drag && primaryButtonDown() === false && Date.now() - drag.startedAt > 80) {
+        handleDragEnd();
+      } else if (current && drag) {
+        followDrag(point, current);
+      } else if (current) {
+        if (refreshFullScreen(Date.now())) {
+          syncAlwaysVisible();
+          showPeek();
+          render('rail');
+        }
+        const revealed = intent.snapshot().revealed;
+        const bubbleRect = bubbleVisible ? current.bubble : null;
+        const inRefresh = refreshVisible && rectContains(current.refresh, point);
+        const inRefreshCorridor = refreshVisible && rectContains(edgeDockRefreshCorridor(current.rail, current.refresh), point);
+        // On a full-height rail the button can share the bottom card's bounds.
+        // Give the action precedence and clear intent too, so returning to the
+        // same cell can open its card again after the normal hover delay.
+        if (inRefresh) {
+          intent.focusCell(null);
+          hideBubble();
+        }
+        const input = {
+          inTrigger: rectContains(current.trigger, point),
+          inPeek: !revealed && rectContains(current.restingHandle, point),
+          // Only with the button known to be up: a held one is a scrollbar or a
+          // selection being dragged past the handle, not a reach for it, and an
+          // unreadable state is treated as held.
+          inWake: !revealed && rectContains(current.wake, point) && primaryButtonDown() === false,
+          inRail: revealed && (rectContains(current.rail, point) || inRefresh || inRefreshCorridor),
+          inBubble: Boolean(bubbleRect && rectContains(bubbleRect, point)),
+          inCorridor: Boolean(bubbleRect && rectContains(edgeDockCorridorBounds(current.rail, bubbleRect), point)),
+          cellIndex: revealed ? edgeDockCellAt(point, current.rail, cells.length, metrics()) : null
+        };
+        // The refresh action shares the readouts' enter-once hover feedback.
+        const hoveredTarget = inRefresh
+          ? (!peekPaintPending && settings().edgeDockRefreshEnabled === true && canRefreshLimits() === true
+            ? refreshHapticTarget : null)
+          : (Number.isInteger(input.cellIndex) ? cells[input.cellIndex]?.id || null : null);
+        if (hoveredTarget !== hapticTarget) {
+          if (hoveredTarget) hapticTick('alignment', 'now');
+          hapticTarget = hoveredTarget;
+        }
+        trackHandlePointer(point, current);
+        applyEffects(intent.tick(input, Date.now()), { hapticReveal: !alwaysVisible() });
+        refreshHovered = input.inRail || input.inBubble || input.inCorridor;
+        syncRefresh(current);
+      }
+    } catch (error) {
+      logger(`[edge-dock] poll failed: ${error.message}`);
+    }
+    schedulePoll();
+  }
+
+  function followDrag(point, current) {
+    let targetDisplay;
+    try { targetDisplay = screen.getDisplayNearestPoint?.(point) || display(); } catch (_) { targetDisplay = display(); }
+    // Sized for the display the rail is landing on, which can fit a different
+    // size than the one it is leaving; the grab point is kept in page units so
+    // it stays under the pointer at either size.
+    const workArea = targetDisplay?.workArea || current.workArea;
+    const scale = edgeDockFittingScale({ workArea, cellKinds: cellKinds(), scale: requestedScale() });
+    const next = edgeDockPlacementForDrop({
+      workArea,
+      pointer: point,
+      grabOffsetY: drag.grabOffsetY * scale,
+      cellKinds: cellKinds(),
+      metrics: scaledEdgeDockMetrics(scale)
+    });
+    if (!next) return;
+    next.displayId = normalizeEdgeDockDisplayId(targetDisplay?.id);
+    const previous = placement();
+    const changedSide = next.side !== previous.side || next.displayId !== previous.displayId;
+    placementOverride = next;
+    positionRail();
+    if (changedSide) render('rail');
+  }
+
+  function handleDragStart(grabOffsetY) {
+    if (!railVisible) return;
+    drag = { grabOffsetY: Math.max(0, Number(grabOffsetY) || 0), startedAt: Date.now() };
+    placementOverride = placement();
+    hideBubble();
+    syncRefresh();
+    intent.tick({ dragging: true }, Date.now());
+    schedulePoll();
+  }
+
+  function handleDragEnd() {
+    if (!drag) return;
+    const final = placementOverride;
+    drag = null;
+    placementOverride = null;
+    if (final) {
+      try { onPlacementChange?.(final); } catch (error) { logger(`[edge-dock] placement save failed: ${error.message}`); }
+    }
+    positionRail();
+    render('rail');
+    render('peek');
+  }
+
+  function registerIpc() {
+    if (ipcRegistered) return;
+    ipcRegistered = true;
+    ipcMain.on('edgeDock:ready', (event) => {
+      const surface = surfaceFor(event.sender);
+      if (!surface) return;
+      ready[surface] = true;
+      render(surface);
+    });
+    // Clicks no longer pin the rail: that state had no clear meaning next to
+    // the always-visible mode, and its only trace was an unexplained bar. A
+    // click on the peek handle reveals the rail; a click on a cell opens its
+    // card at once; a click on the live-rate readout switches tok/s and TPM,
+    // the same toggle the widget's own rate readout offers.
+    ipcMain.on('edgeDock:click', (event, payload) => {
+      const surface = surfaceFor(event.sender);
+      if (surface === 'peek') {
+        if (peekMode !== 'handle') return;
+        applyEffects(intent.reveal(), { hapticReveal: !alwaysVisible() });
+        return;
+      }
+      if (surface !== 'rail') return;
+      const raw = payload?.cellIndex;
+      // A click on the rail's padding carries no cell; Number(null) would be 0.
+      const index = raw === null || raw === undefined ? NaN : Number(raw);
+      if (!Number.isInteger(index) || index < 0 || index >= cells.length) return;
+      if (cells[index]?.kind === 'stat' && cells[index]?.metric === 'liveRate') {
+        try { onToggleRateMode?.(); } catch (error) { logger(`[edge-dock] rate mode toggle failed: ${error.message}`); }
+        return;
+      }
+      if (bubbleCell !== index) {
+        intent.focusCell(index);
+        showBubble(index);
+      }
+    });
+    ipcMain.on('edgeDock:pointer', (event) => {
+      if (surfaceFor(event.sender) !== 'peek' || peekMode !== 'handle' || drag) return;
+      const current = layout();
+      if (current) trackHandlePointer(screen.getCursorScreenPoint(), current);
+    });
+    ipcMain.removeHandler('edgeDock:refreshLimits');
+    ipcMain.on('edgeDock:peekPainted', (event, payload) => {
+      if (surfaceFor(event.sender) !== 'peek' || !peekPaintPending
+        || payload?.mode !== peekMode || payload?.shapeKey !== shapes.peek?.key) return;
+      peekPaintPending = false;
+      setVisible('peek', peekTargetVisible, FADE_IN_MS);
+    });
+    ipcMain.handle('edgeDock:refreshLimits', async (event) => {
+      if (surfaceFor(event.sender) !== 'peek' || peekMode !== 'refresh' || !refreshVisible || peekPaintPending
+        || settings().edgeDockRefreshEnabled !== true || canRefreshLimits() !== true || !onRefreshLimits) return { ok: false, error: 'Not refreshable' };
+      // A rebuilt renderer can join the same backend request. Bind its busy and
+      // result visibility to the current window only after it requests the action.
+      refreshInFlightWindow = windows.peek;
+      if (!refreshInFlight) {
+        refreshFeedbackUntil = 0;
+        refreshFeedbackWindow = null;
+        refreshInFlight = Promise.resolve().then(() => onRefreshLimits())
+          .then((result) => {
+            if (result?.ok === true && running && windows.peek === refreshInFlightWindow
+              && settings().edgeDockRefreshEnabled === true) hapticTick('generic');
+            return result;
+          })
+          .catch((error) => ({ ok: false, error: error?.message || 'Refresh failed' }))
+          .finally(() => {
+            // Let the renderer's result be readable before an unhovered action fades out.
+            if (running && windows.peek === refreshInFlightWindow && alwaysVisible()
+              && settings().edgeDockRefreshEnabled === true) {
+              refreshFeedbackUntil = Date.now() + REFRESH_RESULT_HOLD_MS;
+              refreshFeedbackWindow = refreshInFlightWindow;
+            }
+            refreshInFlight = null;
+            refreshInFlightWindow = null;
+          });
+      }
+      return refreshInFlight;
+    });
+    ipcMain.on('edgeDock:dragStart', (event, payload) => {
+      if (surfaceFor(event.sender) !== 'rail') return;
+      handleDragStart(payload?.grabOffsetY);
+    });
+    ipcMain.on('edgeDock:dragEnd', (event) => {
+      if (surfaceFor(event.sender) !== 'rail') return;
+      handleDragEnd();
+    });
+    ipcMain.on('edgeDock:bubbleSize', (event, payload) => {
+      if (surfaceFor(event.sender) !== 'bubble') return;
+      const cellId = String(payload?.cellId || '');
+      if (bubbleCell === null || cells[bubbleCell]?.id !== cellId) return;
+      const height = Math.round(Number(payload?.height));
+      if (!Number.isFinite(height) || height <= 0) return;
+      const maxHeight = Math.max(40, maxCardHeight() ?? 720);
+      bubbleHeight = Math.min(height, maxHeight);
+      // Store the clamped height: reopening this card restores it verbatim, so
+      // keeping the raw value here would place a card taller than the work area.
+      bubblePlaced = { cellId, height: bubbleHeight };
+      placeBubble();
+      render('bubble');
+    });
+    ipcMain.on('edgeDock:toggleRateMode', (event) => {
+      if (surfaceFor(event.sender) !== 'bubble') return;
+      try { onToggleRateMode?.(); } catch (error) { logger(`[edge-dock] rate mode toggle failed: ${error.message}`); }
+    });
+    // The card's Switch button, the one action the dock can take that is not
+    // about its own geometry. The main process owns the credential swap and
+    // re-projects the cards as soon as the credential swap lands; quota refresh
+    // continues in the background. The renderer only reports intent and gets
+    // the swap outcome back so the button can leave its in-flight label.
+    ipcMain.removeHandler('edgeDock:switchCodexAccount');
+    ipcMain.handle('edgeDock:switchCodexAccount', async (event, payload) => {
+      if (surfaceFor(event.sender) !== 'bubble') return { ok: false, error: 'Unknown surface' };
+      const accountId = String(payload?.accountId || '').trim();
+      if (!accountId) return { ok: false, error: 'Missing account' };
+      try {
+        const result = await onSwitchCodexAccount?.(accountId);
+        return {
+          ok: result?.ok !== false,
+          error: result?.error || ''
+        };
+      } catch (error) {
+        logger(`[edge-dock] codex account switch failed: ${error.message}`);
+        return { ok: false, error: error?.message || 'Switch failed' };
+      }
+    });
+    // The forecast row on the card is the Limits page's row, link and all. The
+    // renderer reports the intent rather than a URL, so the dock's bridge stays
+    // a list of named actions instead of gaining a general "open anything" verb.
+    ipcMain.on('edgeDock:openResetForecastSource', (event) => {
+      if (surfaceFor(event.sender) !== 'bubble') return;
+      try { onOpenResetForecastSource?.(); } catch (error) {
+        logger(`[edge-dock] opening the reset forecast source failed: ${error.message}`);
+      }
+    });
+    ipcMain.on('edgeDock:dismiss', (event) => {
+      if (!surfaceFor(event.sender)) return;
+      applyEffects(intent.retract());
+    });
+  }
+
+  function onDisplayChange() {
+    if (!running) return;
+    if (bubbleCell !== null) invalidateBubblePlacement();
+    positionRail();
+    if (bubbleCell !== null) render('bubble');
+    // The dock may now sit on another display (a removed one falls back to the
+    // primary), so the cached full-screen state can describe the wrong screen.
+    if (refreshFullScreen(Date.now(), true)) {
+      syncAlwaysVisible();
+      render('rail');
+    }
+    if (!railVisible) showPeek();
+  }
+
+  function attachDisplayListeners() {
+    if (displayListenersAttached) return;
+    displayListenersAttached = true;
+    for (const event of ['display-metrics-changed', 'display-added', 'display-removed']) {
+      screen.on(event, onDisplayChange);
+    }
+  }
+
+  function start() {
+    if (running) {
+      buildWindows();
+      return;
+    }
+    running = true;
+    if (platform === 'win32') {
+      powerMonitor?.on('resume', onWake);
+    }
+    registerIpc();
+    attachDisplayListeners();
+    buildWindows();
+    schedulePoll();
+  }
+
+  // These windows stay shown at opacity zero between reveals. A wake can leave
+  // them behind ordinary windows, so the first-show repair never runs again.
+  // Restore the native level and stacking without changing content or focus.
+  function restoreWindowsTopmost() {
+    if (!running) return;
+    // The refresh button uses peek and must stay above the rail's shoulder.
+    const surfaces = refreshVisible && !peekPaintPending ? ['rail', 'bubble', 'peek'] : SURFACES;
+    for (const surface of surfaces) {
+      const win = windows[surface];
+      if (!alive(win)) continue;
+      try {
+        win.setAlwaysOnTop(true, 'pop-up-menu');
+      } catch (error) {
+        logger(`[edge-dock] ${surface} wake topmost restore failed: ${error.message}`);
+      }
+    }
+  }
+
+  function onWake() {
+    clearTimeout(wakeTopmostTimer);
+    restoreWindowsTopmost();
+    // The shell can finish restoring windows after the power event. One bounded
+    // follow-up also coalesces repeated resume events; no permanent raise loop.
+    wakeTopmostTimer = setTimeout(() => {
+      wakeTopmostTimer = null;
+      restoreWindowsTopmost();
+    }, WAKE_TOPMOST_RETRY_MS);
+  }
+
+  function stop() {
+    running = false;
+    if (platform === 'win32') {
+      powerMonitor?.removeListener('resume', onWake);
+    }
+    clearTimeout(wakeTopmostTimer);
+    wakeTopmostTimer = null;
+    refreshFeedbackUntil = 0;
+    refreshFeedbackWindow = null;
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    drag = null;
+    placementOverride = null;
+    intent.retract();
+    fullScreen = false;
+    fullScreenCheckedAt = -Infinity;
+    destroyWindows();
+  }
+
+  return {
+    // Shows a custom size while its slider is dragged; the save that follows
+    // the release goes through sync(), which drops the preview.
+    previewScale(scale) {
+      previewScale = scale === null || scale === undefined ? null : normalizeEdgeDockCustomScale(scale);
+      if (!running) return;
+      positionRail();
+      if (!railVisible) showPeek();
+      for (const surface of SURFACES) render(surface);
+    },
+    // Settings changed: start, stop, rebuild for a material change, or move.
+    sync() {
+      previewScale = null;
+      if (!canUseEdgeDock(settings(), platform)) {
+        if (running) stop();
+        return;
+      }
+      start();
+      syncPageZoom();
+      refreshFullScreen(Date.now(), true);
+      syncAlwaysVisible();
+      if (!drag) {
+        positionRail();
+        showPeek();
+      }
+      for (const surface of SURFACES) render(surface);
+    },
+    setCells(nextCells) {
+      const next = Array.isArray(nextCells) ? nextCells : [];
+      if (JSON.stringify(next) === JSON.stringify(cells)) return;
+      const previousCells = cells;
+      const focusedId = bubbleCell !== null ? previousCells[bubbleCell]?.id || null : null;
+      const placedId = bubblePlaced?.cellId || null;
+      const previous = cells.map((cell) => cell.id).join(',');
+      cells = next;
+      if (!running) return;
+      const structural = previous !== cells.map((cell) => cell.id).join(',');
+      if (placedId) {
+        const before = previousCells.find((cell) => cell.id === placedId);
+        const after = cells.find((cell) => cell.id === placedId);
+        const contentChanged = JSON.stringify(before) !== JSON.stringify(after);
+        // Keep an open card visible while its replacement is measured in the
+        // renderer's hidden staging layer. The old placed height lets equal-size
+        // updates commit immediately; a changed height is reported back and the
+        // window is resized before the new card is swapped in. Clearing the
+        // placement here made every quota refresh blink, and made a Codex
+        // account switch blink twice (optimistic account, then refreshed quota).
+        if (contentChanged && !(bubbleVisible && focusedId === placedId)) {
+          invalidateBubblePlacement();
+        }
+      }
+      if (focusedId) {
+        const nextIndex = cells.findIndex((cell) => cell.id === focusedId);
+        if (nextIndex < 0) {
+          intent.focusCell(null);
+          invalidateBubblePlacement();
+          hideBubble();
+        } else {
+          bubbleCell = nextIndex;
+          intent.focusCell(nextIndex);
+        }
+      } else if (structural) {
+        intent.focusCell(null);
+      }
+      if (structural && !drag) positionRail();
+      if (!structural && !railVisible) return;
+      render('rail');
+      if (bubbleCell !== null) render('bubble');
+    },
+    setAppearance(nextAppearance) {
+      appearance = nextAppearance || {};
+      if (!running) return;
+      const wanted = liquidGlass();
+      for (const surface of SURFACES) {
+        try {
+          glasses[surface]?.update({ dark: wanted?.dark !== false, visible: surface !== 'peek' || peekMode === 'refresh' });
+        } catch (error) {
+          logger(`[edge-dock] ${surface} Liquid Glass appearance failed: ${error.message}`);
+        }
+      }
+      for (const surface of SURFACES) render(surface);
+    },
+    isRunning: () => running,
+    owns: (win) => Boolean(win) && SURFACES.some((surface) => windows[surface] === win),
+    stop
+  };
+}
+
+module.exports = {
+  canUseEdgeDock,
+  createEdgeDockController,
+  edgeDockSupported
+};

@@ -1,22 +1,57 @@
 'use strict';
 
-const clientLabels = { claude: 'Claude Code', codex: 'Codex', hermes: 'Hermes Agent', gemini: 'Gemini', cursor: 'Cursor', opencode: 'OpenCode', openclaw: 'OpenClaw', antigravity: 'Antigravity', cline: 'Cline', kimi: 'Kimi', qwen: 'Qwen', grok: 'Grok Build', copilot: 'GitHub Copilot', pi: 'Pi', zed: 'Zed', kilocode: 'Kilo Code', commandcode: 'Command Code', micode: 'MiMo Code', zcode: 'ZCode', kiro: 'Kiro', codebuddy: 'CodeBuddy', workbuddy: 'WorkBuddy', proma: 'Proma', qodercn: 'Qoder CN', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', cherrystudio: 'Cherry Studio' };
-const reasonixSessionGuard = window.TokenMonitorReasonixSessionGuard;
+// Client identity — ids, labels and display order — comes from the shared
+// catalog (loaded as a script before this file). Destructured to the bare
+// names the call sites below already use.
+const {
+  CLIENT_LABELS: clientLabels,
+  KNOWN_CLIENT_LIST: KNOWN_CLIENTS
+} = window.TokenMonitorClientCatalog;
+// Limits provider identity comes from its own shared catalog, bound here rather
+// than at its first use below because the icon tables are derived from it.
+const { LIMIT_PROVIDER_CATALOG: LIMIT_PROVIDERS, LIMIT_PROVIDER_IDS } = window.TokenMonitorLimitProviders;
+const limitAccountPanelsApi = window.TokenMonitorLimitAccountPanels;
+const limitUsageItemsApi = window.TokenMonitorLimitUsageItems;
+const accountShellApi = window.TokenMonitorAccountShell;
+const accountProfileRequests = accountShellApi.createRequestGuard();
+const accountProfileStatuses = accountShellApi.createRequestGuard();
+const accountProfileSaves = accountShellApi.createBusyGuard();
+const accountShellErrors = Object.create(null);
+let syncContentForm = null;
+
+function setAccountShellError(id, message) {
+  accountShellErrors[id] = message || '';
+  renderAccountShellError(id);
+}
+
+function renderAccountShellError(id) {
+  accountShellApi.render({
+    error: document.getElementById(`${id}ErrorMessage`),
+    errorText: accountShellErrors[id] || ''
+  });
+}
 const { clientColors, fallbackModelColors, modelVendorFor, modelColor } = window.TokenMonitorUsageCharts;
 const motionPreferenceApi = window.TokenMonitorMotionPreference;
 const windowsGlassApi = window.TokenMonitorWindowsGlass;
+const macBackdropApi = window.TokenMonitorMacBackdropMode;
 const glassRenderingApi = window.TokenMonitorGlassRendering;
 const fontSettingsApi = window.TokenMonitorFontSettings;
 const wslStatusPresentationApi = window.TokenMonitorWslStatusPresentation;
 const statsRenderSchedulerApi = window.TokenMonitorStatsRenderScheduler;
+const allTimeSessionsApi = window.TokenMonitorAllTimeSessions;
 const tokenRateApi = window.TokenMonitorTokenRate;
 const { tokenRatePerSecond, tokenBurnPerMinute } = tokenRateApi;
 const reducedMotionMedia = window.matchMedia?.('(prefers-reduced-motion: reduce)');
-const clientsWithIcon = new Set([
-  'claude', 'codex', 'gemini', 'cursor', 'opencode', 'openclaw', 'hermes', 'antigravity', 'cline', 'kimi', 'qwen', 'grok', 'copilot', 'pi', 'zed', 'kilocode', 'commandcode', 'micode', 'zcode', 'kiro', 'codebuddy', 'workbuddy', 'proma', 'qodercn', 'reasonix', 'dsh', 'cherrystudio',
-  'xai', 'openrouter', 'deepseek', 'meta', 'mistral', 'qwen', 'moonshot', 'zai', 'zaiteam', 'cohere', 'xiaomi', 'mimo', 'minimax', 'doubao', 'volcengine', 'qoder', 'trae', 'ollama', 'thirdparty', 'hunyuan'
-]);
-const limitMarksWithIcon = new Set([...clientsWithIcon, 'newapi', 'sub2api']);
+const vendorPresentationApi = window.TokenMonitorVendorPresentation;
+// Marks come from the vendor presentation table, which is also what installs
+// the .row-icon-<id> masks, so a listed id always has a mask behind it. Usage
+// rows (clients, sessions, models) carry the coloured vendors; Limits rows can
+// also show the marks that have no colour of their own (Factory, the relays).
+const clientsWithIcon = new Set(vendorPresentationApi.VENDOR_IDS);
+const limitMarksWithIcon = new Set(vendorPresentationApi.MARK_IDS);
+
+// Modes whose device list is shared with other machines; only these can remove one.
+const SHARED_SYNC_MODES = new Set(['client', 'host', 'icloud']);
 
 function osIconFor(platform) {
   const prefix = String(platform || '').toLowerCase().split('-')[0];
@@ -33,6 +68,11 @@ function iconKindFor(rowData, breakdown) {
     return os ? { kind: 'icon', iconClass: `row-icon-os-${os}` } : { kind: 'dot' };
   }
   if (breakdown === 'model') {
+    if (rowData.key === 'unknown') {
+      return rowData.modelSource === 'codex'
+        ? { kind: 'icon', iconClass: 'row-icon-codex' }
+        : { kind: 'dot' };
+    }
     const vendor = modelVendorFor(rowData.key);
     return vendor && clientsWithIcon.has(vendor)
       ? { kind: 'icon', iconClass: `row-icon-${vendor}` }
@@ -50,100 +90,21 @@ function iconKindFor(rowData, breakdown) {
     : { kind: 'dot' };
 }
 
-const KNOWN_CLIENTS = [
-  { id: 'claude', label: 'Claude Code' },
-  { id: 'codex', label: 'Codex' },
-  { id: 'opencode', label: 'OpenCode' },
-  { id: 'hermes', label: 'Hermes Agent' },
-  { id: 'openclaw', label: 'OpenClaw' },
-  { id: 'cursor', label: 'Cursor' },
-  { id: 'antigravity', label: 'Antigravity' },
-  { id: 'cline', label: 'Cline' },
-  { id: 'kimi', label: 'Kimi' },
-  { id: 'qwen', label: 'Qwen' },
-  { id: 'grok', label: 'Grok Build' },
-  { id: 'copilot', label: 'GitHub Copilot' },
-  { id: 'pi', label: 'Pi' },
-  { id: 'zed', label: 'Zed' },
-  { id: 'kilocode', label: 'Kilo Code' },
-  { id: 'commandcode', label: 'Command Code' },
-  { id: 'micode', label: 'MiMo Code' },
-  { id: 'zcode', label: 'ZCode' },
-  { id: 'kiro', label: 'Kiro' },
-  { id: 'codebuddy', label: 'CodeBuddy' },
-  { id: 'workbuddy', label: 'WorkBuddy' },
-  { id: 'proma', label: 'Proma' },
-  { id: 'qodercn', label: 'Qoder CN' },
-  { id: 'reasonix', label: 'Reasonix' },
-  { id: 'dsh', label: 'DeepSeek Harness' },
-  { id: 'cherrystudio', label: 'Cherry Studio' }
-];
-const LIMIT_PROVIDERS = [
-  { id: 'claude', label: 'Claude', settingsLabel: 'Claude Code' },
-  { id: 'codex', label: 'Codex' },
-  { id: 'opencode', label: 'OpenCode' },
-  { id: 'cursor', label: 'Cursor' },
-  { id: 'antigravity', label: 'Antigravity' },
-  { id: 'kimi', label: 'Kimi' },
-  { id: 'grok', label: 'Grok' },
-  { id: 'copilot', label: 'GitHub Copilot' },
-  { id: 'commandcode', label: 'Command Code' },
-  { id: 'mimo', label: 'MiMo' },
-  { id: 'zai', label: 'GLM' },
-  { id: 'zaiteam', label: 'GLM Team' },
-  { id: 'kiro', label: 'Kiro' },
-  { id: 'workbuddy', label: 'WorkBuddy' },
-  { id: 'qoder', label: 'Qoder' },
-  { id: 'deepseek', label: 'DeepSeek' },
-  { id: 'openrouter', label: 'OpenRouter' },
-  { id: 'minimax', label: 'Minimax' },
-  { id: 'volcengine', label: 'Volcengine' },
-  { id: 'ollama', label: 'Ollama' },
-  { id: 'trae', label: 'Trae CN' },
-  { id: 'thirdparty', label: 'Third-party APIs' }
-];
-const LIMIT_PROVIDER_ACCOUNT_GROUP_IDS = {
-  claude: 'claudeAccountGroup',
-  codex: 'codexAccountGroup',
-  opencode: 'opencodeCookieGroup',
-  cursor: 'cursorAccountGroup',
-  kimi: 'kimiAccountGroup',
-  copilot: 'copilotAccountGroup',
-  mimo: 'mimoAccountGroup',
-  zai: 'zaiAccountGroup',
-  zaiteam: 'zaiteamAccountGroup',
-  deepseek: 'deepseekAccountGroup',
-  openrouter: 'openrouterAccountGroup',
-  minimax: 'minimaxAccountGroup',
-  volcengine: 'volcengineAccountGroup',
-  qoder: 'qoderAccountGroup',
-  trae: 'traeAccountGroup',
-  commandcode: 'commandcodeAccountGroup',
-  ollama: 'ollamaAccountGroup',
-  thirdparty: 'thirdpartyAccountGroup'
-};
-const LIMIT_PROVIDER_ACCOUNT_STATUS_IDS = {
-  claude: 'claudeAccountStatus',
-  codex: 'codexAccountStatus',
-  opencode: 'opencodeCookieStatus',
-  cursor: 'cursorAccountStatus',
-  kimi: 'kimiAccountStatus',
-  copilot: 'copilotApiTokenStatus',
-  mimo: 'mimoAccountStatus',
-  zai: 'zaiAccountStatus',
-  zaiteam: 'zaiteamAccountStatus',
-  deepseek: 'deepseekApiKeyStatus',
-  openrouter: 'openrouterStatus',
-  minimax: 'minimaxApiKeyStatus',
-  volcengine: 'volcengineAccountStatus',
-  qoder: 'qoderAccountStatus',
-  trae: 'traeAccountStatus',
-  commandcode: 'commandcodeAccountStatus',
-  ollama: 'ollamaAccountStatus',
-  thirdparty: 'thirdpartyStatus'
+const LIMIT_PROVIDER_ACCOUNT_NODES = {
+  codex: { group: 'codexAccountGroup', status: 'codexAccountStatus' },
+  opencode: { group: 'opencodeCookieGroup', status: 'opencodeCookieStatus' },
+  cursor: { group: 'cursorAccountGroup', status: 'cursorAccountStatus' },
+  antigravity: { group: 'antigravityAccountGroup', status: 'antigravityAccountStatus' },
+  kimi: { group: 'kimiAccountGroup', status: 'kimiAccountStatus' },
+  copilot: { group: 'copilotAccountGroup', status: 'copilotApiTokenStatus' },
+  mimo: { group: 'mimoAccountGroup', status: 'mimoAccountStatus' },
+  openrouter: { group: 'openrouterAccountGroup', status: 'openrouterStatus' },
+  volcengine: { group: 'volcengineAccountGroup', status: 'volcengineAccountStatus' },
+  thirdparty: { group: 'thirdpartyAccountGroup', status: 'thirdpartyStatus' }
 };
 const LIMIT_PROVIDER_CONNECTION_DETAIL_KEYS = {
   antigravity: 'settings.limits.connection.antigravity',
+  cline: 'settings.limits.connection.cline',
   grok: 'settings.limits.connection.grok',
   kiro: 'settings.limits.connection.kiro',
   workbuddy: 'settings.limits.connection.workbuddy'
@@ -152,8 +113,13 @@ const TRAY_ICON_VARIANTS = [
   { id: 'claude-brand', label: 'Claude', after: 'claude' },
   { id: 'chatgpt', label: 'ChatGPT', after: 'codex' }
 ];
+// The ids the tray has artwork for. Providers are derived for the same reason as
+// above and had drifted from it: Alibaba Cloud was added to the mark set but not
+// here, so the picker previewed its logo from the svg while the tray itself,
+// which draws only what deliverTrayProviderIcons rasterized, fell back to "A".
 const trayIconProviderIds = new Set([
   ...clientsWithIcon,
+  ...LIMIT_PROVIDER_IDS,
   ...TRAY_ICON_VARIANTS.map((provider) => provider.id)
 ]);
 const TRAY_ICON_PROVIDERS = [
@@ -170,6 +136,22 @@ const TRAY_ICON_PROVIDERS = [
 const DEFAULT_LIMIT_PROVIDER_ORDER = LIMIT_PROVIDERS.map((provider) => provider.id).join(',');
 const limitProviderOrderApi = window.TokenMonitorLimitProviderOrder;
 const limitProviderPresentationApi = window.TokenMonitorLimitProviderPresentation;
+const codexAccountControlApi = window.TokenMonitorCodexAccountControl;
+
+function limitProviderColor(providerId) {
+  if (providerId === 'factory') return clientColors.droid;
+  return clientColors[providerId] || clientColors.default;
+}
+const limitResetMotionApi = window.TokenMonitorLimitResetMotion;
+const limitResetAnimator = window.TokenMonitorLimitResetAnimator.createLimitResetAnimator({
+  document,
+  motion: limitResetMotionApi,
+  prefersReducedMotion: () => prefersReducedMotion(),
+  formatPercent: (value) => formatPercent(value),
+  requestAnimationFrame: (frame) => requestAnimationFrame(frame),
+  cancelAnimationFrame: (handle) => cancelAnimationFrame(handle),
+  performance
+});
 const accountIdentityApi = window.TokenMonitorAccountIdentity;
 const clientStatusPresentationApi = window.TokenMonitorClientStatusPresentation;
 const clientHealthPresentationApi = window.TokenMonitorClientHealthPresentation;
@@ -177,31 +159,38 @@ const clientSourceCacheApi = window.TokenMonitorClientSourceCache;
 const clientRescanStateApi = window.TokenMonitorClientRescanState;
 const serviceStatusPresentationApi = window.TokenMonitorServiceStatusPresentation;
 const clientDisplayPreferencesApi = window.TokenMonitorClientDisplayPreferences;
+const settingsListFilterApi = window.TokenMonitorSettingsListFilter;
 const customPricingFormApi = window.TokenMonitorCustomPricingForm;
 const viewDisplayPreferencesApi = window.TokenMonitorViewDisplayPreferences;
-const preferenceDragSortApi = window.TokenMonitorPreferenceDragSort;
 const verticalDragSortApi = window.TokenMonitorVerticalDragSort;
 const rowDragControllerApi = window.TokenMonitorRowDragController;
 const homeOverviewApi = window.TokenMonitorHomeOverview;
 const homeModulePreferencesApi = window.TokenMonitorHomeModulePreferences;
 const fixedPeriodRangesApi = window.TokenMonitorFixedPeriodRanges;
 const hubBuildPresentationApi = window.TokenMonitorHubBuildPresentation;
+const syncDevicePanelApi = window.TokenMonitorSyncDevicePanel;
 const { limitFillPercent, limitModeSuffix } = window.TokenMonitorLimitDisplayMode;
 const i18n = window.TokenMonitorI18n;
 const currencyApi = window.TokenMonitorCurrency;
 const subscriptionApi = window.TokenMonitorSubscriptionDisplay;
+// What a recorded subscription reads. Shared with the Limits view, which builds
+// the same sentences into the plan cell's tooltip — so this page and that one
+// cannot describe one record two ways.
+const subscriptionText = window.TokenMonitorSubscriptionText;
 const compactTokenApi = window.TokenMonitorCompactTokens;
 const trayLayoutApi = window.TokenMonitorTrayLayout;
 const sessionRowsApi = window.TokenMonitorSessionRows;
 const breakdownRenderPolicyApi = window.TokenMonitorBreakdownRenderPolicy;
 const {
-  createAfterLayoutScheduler,
-  isLargeSessionBreakdown,
+  barScaleMax,
+  breakdownPage,
   rowRenderFingerprint,
+  rowWidth,
   shouldAnimateBreakdownRows,
   toolIconsEnabled
 } = breakdownRenderPolicyApi;
 const deviceBreakdownApi = window.TokenMonitorDeviceBreakdown;
+const toolDetailsApi = window.TokenMonitorToolDetails;
 const usageAttributionRowsApi = window.TokenMonitorUsageAttributionRows;
 const projectRowsApi = window.TokenMonitorProjectRows;
 const sessionDetailApi = window.TokenMonitorSessionDetail;
@@ -209,7 +198,6 @@ const windowShortcutApi = window.TokenMonitorWindowShortcut;
 const LIMIT_REFRESH_OPTIONS = [60000, 120000, 300000, 900000, 1800000];
 const WINDOW_BEHAVIOR_VALUES = ['floating', 'normal', 'desktop'];
 const WINDOW_BEHAVIOR_ICONS = { floating: '⇧', normal: '○', desktop: '⇩' };
-const LIMIT_SOURCE_LABELS = { oauth: 'OAuth', cli: 'CLI', web: 'Web', rpc: 'RPC', local: 'Local', api: 'API' };
 const LIMIT_CAPABILITY_TAG_KEYS = {
   Auto: 'settings.limits.capability.auto',
   'OAuth/CLI': 'settings.limits.capability.oauthCli',
@@ -246,6 +234,7 @@ const LIMIT_CAPABILITY_TAG_KEYS = {
   'Sign in again': 'settings.limits.status.signInAgain',
   'Run grok login': 'settings.limits.status.runGrokLogin',
   'Run kiro-cli login': 'settings.limits.status.runKiroLogin',
+  'Open Cline': 'settings.limits.status.openCline',
   'Re-login': 'settings.limits.status.relogin',
   Limited: 'settings.limits.status.limited',
   'Usage API limited': 'settings.limits.status.usageApiLimited',
@@ -258,22 +247,23 @@ const deviceStaleColor = '#8c97a7';
 const baseBreakdownOrder = ['tool', 'device', 'model', 'project', 'session'];
 const VIEW_DISPLAY_OPTIONS = [
   { id: 'home', labelKey: 'views.home' },
+  { id: 'limits', labelKey: 'views.limits' },
   { id: 'tool', labelKey: 'views.tool' },
-  { id: 'status', labelKey: 'views.status' },
-  { id: 'device', labelKey: 'views.device' },
   { id: 'model', labelKey: 'views.model' },
   { id: 'project', labelKey: 'views.project' },
   { id: 'session', labelKey: 'views.session' },
-  { id: 'limits', labelKey: 'views.limits' },
-  { id: 'trends', labelKey: 'views.trends' }
+  { id: 'device', labelKey: 'views.device' },
+  { id: 'trends', labelKey: 'views.trends' },
+  { id: 'status', labelKey: 'views.status' }
 ];
 const viewPeriodValues = new Set(['today', 'month', 'week', 'last7', 'last30', 'allTime']);
 const viewBreakdownValues = new Set(['home', ...baseBreakdownOrder, 'status', 'limits', 'trends']);
 const HOME_MODULE_OPTIONS = [
   { id: 'limits', labelKey: 'home.limits', viewId: 'limits' },
   { id: 'tool', labelKey: 'home.tools', viewId: 'tool' },
-  { id: 'device', labelKey: 'home.devices', viewId: 'device' },
   { id: 'model', labelKey: 'home.models', viewId: 'model' },
+  { id: 'session', labelKey: 'home.sessions', viewId: 'session' },
+  { id: 'device', labelKey: 'home.devices', viewId: 'device' },
   { id: 'trends', labelKey: 'home.activity', viewId: 'trends' }
 ];
 const VIEW_SWITCHER_LONG_PRESS_MS = 420;
@@ -303,6 +293,8 @@ const TOKEN_MONITOR_WSL_SQLITE_GUIDE_URL = `${TOKEN_MONITOR_REPOSITORY_URL}/blob
 const serviceStatusProviderPreferencesApi = window.TokenMonitorServiceStatusProviderPreferences;
 const SETTINGS_SECTION_IDS = ['general', 'main', 'window', 'appearance', 'tools', 'limits', 'subscriptions', 'sync'];
 const REFRESH_BUTTON_FEEDBACK_MS = 700;
+const LIVE_TOKEN_RATE_ACTIVE_MS = 8000;
+const LIVE_TOKEN_RATE_CLEAR_MS = 3 * 60 * 1000;
 const CODEX_PENDING_ACTIVE_GRACE_MS = 30000;
 const initialFloatingBubble = window.__TOKEN_MONITOR_INITIAL_FLOATING_BUBBLE__ || { collapsed: false, side: null };
 const initialViewState = window.__TOKEN_MONITOR_INITIAL_VIEW_STATE__ || {};
@@ -313,7 +305,17 @@ function normalizeInitialViewValue(value, allowed, fallback) {
   return allowed.has(raw) ? raw : fallback;
 }
 
-const state = { period: normalizeInitialViewValue(initialViewState.period, viewPeriodValues, 'today'), breakdown: normalizeInitialViewValue(initialViewState.breakdown, viewBreakdownValues, 'home'), viewSwitcherOpen: false, viewSwitcherHasOpened: false, limitDetailTooltipHasOpened: false, limitDetailTooltipActive: false, limitDetailTooltipRenderPending: false, settings: null, stats: null, homeHistory: null, homeHistoryBusy: false, homeHistoryRequested: false, homeHistorySignature: '', homeHistoryRetries: 0, homeHistoryRetryTimer: null, homeActivityScrollLeft: null, homeActivityFollowEnd: true, homeActivityResizeObserver: null, serviceStatus: null, serviceStatusBusy: false, serviceProvidersExpanded: false, trendSettingsExpanded: false, trendsActivating: false, homeSettingsExpanded: false, homeLimitSettingsExpanded: false, limitProviderSettingsExpanded: '', clientHealthExpanded: '', clientSources: clientSourceCacheApi.createClientSourceCache(), clientSourcesKey: '', clientSourcesRequest: 0, subscriptionEditingId: '', subscriptionTopUps: [], subscriptionFormBase: null, subscriptionEditorTransitionId: 0, serviceStatusTicker: null, refreshTimer: null, refreshBusy: false, refreshFeedbackTimer: null, currentTotal: 0, rowSignature: '', streamConnected: false, streamFailure: null, mode: 'idle', appInfo: null, systemDarkUi: false, tokscaleStatus: null, tokscaleCheck: null, tokscaleBusy: false, hubInfo: null, hubBuildStatus: null, cursorAccount: { status: null, error: '' }, cursorAccountExpanded: false, codexAccountExpanded: false, codexAccountError: '', codexSignInBusy: false, codexSignInFlowId: '', codexLoginUrl: '', codexLoginStatus: '', codexLoginOutput: '', codexWorkspaceChoices: [], codexWorkspaceId: '', codexActiveAccount: null, codexPendingActiveAccount: null, codexPendingActiveAccountUntil: 0, codexPendingActiveAccountTimer: null, codexSystemSwitchingAccountId: '', codexSystemSwitchErrorAccountId: '', codexSystemSwitchError: '', codexSwitchPopoverHasOpened: false, codexSwitchPopoverActive: false, codexSwitchPopoverRenderPending: false, customPricingExpanded: false, claudeAccountExpanded: false, claudePendingCheckSince: 0, opencodeProfileCount: 0, opencodeCookieExpanded: false, openrouterProfileCount: 0, openrouterAccountExpanded: false, thirdPartyProfileCount: 0, thirdPartyAccountExpanded: false, deepseekAccountExpanded: false, deepseekPendingCheckSince: 0, minimaxAccountExpanded: false, minimaxPendingCheckSince: 0, zaiAccountExpanded: false, zaiPendingCheckSince: 0, zaiteamAccountExpanded: false, zaiteamPendingCheckSince: 0, volcengineAccountExpanded: false, volcenginePendingCheckSince: 0, volcengineAgentExpanded: false, qoderAccountExpanded: false, qoderPendingCheckSince: 0, commandcodeAccountExpanded: false, commandcodePendingCheckSince: 0, kimiAccountExpanded: false, kimiPendingCheckSince: 0, ollamaAccountExpanded: false, ollamaPendingCheckSince: 0, mimoAccountExpanded: false, mimoAccountError: '', copilotAccountExpanded: false, copilotManualExpanded: false, copilotPendingCheckSince: 0, copilotSignInBusy: false, copilotSignInCancelable: false, copilotSignInFlowId: '', copilotAuthorizeMessage: '', copilotLoginStatus: '', copilotErrorMessage: '', floatingBubble: initialFloatingBubble, suppressInitialNumberAnimation: window.__TOKEN_MONITOR_SUPPRESS_INITIAL_NUMBER_ANIMATION__ === true, openSession: null, detailSort: 'time', recordingWindowShortcut: false, windowShortcutInvalid: false };
+const state = { period: normalizeInitialViewValue(initialViewState.period, viewPeriodValues, 'today'), breakdown: normalizeInitialViewValue(initialViewState.breakdown, viewBreakdownValues, 'home'), viewSwitcherOpen: false, viewSwitcherHasOpened: false, limitDetailTooltipHasOpened: false, limitDetailTooltipActive: false, limitDetailTooltipRenderPending: false, settings: null, windowVisible: new URLSearchParams(window.location.search).get('windowHidden') !== '1', stats: null, homeHistory: null, homeHistoryBusy: false, homeHistoryRequested: false, homeHistorySignature: '', homeHistoryRetries: 0, homeHistoryRetryTimer: null, homeActivityScrollLeft: null, homeActivityFollowEnd: true, homeActivityResizeObserver: null, serviceStatus: null, serviceStatusBusy: false, serviceProvidersExpanded: false, trendSettingsExpanded: false, trendsActivating: false, homeSettingsExpanded: false, homeLimitSettingsExpanded: false, limitProviderSettingsExpanded: '', clientHealthExpanded: '', clientSources: clientSourceCacheApi.createClientSourceCache(), clientSourcesKey: '', clientSourcesRequest: 0, subscriptionEditingId: '', subscriptionTopUps: [], subscriptionFormBase: null, subscriptionEditorTransitionId: 0, serviceStatusTicker: null, refreshTimer: null, refreshBusy: false, refreshFeedbackTimer: null, currentTotal: 0, rowSignature: '', streamConnected: false, streamFailure: null, mode: 'idle', appInfo: null, systemDarkUi: false, tokscaleStatus: null, hubInfo: null, hubBuildStatus: null, cursorAccount: { status: null, error: '' }, cursorAccountExpanded: false, codexAccountExpanded: false, codexAccountError: '', codexSignInBusy: false, codexSignInFlowId: '', codexLoginUrl: '', codexLoginStatus: '', codexLoginOutput: '', codexWorkspaceChoices: [], codexWorkspaceId: '', codexActiveAccount: null, codexPendingActiveAccount: null, codexPendingActiveAccountUntil: 0, codexPendingActiveAccountTimer: null, customPricingExpanded: false, claudeAccountExpanded: false, claudeAddAccountExpanded: false, claudePendingCheckSince: 0, opencodeProfileCount: 0, opencodeCookieExpanded: false, openrouterProfileCount: 0, openrouterAccountExpanded: false, thirdPartyProfileCount: 0, thirdPartyAccountExpanded: false, deepseekAccountExpanded: false, deepseekPendingCheckSince: 0, minimaxAccountExpanded: false, minimaxPendingCheckSince: 0, factoryAccountExpanded: false, factoryPendingCheckSince: 0, clineAccountExpanded: false, clinePendingCheckSince: 0, zaiAccountExpanded: false, zaiPendingCheckSince: 0, zaiteamAccountExpanded: false, zaiteamPendingCheckSince: 0, volcengineAccountExpanded: false, volcenginePendingCheckSince: 0, volcengineAgentExpanded: false, qoderAccountExpanded: false, qoderPendingCheckSince: 0, kimiAccountExpanded: false, kimiPendingCheckSince: 0, ollamaAccountExpanded: false, ollamaPendingCheckSince: 0, mimoAccountExpanded: false, mimoAccountError: '', antigravityAccountExpanded: false, antigravityAccountError: '', antigravitySignInBusy: false, copilotAccountExpanded: false, copilotManualExpanded: false, copilotPendingCheckSince: 0, copilotSignInBusy: false, copilotSignInCancelable: false, copilotSignInFlowId: '', copilotAuthorizeMessage: '', copilotLoginStatus: '', copilotErrorMessage: '', floatingBubble: initialFloatingBubble, suppressInitialNumberAnimation: window.__TOKEN_MONITOR_SUPPRESS_INITIAL_NUMBER_ANIMATION__ === true, openSession: null, detailSort: 'time', recordingWindowShortcut: false, windowShortcutInvalid: false, toolSearchQuery: '', limitProviderSearchQuery: '', accountPanelMessages: {} };
+state.devinAccountExpanded = false;
+state.devinPendingCheckSince = 0;
+state.icloudStatus = null;
+state.zedAccountExpanded = false;
+state.zedPendingCheckSince = 0;
+state.toolDetailMode = 'tokens';
+state.codexResetForecast = null;
+state.codexResetForecastBusy = false;
+state.codexResetForecastRequestedAt = 0;
+state.codexResetForecastRetryTimer = null;
 state.clientRescans = clientRescanStateApi.createClientRescanState({
   onChange: (clientId) => {
     if (state.clientHealthExpanded === clientId) refillOpenClientHealthPanel();
@@ -322,9 +324,12 @@ state.clientRescans = clientRescanStateApi.createClientRescanState({
 state.toolPreferenceRenderSignature = '';
 state.toolPreferenceDetailSignature = '';
 state.toolPreferenceSourceSignature = '';
+state.customScanPathErrors = new Map();
 state.limitProviderRenderSignature = '';
 state.limitPanelRenderSignature = '';
 state.settingsPushRevision = 0;
+state.limitProviderSelectionRevision = 0;
+state.pendingLimitProviderSelection = null;
 state.homeHistoryLoadedSignature = '';
 state.homeHistoryRetrySignature = '';
 state.homeReturnVisible = false;
@@ -343,24 +348,42 @@ state.fixedPeriodHistoryPromise = null;
 state.fixedPeriodHistoryCoordinator = null;
 state.fixedPeriodSnapshot = null;
 state.periodMenuOpen = false;
+state.sessionPage = 0;
+state.sessionPagerSignature = '';
 let directBreakdownOverride = null;
 state.projectSettingsExpanded = false;
+state.sessionSettingsExpanded = false;
 state.homeActivitySettingsExpanded = false;
 state.settingsSections = Object.fromEntries(SETTINGS_SECTION_IDS.map((id) => [id, false]));
-const defaultAppearance = { glassOpacity: 68, glassBlur: 32, zoomFactor: 1, systemGlass: true, windowsBackdrop: 'acrylic', reduceMotion: 'system', showLiveDot: true, showToolIcons: true, titleIconOnly: true, showCompactTotalTokens: false, compactTokenUnits: 'western', settingsInTitlebar: false };
-let preferenceDrag = null;
+const defaultAppearance = { glassOpacity: 68, glassBlur: 32, backgroundImageOpacity: 28, zoomFactor: 1, systemGlass: true, windowsBackdrop: 'acrylic', macBackdrop: 'vibrancy', reduceMotion: 'system', showLiveDot: true, showToolIcons: true, titleIconOnly: true, showCompactTotalTokens: false, showLiveTokenRate: false, liveTokenRateScope: 'all', compactTokenUnits: 'western', settingsInTitlebar: false };
+let nativeMaterialState = glassRenderingApi.normalizeNativeMaterialState();
+let nativeMaterialRevision = 0;
+let appearancePreview = {};
+// Writes still in flight. Main applies the native material before it broadcasts
+// the saved settings, so a material push landing in between must not repaint
+// the appearance controls from the settings that write is replacing.
+const pendingSettingsPatches = new Set();
 let viewSwitcherLongPressTimer = null;
 let viewSwitcherLongPressTriggered = false;
 let viewSwitcherHoverCloseTimer = null;
 const els = {
-  shell: document.querySelector('.shell'), status: document.getElementById('status'), liveDot: document.getElementById('liveDot'), tokenRateReveal: document.getElementById('tokenRateReveal'), totalTokens: document.getElementById('totalTokens'), totalTokensCompact: document.getElementById('totalTokensCompact'), cost: document.getElementById('cost'), homePanel: document.getElementById('homePanel'), breakdown: document.getElementById('breakdown'), serviceStatusPanel: document.getElementById('serviceStatusPanel'), limitsPanel: document.getElementById('limitsPanel'), trendsPanel: document.getElementById('trendsPanel'), viewSwitcher: document.getElementById('viewSwitcher'), pinButton: document.getElementById('pinButton'), utilityActions: document.getElementById('utilityActions'), settingsButton: document.getElementById('settingsButton'), settingsPanel: document.getElementById('settingsPanel'), languageInput: document.getElementById('languageInput'), currencyInput: document.getElementById('currencyInput'), currencyRateRow: document.getElementById('currencyRateRow'), currencyRateModeAuto: document.getElementById('currencyRateModeAuto'), currencyRateModeManual: document.getElementById('currencyRateModeManual'), currencyRateManualField: document.getElementById('currencyRateManualField'), currencyRateOverrideInput: document.getElementById('currencyRateOverrideInput'), currencyRateStatus: document.getElementById('currencyRateStatus'), hubUrlInput: document.getElementById('hubUrlInput'), secretInput: document.getElementById('secretInput'), deviceIdInput: document.getElementById('deviceIdInput'), limitProviderCheckboxes: document.getElementById('limitProviderCheckboxes'), limitsRefreshInput: document.getElementById('limitsRefreshInput'), limitsRefreshAdaptiveNote: document.getElementById('limitsRefreshAdaptiveNote'), showLimitSourceInput: document.getElementById('showLimitSourceInput'), maskLimitAccountEmailsInput: document.getElementById('maskLimitAccountEmailsInput'), showLimitUsedInputs: Array.from(document.querySelectorAll('input[name="showLimitUsed"]')), liveDotInput: document.getElementById('liveDotInput'), toolIconsInput: document.getElementById('toolIconsInput'), floatingBubbleInput: document.getElementById('floatingBubbleInput'), floatingBubbleTriggerInputs: Array.from(document.querySelectorAll('input[name="floatingBubbleTrigger"]')), floatingBubbleTriggerRow: document.getElementById('floatingBubbleTriggerRow'), floatingBubbleContentInput: document.getElementById('floatingBubbleContentInput'), floatingBubbleContentRow: document.getElementById('floatingBubbleContentRow'), floatingBubbleComposer: document.getElementById('floatingBubbleComposer'), floatingBubbleContent: document.getElementById('floatingBubbleContent'), discordRpcInput: document.getElementById('discordRpcInput'), windowBehaviorInput: document.getElementById('windowBehaviorInput'), showTrayIconInput: document.getElementById('showTrayIconInput'), showTrayProviderBadgeInput: document.getElementById('showTrayProviderBadgeInput'), trayModeInput: document.getElementById('trayModeInput'), trayContentInput: document.getElementById('trayContentInput'), trayComposer: document.getElementById('trayComposer'), windowToggleShortcutValue: document.getElementById('windowToggleShortcutValue'), windowToggleShortcutClearButton: document.getElementById('windowToggleShortcutClearButton'), windowToggleShortcutNote: document.getElementById('windowToggleShortcutNote'), glassInput: document.getElementById('glassInput'), blurInput: document.getElementById('blurInput'), zoomInput: document.getElementById('zoomInput'), resetGlassButton: document.getElementById('resetGlassButton'), resetDepthButton: document.getElementById('resetDepthButton'), resetZoomButton: document.getElementById('resetZoomButton'), saveSettingsButton: document.getElementById('saveSettingsButton'), clientDisplayList: document.getElementById('clientDisplayList'), wslScanInput: document.getElementById('wslScanInput'), wslScanRow: document.getElementById('wslScanRow'), wslPanel: document.getElementById('wslPanel'), openConfigButton: document.getElementById('openConfigButton'), exportAutoInput: document.getElementById('exportAutoInput'), exportAutoDetails: document.getElementById('exportAutoDetails'), exportAutoStatus: document.getElementById('exportAutoStatus'), exportDirLabel: document.getElementById('exportDirLabel'), exportPickDirButton: document.getElementById('exportPickDirButton'), exportIntervalInput: document.getElementById('exportIntervalInput'), exportNowButton: document.getElementById('exportNowButton'), refreshButton: document.getElementById('refreshButton'), minButton: document.getElementById('minButton'), closeButton: document.getElementById('closeButton'), floatingBubbleTab: document.getElementById('floatingBubbleTab'),
+  shell: document.querySelector('.shell'), status: document.getElementById('status'), liveDot: document.getElementById('liveDot'), tokenRateReveal: document.getElementById('tokenRateReveal'), liveTokenRate: document.getElementById('liveTokenRate'), liveTokenRateValue: document.getElementById('liveTokenRateValue'), totalTokens: document.getElementById('totalTokens'), totalTokensCompact: document.getElementById('totalTokensCompact'), cost: document.getElementById('cost'), homePanel: document.getElementById('homePanel'), breakdown: document.getElementById('breakdown'), sessionPagerHost: document.getElementById('sessionPagerHost'), serviceStatusPanel: document.getElementById('serviceStatusPanel'), limitsPanel: document.getElementById('limitsPanel'), trendsPanel: document.getElementById('trendsPanel'), viewSwitcher: document.getElementById('viewSwitcher'), pinButton: document.getElementById('pinButton'), utilityActions: document.getElementById('utilityActions'), settingsButton: document.getElementById('settingsButton'), settingsPanel: document.getElementById('settingsPanel'), languageInput: document.getElementById('languageInput'), currencyInput: document.getElementById('currencyInput'), currencyRateRow: document.getElementById('currencyRateRow'), currencyRateModeAuto: document.getElementById('currencyRateModeAuto'), currencyRateModeManual: document.getElementById('currencyRateModeManual'), currencyRateManualField: document.getElementById('currencyRateManualField'), currencyRateOverrideInput: document.getElementById('currencyRateOverrideInput'), currencyRateStatus: document.getElementById('currencyRateStatus'), hubUrlInput: document.getElementById('hubUrlInput'), secretInput: document.getElementById('secretInput'), deviceIdInput: document.getElementById('deviceIdInput'), limitProviderCheckboxes: document.getElementById('limitProviderCheckboxes'), limitsRefreshInput: document.getElementById('limitsRefreshInput'), limitsRefreshAdaptiveNote: document.getElementById('limitsRefreshAdaptiveNote'), showLimitSourceInput: document.getElementById('showLimitSourceInput'), maskLimitAccountEmailsInput: document.getElementById('maskLimitAccountEmailsInput'), showLimitUsedInputs: Array.from(document.querySelectorAll('input[name="showLimitUsed"]')), liveDotInput: document.getElementById('liveDotInput'), toolIconsInput: document.getElementById('toolIconsInput'), floatingBubbleInput: document.getElementById('floatingBubbleInput'), floatingBubbleTriggerInputs: Array.from(document.querySelectorAll('input[name="floatingBubbleTrigger"]')), floatingBubbleTriggerRow: document.getElementById('floatingBubbleTriggerRow'), floatingBubbleContentInput: document.getElementById('floatingBubbleContentInput'), floatingBubbleContentRow: document.getElementById('floatingBubbleContentRow'), floatingBubbleComposer: document.getElementById('floatingBubbleComposer'), floatingBubbleContent: document.getElementById('floatingBubbleContent'), discordRpcInput: document.getElementById('discordRpcInput'), windowBehaviorInput: document.getElementById('windowBehaviorInput'), keepAboveTaskbarInput: document.getElementById('keepAboveTaskbarInput'), keepAboveTaskbarRow: document.getElementById('keepAboveTaskbarRow'), showTrayIconInput: document.getElementById('showTrayIconInput'), showTrayProviderBadgeInput: document.getElementById('showTrayProviderBadgeInput'), hideAppIconInput: document.getElementById('hideAppIconInput'), hideAppIconRow: document.getElementById('hideAppIconRow'), hideAppIconOptions: document.getElementById('hideAppIconOptions'), trayModeInput: document.getElementById('trayModeInput'), trayContentInput: document.getElementById('trayContentInput'), trayComposer: document.getElementById('trayComposer'), windowToggleShortcutValue: document.getElementById('windowToggleShortcutValue'), windowToggleShortcutClearButton: document.getElementById('windowToggleShortcutClearButton'), windowToggleShortcutNote: document.getElementById('windowToggleShortcutNote'), glassInput: document.getElementById('glassInput'), blurInput: document.getElementById('blurInput'), zoomInput: document.getElementById('zoomInput'), resetGlassButton: document.getElementById('resetGlassButton'), resetDepthButton: document.getElementById('resetDepthButton'), resetZoomButton: document.getElementById('resetZoomButton'), saveSettingsButton: document.getElementById('saveSettingsButton'), clientDisplayList: document.getElementById('clientDisplayList'), wslScanInput: document.getElementById('wslScanInput'), wslScanRow: document.getElementById('wslScanRow'), wslPanel: document.getElementById('wslPanel'), openConfigButton: document.getElementById('openConfigButton'), exportAutoInput: document.getElementById('exportAutoInput'), exportAutoDetails: document.getElementById('exportAutoDetails'), exportAutoStatus: document.getElementById('exportAutoStatus'), exportDirLabel: document.getElementById('exportDirLabel'), exportPickDirButton: document.getElementById('exportPickDirButton'), exportIntervalInput: document.getElementById('exportIntervalInput'), exportNowButton: document.getElementById('exportNowButton'), refreshButton: document.getElementById('refreshButton'), minButton: document.getElementById('minButton'), closeButton: document.getElementById('closeButton'), floatingBubbleTab: document.getElementById('floatingBubbleTab'),
   subscriptionList: document.getElementById('subscriptionList'), subscriptionAddForm: document.getElementById('subscriptionAddForm'), subscriptionAddToggle: document.getElementById('subscriptionAddToggle'), subscriptionAddDetails: document.getElementById('subscriptionAddDetails'), subscriptionProviderInput: document.getElementById('subscriptionProviderInput'), subscriptionAccountInput: document.getElementById('subscriptionAccountInput'), subscriptionPlanNameInput: document.getElementById('subscriptionPlanNameInput'), subscriptionAmountInput: document.getElementById('subscriptionAmountInput'), subscriptionCurrencyInput: document.getElementById('subscriptionCurrencyInput'), subscriptionIntervalCountInput: document.getElementById('subscriptionIntervalCountInput'), subscriptionIntervalInput: document.getElementById('subscriptionIntervalInput'), subscriptionStartDateInput: document.getElementById('subscriptionStartDateInput'), subscriptionAutoRenewInput: document.getElementById('subscriptionAutoRenewInput'), subscriptionNextRenewalInput: document.getElementById('subscriptionNextRenewalInput'), subscriptionNote: document.getElementById('subscriptionNote'), subscriptionOrphanNotice: document.getElementById('subscriptionOrphanNotice'), subscriptionOrphanText: document.getElementById('subscriptionOrphanText'), subscriptionOrphanAdopt: document.getElementById('subscriptionOrphanAdopt'), subscriptionOrphanDiscard: document.getElementById('subscriptionOrphanDiscard'), subscriptionSyncError: document.getElementById('subscriptionSyncError'), subscriptionNextRenewalLabel: document.getElementById('subscriptionNextRenewalLabel'), subscriptionNextRenewalNote: document.getElementById('subscriptionNextRenewalNote'), subscriptionSubmit: document.getElementById('subscriptionSubmit'), subscriptionCancelEdit: document.getElementById('subscriptionCancelEdit'), subscriptionTotalRow: document.getElementById('subscriptionTotalRow'), subscriptionErrorMessage: document.getElementById('subscriptionErrorMessage'), subscriptionPlanFields: document.getElementById('subscriptionPlanFields'), subscriptionTopUpFields: document.getElementById('subscriptionTopUpFields'), subscriptionTopUpList: document.getElementById('subscriptionTopUpList'), subscriptionTopUpDateInput: document.getElementById('subscriptionTopUpDateInput'), subscriptionTopUpAmountInput: document.getElementById('subscriptionTopUpAmountInput'), subscriptionTopUpAddButton: document.getElementById('subscriptionTopUpAddButton'), subscriptionAmountRow: document.getElementById('subscriptionAmountRow'), subscriptionTopUpHeadingRow: document.getElementById('subscriptionTopUpHeadingRow'), subscriptionKindInputs: [...document.querySelectorAll('input[name="subscriptionKind"]')]
 };
 Object.assign(els, {
+  glassInputNote: document.getElementById('glassInputNote'),
+  backgroundImageOpacityRow: document.getElementById('backgroundImageOpacityRow'),
+  backgroundImageOpacityInput: document.getElementById('backgroundImageOpacityInput'),
+  resetBackgroundImageOpacityButton: document.getElementById('resetBackgroundImageOpacityButton'),
+  blurInputNote: document.getElementById('blurInputNote'),
   fixedPeriodMessage: document.getElementById('fixedPeriodMessage'),
+  toolDetailFooter: document.getElementById('toolDetailFooter'),
+  toolDetailFooterTokens: document.getElementById('toolDetailFooterTokens'),
+  toolDetailFooterModels: document.getElementById('toolDetailFooterModels'),
   monthPeriodMenu: document.getElementById('monthPeriodMenu'),
   monthPeriodTab: document.getElementById('monthPeriodTab'),
-  periodMonthModeInput: document.getElementById('periodMonthModeInput')
+  periodMonthModeInput: document.getElementById('periodMonthModeInput'),
+  modelRankingMetricInputs: Array.from(document.querySelectorAll('input[name="modelRankingMetric"]'))
 });
 Object.assign(els, {
   appTitleMark: document.querySelector('.app-title-mark'),
@@ -368,11 +391,42 @@ Object.assign(els, {
   backHomeButton: document.getElementById('backHomeButton'),
   systemGlassInputs: Array.from(document.querySelectorAll('input[name="systemGlassOption"]')),
   floatingBubbleOptions: document.getElementById('floatingBubbleOptions'),
+  edgeDockFeature: document.getElementById('edgeDockFeature'),
+  edgeDockInput: document.getElementById('edgeDockInput'),
+  edgeDockOptions: document.getElementById('edgeDockOptions'),
+  edgeDockMoreOptionsGroup: document.getElementById('edgeDockMoreOptionsGroup'),
+  edgeDockMoreOptionsToggle: document.getElementById('edgeDockMoreOptionsToggle'),
+  edgeDockMoreOptionsDetails: document.getElementById('edgeDockMoreOptionsDetails'),
+  edgeDockSideInputs: Array.from(document.querySelectorAll('input[name="edgeDockSide"]')),
+  edgeDockModeInputs: Array.from(document.querySelectorAll('input[name="edgeDockMode"]')),
+  edgeDockSizeInputs: Array.from(document.querySelectorAll('input[name="edgeDockSize"]')),
+  edgeDockCustomScaleRow: document.getElementById('edgeDockCustomScaleRow'),
+  edgeDockCustomScaleInput: document.getElementById('edgeDockCustomScaleInput'),
+  edgeDockHapticRow: document.getElementById('edgeDockHapticRow'),
+  edgeDockHapticInput: document.getElementById('edgeDockHapticInput'),
+  edgeDockWarnColorsInput: document.getElementById('edgeDockWarnColorsInput'),
+  edgeDockRunningIndicatorInput: document.getElementById('edgeDockRunningIndicatorInput'),
+  edgeDockMacBackdropRow: document.getElementById('edgeDockMacBackdropRow'),
+  edgeDockMacBackdropInput: document.getElementById('edgeDockMacBackdropInput'),
+  edgeDockComposer: document.getElementById('edgeDockComposer'),
   trayIconOptions: document.getElementById('trayIconOptions'),
   trayOptions: document.getElementById('trayOptions'),
   hubModeOptions: document.getElementById('hubModeOptions'),
+  icloudModeOption: document.querySelector('#hubModeOptions option[value="icloud"]'),
+  syncModeDescription: document.getElementById('syncModeDescription'),
+  icloudFields: document.getElementById('icloudFields'),
+  icloudStatus: document.getElementById('icloudStatus'),
+  icloudRootStatus: document.getElementById('icloudRootStatus'),
   hubBuildStatus: document.getElementById('hubBuildStatus'),
   hubClientFields: document.getElementById('hubClientFields'),
+  syncConnectionEditor: document.getElementById('syncConnectionEditor'),
+  syncConnectionIdentity: document.getElementById('syncConnectionIdentity'),
+  syncConnectionEndpoint: document.getElementById('syncConnectionEndpoint'),
+  syncConnectionEdit: document.getElementById('syncConnectionEdit'),
+  syncConnectionCancel: document.getElementById('syncConnectionCancel'),
+  syncConnectionSaveError: document.getElementById('syncConnectionSaveError'),
+  syncDeviceSettings: document.getElementById('syncDeviceSettings'),
+  syncUploadIntervalRow: document.getElementById('syncUploadIntervalRow'),
   hubHostFields: document.getElementById('hubHostFields'),
   hubPortInput: document.getElementById('hubPortInput'),
   hubSecretInput: document.getElementById('hubSecretInput'),
@@ -380,7 +434,16 @@ Object.assign(els, {
   hubSecretRegenButton: document.getElementById('hubSecretRegenButton'),
   secretPasteButton: document.getElementById('secretPasteButton'),
   hubStatusRow: document.getElementById('hubStatusRow'),
-  syncClientStatus: document.getElementById('syncClientStatus'),
+  syncDevicePanel: document.getElementById('syncDevicePanel'),
+  syncPanelConnection: document.getElementById('syncPanelConnection'),
+  syncPanelSignal: document.getElementById('syncPanelSignal'),
+  syncPanelState: document.getElementById('syncPanelState'),
+  syncPanelDetail: document.getElementById('syncPanelDetail'),
+  syncPanelUpload: document.getElementById('syncPanelUpload'),
+  syncPanelBuild: document.getElementById('syncPanelBuild'),
+  syncPanelCount: document.getElementById('syncPanelCount'),
+  syncDeviceList: document.getElementById('syncDeviceList'),
+  syncPanelOpenDevices: document.getElementById('syncPanelOpenDevices'),
   hubAddressList: document.getElementById('hubAddressList'),
   syncUploadIntervalInput: document.getElementById('syncUploadIntervalInput'),
   collectionCadenceInput: document.getElementById('collectionCadenceInput'),
@@ -391,6 +454,8 @@ Object.assign(els, {
   windowsBackdropRow: document.getElementById('windowsBackdropRow'),
   windowsBackdropInput: document.getElementById('windowsBackdropInput'),
   windowsBackdropNote: document.getElementById('windowsBackdropNote'),
+  macBackdropRow: document.getElementById('macBackdropRow'),
+  macBackdropInput: document.getElementById('macBackdropInput'),
   clearSessionUsageArchiveButton: document.getElementById('clearSessionUsageArchiveButton'),
   startupGroup: document.getElementById('startupGroup'),
   startAtLoginInput: document.getElementById('startAtLoginInput'),
@@ -398,16 +463,10 @@ Object.assign(els, {
   advancedSettingsGroup: document.getElementById('advancedSettingsGroup'),
   advancedSettingsToggle: document.getElementById('advancedSettingsToggle'),
   advancedSettingsDetails: document.getElementById('advancedSettingsDetails'),
-  advancedSettingsSummary: document.getElementById('advancedSettingsSummary'),
   tokscaleGroup: document.getElementById('tokscaleGroup'),
   tokscaleInstalled: document.getElementById('tokscaleInstalled'),
-  tokscaleBundledLine: document.getElementById('tokscaleBundledLine'),
-  tokscaleBundled: document.getElementById('tokscaleBundled'),
-  tokscaleNpm: document.getElementById('tokscaleNpm'),
-  tokscaleMessage: document.getElementById('tokscaleMessage'),
-  checkTokscaleButton: document.getElementById('checkTokscaleButton'),
-  downloadTokscaleButton: document.getElementById('downloadTokscaleButton'),
-  resetTokscaleButton: document.getElementById('resetTokscaleButton'),
+  tokscaleBundledBuild: document.getElementById('tokscaleBundledBuild'),
+  tokscaleBundledBuildRow: document.getElementById('tokscaleBundledBuildRow'),
   openTokscaleLinkButton: document.getElementById('openTokscaleLinkButton'),
   aboutVersion: document.getElementById('aboutVersion'),
   openRepositoryButton: document.getElementById('openRepositoryButton'),
@@ -415,11 +474,16 @@ Object.assign(els, {
   reportIssueButton: document.getElementById('reportIssueButton'),
   titleIconInput: document.getElementById('titleIconInput'),
   showCompactTotalTokensInput: document.getElementById('showCompactTotalTokensInput'),
+  showLiveTokenRateInput: document.getElementById('showLiveTokenRateInput'),
+  liveTokenRateScopeRow: document.getElementById('liveTokenRateScopeRow'),
+  liveTokenRateScopeInput: document.getElementById('liveTokenRateScopeInput'),
   compactTokenUnitsRow: document.getElementById('compactTokenUnitsRow'),
   compactTokenUnitsInput: document.getElementById('compactTokenUnitsInput'),
   swapSettingsRefreshInput: document.getElementById('swapSettingsRefreshInput'),
   resetClientDisplayOrderButton: document.getElementById('resetClientDisplayOrderButton'),
   showAllClientsButton: document.getElementById('showAllClientsButton'),
+  clientDisplaySearchInput: document.getElementById('clientDisplaySearchInput'),
+  limitProviderSearchInput: document.getElementById('limitProviderSearchInput'),
   resetViewDisplayOrderButton: document.getElementById('resetViewDisplayOrderButton'),
   showAllViewsButton: document.getElementById('showAllViewsButton'),
   viewDisplayList: document.getElementById('viewDisplayList'),
@@ -430,6 +494,9 @@ Object.assign(els, {
   mainSettingsSummary: document.getElementById('mainSettingsSummary'),
   windowSettingsSummary: document.getElementById('windowSettingsSummary'),
   appearanceSettingsSummary: document.getElementById('appearanceSettingsSummary'),
+  backgroundImageStatus: document.getElementById('backgroundImageStatus'),
+  chooseBackgroundImageButton: document.getElementById('chooseBackgroundImageButton'),
+  clearBackgroundImageButton: document.getElementById('clearBackgroundImageButton'),
   subscriptionsSettingsSummary: document.getElementById('subscriptionsSettingsSummary'),
   themePresetChips: document.getElementById('themePresetChips'),
   themeColorGrid: document.getElementById('themeColorGrid'),
@@ -440,6 +507,7 @@ Object.assign(els, {
   themeAdvancedGroup: document.getElementById('themeAdvancedGroup'),
   themeAdvancedToggle: document.getElementById('themeAdvancedToggle'),
   themeAdvancedDetails: document.getElementById('themeAdvancedDetails'),
+  textSizeInput: document.getElementById('textSizeInput'),
   interfaceFontPreset: document.getElementById('interfaceFontPreset'),
   interfaceFontInput: document.getElementById('interfaceFontInput'),
   interfaceFontCustomRow: document.getElementById('interfaceFontCustomRow'),
@@ -460,33 +528,64 @@ Object.assign(els, {
   sessionDetailHead: document.getElementById('session-detail-head')
 });
 
+const SYNC_MODE_DESCRIPTIONS = {
+  local: 'settings.sync.localOnlyDesc',
+  client: 'settings.sync.connectHubDesc',
+  host: 'settings.sync.hostHubDesc',
+  icloud: 'settings.sync.icloudDesc'
+};
+const SYNC_MODE_ICON_PATHS = {
+  local: ['M5 4h14v12H5z', 'M2 20h20l-3-4H5z'],
+  client: ['M10 13a5 5 0 0 0 7 .5l3-3a5 5 0 0 0-7-7l-2 2', 'M14 11a5 5 0 0 0-7-.5l-3 3a5 5 0 0 0 7 7l2-2'],
+  host: ['M4 3h16v7H4z', 'M4 14h16v7H4z', 'M7 6.5h.01M7 17.5h.01', 'M11 6.5h6M11 17.5h6'],
+  icloud: ['M7 18H6a4 4 0 1 1 .7-7.9A6 6 0 0 1 18 8a5 5 0 0 1 0 10H7']
+};
+const syncModeIcons = Object.fromEntries(Object.entries(SYNC_MODE_ICON_PATHS).map(([mode, paths]) => [mode, (doc) => {
+  const svg = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  for (const [name, value] of Object.entries({ viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.6', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })) {
+    svg.setAttribute(name, value);
+  }
+  for (const d of paths) {
+    const path = doc.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
+}]));
+const syncModeSelect = window.TokenMonitorSelectControl?.enhance(els.hubModeOptions, {
+  getOptionMeta: option => ({ description: t(SYNC_MODE_DESCRIPTIONS[option.value]), icon: syncModeIcons[option.value] })
+});
+window.addEventListener('unload', () => syncModeSelect?.destroy(), { once: true });
+
 function toggleAccordionRow(row) {
   const isExpanded = row.classList.contains('expanded');
   document.querySelectorAll('.row.expanded').forEach((other) => {
     other.classList.remove('expanded');
-    other.setAttribute('aria-expanded', 'false');
+    other.querySelector('.row-head')?.setAttribute('aria-expanded', 'false');
   });
   if (!isExpanded) {
     row.classList.add('expanded');
-    row.setAttribute('aria-expanded', 'true');
+    row.querySelector('.row-head')?.setAttribute('aria-expanded', 'true');
+    renderActiveToolDetail();
   }
-}
-
-function setAttributeIfChanged(element, name, value) {
-  if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+  renderToolDetailFooter();
 }
 
 document.addEventListener('click', (event) => {
+  if (event.target.closest('button, a, input, select, textarea')) return;
   const row = event.target.closest('.row.has-accordion');
   if (row) toggleAccordionRow(row);
 });
 
 document.addEventListener('keydown', (event) => {
-  const row = event.target.closest('.row.has-accordion');
+  const row = event.target.closest('.row-head')?.closest('.row.has-accordion');
   if (!row || (event.key !== 'Enter' && event.key !== ' ')) return;
   event.preventDefault();
   toggleAccordionRow(row);
 });
+
+els.toolDetailFooterTokens.addEventListener('click', () => setActiveToolDetailMode('tokens'));
+els.toolDetailFooterModels.addEventListener('click', () => setActiveToolDetailMode('models'));
 
 document.addEventListener('pointerdown', (event) => {
   if (state.viewSwitcherOpen && !event.target.closest('#viewSwitcher')) {
@@ -540,6 +639,29 @@ function t(key, params) {
   return i18n.translate(currentLocale(), key, params);
 }
 
+const codexAccountControl = codexAccountControlApi.createCodexAccountControl({
+  document,
+  requestAnimationFrame,
+  translate: t,
+  switchAccount: (accountId) => window.tokenMonitor.codex.switchSystemAccount(accountId),
+  requestRender: () => {
+    renderLimits();
+    renderCodexAccounts();
+    renderSettingsSummaries();
+  },
+  onSwitchFailure: (message) => {
+    state.codexAccountError = message;
+  },
+  onSwitchSuccess: (result, _accountId) => {
+    state.codexAccountError = '';
+    state.settings.codexManagedAccounts = result.accounts || state.settings.codexManagedAccounts || [];
+    applyCodexOptimisticActiveAccount(result.activeAccount);
+  },
+  onPostSwitchError: (error) => {
+    console.log(`[codex] post-switch update failed: ${error?.message || error}`);
+  }
+});
+
 const diagnosticsPanel = window.TokenMonitorDiagnosticsPanel?.createDiagnosticsPanel({
   api: window.tokenMonitor,
   translate: t,
@@ -565,6 +687,7 @@ function applySettingsTranslations() {
 }
 
 function applySettingsSectionDom(id, open) {
+  if (id === 'sync' && !open) { syncModeSelect?.close(); syncContentForm?.closeHelp(); }
   const toggle = document.querySelector(`[data-settings-section="${id}"]`);
   const details = document.getElementById(`${id}SettingsDetails`);
   const group = toggle?.closest('.settings-collapsible-group');
@@ -586,6 +709,7 @@ function setSettingsSectionExpanded(section, expanded) {
   }
   state.settingsSections[id] = next;
   applySettingsSectionDom(id, next);
+  if (id === 'sync' && next) void syncContentForm?.refresh();
 }
 
 // Expanding a section auto-collapses the previously open one. When that one
@@ -681,9 +805,12 @@ function viewsSummary() {
 function settingsSectionSummary(section) {
   if (!state.settings) return '';
   if (section === 'sync') {
-    if (state.settings.hubMode === 'host') return t('settings.sync.hostHub');
-    if (state.settings.hubMode === 'client') return t('settings.sync.connectHub');
-    return t('settings.sync.localOnly');
+    const modeKeys = { host: 'settings.sync.hostHub', client: 'settings.sync.connectHub', icloud: 'settings.sync.icloud' };
+    const label = t(modeKeys[state.settings.hubMode] || 'settings.sync.localOnly');
+    const devices = SHARED_SYNC_MODES.has(state.settings.hubMode) && state.mode === 'sync' ? state.stats?.devices : null;
+    if (!Array.isArray(devices) || devices.length === 0) return label;
+    const online = devices.filter((device) => device?.stale !== true).length;
+    return `${label} · ${t('settings.sync.panel.onlineCount', { online, total: devices.length })}`;
   }
   if (section === 'tools') {
     const counts = clientHealthPresentationApi.clientHealthCountsForTracked(
@@ -740,6 +867,7 @@ function settingsSectionSummary(section) {
 }
 
 function renderSettingsSummaries() {
+  if (!isSettingsSurfaceVisible()) return;
   for (const section of SETTINGS_SECTION_IDS) {
     const el = els[`${section}SettingsSummary`];
     if (el) el.textContent = settingsSectionSummary(section);
@@ -787,6 +915,274 @@ const tokenRateBoost = tokenRateApi.createTokenRateBoostController({
   prefersReducedMotion,
   onChange: () => renderTokenRate()
 });
+const liveTokenRateTracker = tokenRateApi.createLiveTokenRateGroupTracker({
+  now: () => Date.now(),
+  activeMs: LIVE_TOKEN_RATE_ACTIVE_MS,
+  clearMs: LIVE_TOKEN_RATE_CLEAR_MS
+});
+const displayLiveTokenRateTrackers = new Map();
+const displayLiveTokenRateContexts = new Map();
+let displayLiveTokenRateExpiryTimer = null;
+let liveTokenRateContext = '';
+let liveTokenRateIdleTimer = null;
+let liveTokenRateAnimationTimer = null;
+let liveTokenRateRenderedRevision = 0;
+
+function liveTokenRateSourceKey(periodSource) {
+  return [
+    state.mode,
+    state.settings?.hubMode || '',
+    state.settings?.hubUrl || '',
+    state.settings?.deviceId || '',
+    state.settings?.clients || '',
+    effectiveLiveTokenRateScope(),
+    periodSource
+  ].join('|');
+}
+
+function effectiveLiveTokenRateScope() {
+  const hubMode = state.settings?.hubMode;
+  const syncMode = tokenRateApi.isSharedSyncMode(hubMode);
+  return syncMode && state.settings?.liveTokenRateScope !== 'device' ? 'all' : 'device';
+}
+
+function clearLiveTokenRateTimers() {
+  if (liveTokenRateIdleTimer) clearTimeout(liveTokenRateIdleTimer);
+  if (liveTokenRateAnimationTimer) clearTimeout(liveTokenRateAnimationTimer);
+  liveTokenRateIdleTimer = null;
+  liveTokenRateAnimationTimer = null;
+}
+
+function resetLiveTokenRateTracking() {
+  liveTokenRateContext = '';
+  liveTokenRateRenderedRevision = 0;
+  liveTokenRateTracker.reset();
+  clearLiveTokenRateTimers();
+}
+
+function displayLiveTokenRateItems() {
+  return trayLayoutApi.liveTokenRateItemsForSurfaces([
+    {
+      enabled: state.settings?.showTrayIcon !== false,
+      content: state.settings?.trayContent,
+      layout: state.settings?.trayCustomLayout
+    },
+    {
+      enabled: state.settings?.floatingBubbleEnabled === true,
+      content: state.settings?.floatingBubbleContent,
+      layout: state.settings?.floatingBubbleCustomLayout
+    }
+  ]);
+}
+
+function effectiveDisplayLiveTokenRateScope(scope) {
+  const hubMode = state.settings?.hubMode;
+  const syncMode = tokenRateApi.isSharedSyncMode(hubMode);
+  return syncMode && scope === 'all' ? 'all' : 'device';
+}
+
+function clearDisplayLiveTokenRateExpiryTimer() {
+  if (displayLiveTokenRateExpiryTimer) clearTimeout(displayLiveTokenRateExpiryTimer);
+  displayLiveTokenRateExpiryTimer = null;
+}
+
+function scheduleDisplayLiveTokenRateExpiry() {
+  clearDisplayLiveTokenRateExpiryTimer();
+  const expiries = [...displayLiveTokenRateTrackers.values()]
+    .map((tracker) => tracker.nextExpiryAt())
+    .filter((value) => Number.isFinite(value));
+  if (!expiries.length) return;
+  displayLiveTokenRateExpiryTimer = setTimeout(() => {
+    displayLiveTokenRateExpiryTimer = null;
+    void maybeUpdateBarsIcon({ refreshComposers: false });
+    renderFloatingBubbleContent();
+    if (isSettingsSurfaceVisible()) refreshTrayComposers();
+    scheduleDisplayLiveTokenRateExpiry();
+  }, Math.max(0, Math.min(...expiries) - Date.now()) + 10);
+}
+
+function resetDisplayLiveTokenRateTracking() {
+  displayLiveTokenRateTrackers.clear();
+  displayLiveTokenRateContexts.clear();
+  clearDisplayLiveTokenRateExpiryTimer();
+}
+
+function observeDisplayLiveTokenRates(stats) {
+  const items = displayLiveTokenRateItems();
+  if (!items.length) {
+    resetDisplayLiveTokenRateTracking();
+    return false;
+  }
+
+  const scopes = new Set(items.map((item) => effectiveDisplayLiveTokenRateScope(item.rateScope)));
+  let changed = false;
+  for (const scope of scopes) {
+    const selection = tokenRateApi.selectLiveTokenRatePeriods(
+      stats,
+      state.settings?.deviceId,
+      state.settings?.hubMode,
+      scope
+    );
+    const context = [
+      state.mode,
+      state.settings?.hubMode || '',
+      state.settings?.hubUrl || '',
+      state.settings?.deviceId || '',
+      state.settings?.clients || '',
+      scope,
+      selection.source
+    ].join('|');
+    let tracker = displayLiveTokenRateTrackers.get(scope);
+    if (!tracker) {
+      tracker = tokenRateApi.createLiveTokenRateGroupTracker({
+        now: () => Date.now(),
+        activeMs: LIVE_TOKEN_RATE_ACTIVE_MS,
+        clearMs: LIVE_TOKEN_RATE_CLEAR_MS
+      });
+      displayLiveTokenRateTrackers.set(scope, tracker);
+    }
+    if (displayLiveTokenRateContexts.get(scope) !== context) {
+      displayLiveTokenRateContexts.set(scope, context);
+      tracker.reset(selection.entries);
+      changed = true;
+    } else {
+      changed = tracker.observe(selection.entries).changed || changed;
+    }
+  }
+  for (const scope of [...displayLiveTokenRateTrackers.keys()]) {
+    if (scopes.has(scope)) continue;
+    displayLiveTokenRateTrackers.delete(scope);
+    displayLiveTokenRateContexts.delete(scope);
+    changed = true;
+  }
+  scheduleDisplayLiveTokenRateExpiry();
+  return changed;
+}
+
+function displayLiveTokenRateSamples() {
+  const device = displayLiveTokenRateTrackers.get('device')?.getSample() || null;
+  const all = effectiveDisplayLiveTokenRateScope('all') === 'all'
+    ? displayLiveTokenRateTrackers.get('all')?.getSample() || null
+    : device;
+  return { all, device };
+}
+
+function scheduleLiveTokenRateExpiry() {
+  if (liveTokenRateIdleTimer) clearTimeout(liveTokenRateIdleTimer);
+  liveTokenRateIdleTimer = null;
+  const expiresAt = liveTokenRateTracker.nextExpiryAt();
+  if (!expiresAt) return;
+  liveTokenRateIdleTimer = setTimeout(() => {
+    liveTokenRateIdleTimer = null;
+    renderLiveTokenRate();
+    scheduleLiveTokenRateExpiry();
+  }, Math.max(0, expiresAt - Date.now()) + 10);
+}
+
+function observeLiveTokenRate(stats) {
+  if (state.settings?.showLiveTokenRate !== true) return;
+  const selection = tokenRateApi.selectLiveTokenRatePeriods(
+    stats,
+    state.settings?.deviceId,
+    state.settings?.hubMode,
+    effectiveLiveTokenRateScope()
+  );
+  const sourceKey = liveTokenRateSourceKey(selection.source);
+  if (sourceKey !== liveTokenRateContext) {
+    liveTokenRateContext = sourceKey;
+    liveTokenRateTracker.reset(selection.entries);
+    clearLiveTokenRateTimers();
+    renderLiveTokenRate();
+    return;
+  }
+  const result = liveTokenRateTracker.observe(selection.entries);
+  if (!result.changed) return;
+  scheduleLiveTokenRateExpiry();
+  renderLiveTokenRate();
+}
+
+function formatLiveTokenRate(value) {
+  const rate = Math.max(0, Number(value) || 0);
+  if (rate > 0 && rate < 0.1) return '<0.1';
+  if (rate > 0 && rate < 1) {
+    return rate.toLocaleString(currentLocale(), { maximumFractionDigits: 1 });
+  }
+  return formatCompact(rate, effectiveCompactTokenUnits(), currentLocale());
+}
+
+function renderLiveTokenRate() {
+  if (!els.liveTokenRate || !els.liveTokenRateValue) return;
+  const enabled = state.settings?.showLiveTokenRate === true;
+  if (!enabled) {
+    resetLiveTokenRateTracking();
+    limitWindowsView.setDetailTooltip(els.liveTokenRate, null);
+  }
+  els.liveTokenRate.classList.toggle('hidden', !enabled);
+  syncLiveTokenRateFooterState();
+  if (!enabled) return;
+
+  const burn = state.settings?.tokenRateMode === 'burn';
+  const sample = liveTokenRateTracker.getSample();
+  const unit = burn ? 'TPM' : 'tok/s';
+  const rate = sample ? (burn ? sample.burn : sample.speed) : null;
+  const value = rate === null ? '—' : formatLiveTokenRate(rate);
+  const text = `${value} ${unit}`;
+  const idle = !sample || sample.idle === true;
+  els.liveTokenRateValue.textContent = text;
+  els.liveTokenRate.dataset.mode = burn ? 'burn' : 'speed';
+  els.liveTokenRate.classList.toggle('is-idle', idle);
+  if (idle) els.liveTokenRate.classList.remove('is-fresh');
+  const scope = t(effectiveLiveTokenRateScope() === 'all'
+    ? 'settings.appearance.liveTokenRateScopeAll'
+    : 'settings.appearance.liveTokenRateScopeDevice');
+  const labelKey = idle && sample
+    ? (burn ? 'home.liveTokenRate.burnIdleTitle' : 'home.liveTokenRate.speedIdleTitle')
+    : (burn ? 'home.liveTokenRate.burnTitle' : 'home.liveTokenRate.speedTitle');
+  const label = t(labelKey, { value: text, scope });
+  const detailEntries = tokenRateApi.liveTokenRateTooltipEntries(
+    sample, burn ? 'burn' : 'speed', formatLiveTokenRate
+  );
+  limitWindowsView.setDetailTooltip(els.liveTokenRate, detailEntries.length ? detailEntries : null);
+  for (const cell of els.liveTokenRate.querySelectorAll('.limit-detail-tooltip-row span:first-child')) {
+    const model = cell.textContent;
+    const icon = document.createElement('span');
+    icon.className = `row-icon row-icon-${modelVendorFor(model) || 'token-monitor'}`;
+    icon.setAttribute('aria-hidden', 'true');
+    const name = document.createElement('span');
+    name.className = 'live-token-rate-model-label';
+    name.textContent = model;
+    cell.classList.add('live-token-rate-model-name');
+    cell.replaceChildren(icon, name);
+  }
+  if (!detailEntries.length) els.liveTokenRate.title = label;
+  els.liveTokenRate.setAttribute('aria-label', [label, ...detailEntries.map((entry) =>
+    Array.isArray(entry) ? entry.join(': ') : entry.full)].join(', '));
+  syncLiveTokenRateFooterState();
+
+  if (!idle && sample.revision !== liveTokenRateRenderedRevision) {
+    liveTokenRateRenderedRevision = sample.revision;
+    els.liveTokenRate.classList.remove('is-fresh');
+    void els.liveTokenRate.offsetWidth;
+    els.liveTokenRate.classList.add('is-fresh');
+    if (liveTokenRateAnimationTimer) clearTimeout(liveTokenRateAnimationTimer);
+    liveTokenRateAnimationTimer = setTimeout(() => {
+      liveTokenRateAnimationTimer = null;
+      els.liveTokenRate?.classList.remove('is-fresh');
+    }, 650);
+  }
+}
+
+function syncLiveTokenRateFooterState() {
+  const footer = els.liveTokenRate?.closest('.footer');
+  if (!footer) return;
+  const enabled = state.settings?.showLiveTokenRate === true;
+  const obscured = !els.toolDetailFooter?.classList.contains('hidden');
+  footer.classList.toggle('live-token-rate-enabled', enabled);
+  footer.classList.toggle('live-token-rate-obscured', enabled && obscured);
+  els.liveTokenRate.tabIndex = enabled && !obscured ? 0 : -1;
+  els.liveTokenRate.setAttribute('aria-hidden', String(!enabled || obscured));
+}
+
 function tokenRateText(rate, burn) {
   // formatCompact rounds, so a sub-0.5 rate would render as a bare "0". Treat that as no
   // data and stay hidden rather than claim a zero pace.
@@ -797,16 +1193,18 @@ function tokenRateText(rate, burn) {
     : '';
 }
 function renderTokenRate() {
-  if (!els.tokenRateReveal) return;
-  tokenRateBoost.refresh();
-  const { burn, rate } = currentTokenRateValue();
-  const boost = tokenRateBoost.getSnapshot();
-  const displayRate = boost ? boost.displayRate : rate;
-  const text = tokenRateText(displayRate, boost ? boost.mode === 'burn' : burn);
-  els.tokenRateReveal.textContent = text;
-  els.tokenRateReveal.classList.toggle('has-value', Boolean(text));
-  els.tokenRateReveal.classList.toggle('boosting', boost?.phase === 'boosting');
-  els.tokenRateReveal.classList.toggle('settling', boost?.phase === 'settling');
+  if (els.tokenRateReveal) {
+    tokenRateBoost.refresh();
+    const { burn, rate } = currentTokenRateValue();
+    const boost = tokenRateBoost.getSnapshot();
+    const displayRate = boost ? boost.displayRate : rate;
+    const text = tokenRateText(displayRate, boost ? boost.mode === 'burn' : burn);
+    els.tokenRateReveal.textContent = text;
+    els.tokenRateReveal.classList.toggle('has-value', Boolean(text));
+    els.tokenRateReveal.classList.toggle('boosting', boost?.phase === 'boosting');
+    els.tokenRateReveal.classList.toggle('settling', boost?.phase === 'settling');
+  }
+  renderLiveTokenRate();
 }
 function startTokenRateBoost(event) {
   if (!tokenRateBoost.start(event)) return;
@@ -825,7 +1223,9 @@ function suppressTokenRateClickAfterHold(event) {
 // The title mark is the only pixel of the reveal that can take a click: a drag region does
 // not deliver mouse events, so this control and its hover target are the same no-drag island.
 //
-// Deliberately pointer-only, and the mark stays a non-focusable aria-hidden span. A focusable
+// The title affordance is deliberately pointer-only, and the mark stays a non-focusable
+// aria-hidden span. The persistent footer reading is the separate keyboard-accessible path.
+// A focusable
 // control here is worse than no keyboard path: the window assigns focus to a control when it
 // is shown, and Chromium then derives :focus-visible from that activation rather than from
 // any click, so the reveal reopens with a focus ring on a window the user just summoned with
@@ -877,7 +1277,33 @@ function compactMonthLabel(label) {
     .format(new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, 1)));
 }
 function currentCurrency() { return currencyApi.normalizeCurrency(state.settings?.currency); }
-function formatCost(value) { return currencyApi.formatCurrencyFromUsd(value, currentCurrency()); }
+function formatCost(value, unpricedTokens) {
+  return usageAttributionRowsApi.usageCostLabel(value, unpricedTokens,
+    (cost) => currencyApi.formatCurrencyFromUsd(cost, currentCurrency()), formatNumber, t('usage.unpricedTokens'));
+}
+function setTotalCost(cost, unpricedTokens, available = true) {
+  let label = els.cost.querySelector('.usage-cost-value');
+  if (!label) {
+    label = document.createElement('span');
+    label.className = 'usage-cost-value';
+    els.cost.replaceChildren(label);
+  }
+  const hasUnpriced = available && unpricedTokens > 0;
+  els.cost.classList.toggle('has-unpriced', hasUnpriced);
+  label.textContent = available
+    ? (hasUnpriced && !(cost > 0) ? '—' : formatCost(cost)) : '';
+  let info = els.cost.querySelector('.usage-cost-info');
+  if (!info && hasUnpriced) {
+    info = document.createElement('span');
+    info.className = 'usage-cost-info';
+    els.cost.append(info);
+  }
+  if (!info) return;
+  info.hidden = !hasUnpriced;
+  limitWindowsView.setDetailTooltip(info, hasUnpriced
+    ? [{ full: t('usage.excludedFromCost', { tokens: formatNumber(unpricedTokens) }) }]
+    : null, { centered: true });
+}
 function applyEffectiveCurrencyRates() {
   if (state.settings?.currencyRatesEffective) currencyApi.configureRates(state.settings.currencyRatesEffective);
 }
@@ -918,22 +1344,10 @@ function syncCurrencyRateControls() {
 }
 function formatTime(value) { const date = value ? new Date(value) : new Date(); return Number.isNaN(date.getTime()) ? '--:--:--' : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
 function formatPercent(value) { return Number.isFinite(Number(value)) ? `${Math.round(Number(value))}%` : '--'; }
-function formatReset(value) {
-  const diffMs = limitProviderPresentationApi.limitResetRemainingMs(value);
-  if (diffMs === null) return '';
-  if (diffMs === 0) return 'Reset now';
-  return `Reset ${formatDuration(diffMs)}`;
-}
-function formatDuration(ms) {
-  const totalMinutes = Math.max(0, Math.round(ms / 60000));
-  const days = Math.floor(totalMinutes / 1440);
-  const hours = Math.floor((totalMinutes % 1440) / 60);
-  const minutes = totalMinutes % 60;
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m`;
-  return '<1m';
-}
+// The quota-boundary wording lives beside the reset arithmetic it reads, so the
+// edge dock renders the same line from the same function rather than its own.
+const formatLimitBoundary = limitProviderPresentationApi.limitBoundaryText;
+const formatDuration = limitProviderPresentationApi.limitDurationText;
 function formatActiveDuration(ms) {
   const totalMinutes = Math.max(0, Math.round(Number(ms || 0) / 60000));
   const hours = Math.floor(totalMinutes / 60);
@@ -942,32 +1356,10 @@ function formatActiveDuration(ms) {
   if (minutes > 0) return `${minutes}m`;
   return '0m';
 }
-function formatUpdatedAge(value) {
-  const date = value ? new Date(value) : null;
-  if (!date || Number.isNaN(date.getTime())) return 'Update unknown';
-  const diffMs = Math.max(0, Date.now() - date.getTime());
-  if (diffMs < 45_000) return 'Updated just now';
-  const minutes = Math.round(diffMs / 60000);
-  if (minutes < 60) return `Updated ${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `Updated ${hours}h ago`;
-  return `Updated ${Math.round(hours / 24)}d ago`;
-}
 function versionText(value) {
   return value ? `v${value}` : 'unknown';
 }
 
-function compactAge(value) {
-  const date = value ? new Date(value) : null;
-  if (!date || Number.isNaN(date.getTime())) return '';
-  const diffMs = Math.max(0, Date.now() - date.getTime());
-  if (diffMs < 45_000) return t('settings.age.justNow');
-  const minutes = Math.round(diffMs / 60000);
-  if (minutes < 60) return t('settings.age.minutesAgo', { minutes });
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return t('settings.age.hoursAgo', { hours });
-  return t('settings.age.daysAgo', { days: Math.round(hours / 24) });
-}
 function colorWithAlpha(hex, alpha) {
   const raw = String(hex || '').replace('#', '');
   if (!/^[0-9a-f]{6}$/i.test(raw)) return `rgba(183, 234, 212, ${alpha})`;
@@ -977,135 +1369,31 @@ function colorWithAlpha(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-function setTokscaleMessage(text = '', tone = '') {
-  if (!els.tokscaleMessage) return;
-  els.tokscaleMessage.textContent = text;
-  els.tokscaleMessage.classList.toggle('error', tone === 'error');
-  els.tokscaleMessage.classList.toggle('success', tone === 'success');
-}
-
-function mergeTokscalePayload(payload) {
-  if (!payload || typeof payload !== 'object') return;
-  if (payload.status) state.tokscaleStatus = payload.status;
-  else if (payload.supported === false) state.tokscaleStatus = { supported: false };
-  else if (payload.current || payload.bundled || payload.downloaded) {
-    state.tokscaleStatus = {
-      ...(state.tokscaleStatus || { supported: true }),
-      supported: payload.supported !== false,
-      current: payload.current ?? state.tokscaleStatus?.current ?? null,
-      bundled: payload.bundled ?? state.tokscaleStatus?.bundled ?? null,
-      downloaded: payload.downloaded ?? state.tokscaleStatus?.downloaded ?? null
-    };
-  }
-  if (payload.npm || payload.checkedAt) {
-    state.tokscaleCheck = {
-      newer: Boolean(payload.newer),
-      npm: payload.npm || state.tokscaleCheck?.npm || null,
-      checkedAt: payload.checkedAt || state.tokscaleCheck?.checkedAt || null
-    };
-  }
-  if (payload.downloaded === true && state.tokscaleCheck?.npm?.version === payload.version) {
-    state.tokscaleCheck = { ...state.tokscaleCheck, newer: false };
-  }
-}
-
 function renderTokscaleStatus() {
   if (!els.tokscaleGroup) return;
   const status = state.tokscaleStatus;
-  const advancedSummaryKey = state.tokscaleCheck?.newer
-    ? 'settings.advanced.tokscaleUpdate'
-    : 'settings.advanced.summary';
-  if (els.advancedSettingsSummary) {
-    els.advancedSettingsSummary.dataset.i18n = advancedSummaryKey;
-    els.advancedSettingsSummary.textContent = t(advancedSummaryKey);
-  }
   if (status?.supported === false) {
     els.tokscaleGroup.classList.add('hidden');
     return;
   }
   els.tokscaleGroup.classList.remove('hidden');
   const current = status?.current;
-  const source = current?.source === 'downloaded'
-    ? (current.installedAt
-      ? t('settings.tokscale.downloadedSourceWithAge', { age: compactAge(current.installedAt) })
-      : t('settings.tokscale.downloadedSource'))
-    : t('settings.tokscale.bundledSource');
-  els.tokscaleInstalled.textContent = current ? `${versionText(current.version)} (${source})` : t('settings.common.notFound');
-  els.tokscaleBundledLine.classList.toggle('hidden', !status?.downloaded || !status?.bundled);
-  els.tokscaleBundled.textContent = status?.bundled ? versionText(status.bundled.version) : '—';
-  if (state.tokscaleCheck?.npm?.version) {
-    els.tokscaleNpm.textContent = state.tokscaleCheck.newer
-      ? versionText(state.tokscaleCheck.npm.version)
-      : t('settings.appUpdate.latestWithStatus', { version: state.tokscaleCheck.npm.version, status: t('settings.tokscale.currentSuffix') });
-  } else {
-    els.tokscaleNpm.textContent = t('settings.common.notChecked');
-  }
-  els.checkTokscaleButton.disabled = state.tokscaleBusy;
-  els.downloadTokscaleButton.disabled = state.tokscaleBusy;
-  els.resetTokscaleButton.disabled = state.tokscaleBusy;
-  els.downloadTokscaleButton.classList.toggle('hidden', !state.tokscaleCheck?.newer);
-  els.resetTokscaleButton.classList.toggle('hidden', !status?.downloaded);
+  els.tokscaleInstalled.textContent = current?.version
+    ? versionText(current.version)
+    : t(status ? 'settings.tokscale.versionUnknown' : 'settings.common.checking');
+  const build = status?.bundledBuild;
+  els.tokscaleBundledBuildRow.classList.toggle('hidden', !build);
+  els.tokscaleBundledBuild.textContent = build ? `fork ${build.commit.slice(0, 8)}` : '';
 }
 
 async function refreshTokscaleStatus() {
   if (!window.tokenMonitor.getTokscaleStatus) return;
   try {
     state.tokscaleStatus = await window.tokenMonitor.getTokscaleStatus();
-    renderTokscaleStatus();
-  } catch (error) {
-    setTokscaleMessage(error.message, 'error');
+  } catch (_) {
+    state.tokscaleStatus = {};
   }
-}
-
-async function checkTokscaleNpm() {
-  state.tokscaleBusy = true;
-  setTokscaleMessage(t('settings.tokscale.checkingNpm'));
   renderTokscaleStatus();
-  try {
-    const result = await window.tokenMonitor.checkTokscaleNpm();
-    if (result?.error) throw new Error(result.error);
-    mergeTokscalePayload(result);
-    if (state.tokscaleStatus?.supported === false) return;
-    setTokscaleMessage(state.tokscaleCheck?.newer ? t('settings.tokscale.newerOnNpm') : t('settings.tokscale.bundledCurrent'));
-  } catch (error) {
-    setTokscaleMessage(error.message, 'error');
-  } finally {
-    state.tokscaleBusy = false;
-    renderTokscaleStatus();
-  }
-}
-
-async function downloadTokscaleFromNpm() {
-  state.tokscaleBusy = true;
-  setTokscaleMessage(t('settings.tokscale.downloading'));
-  renderTokscaleStatus();
-  try {
-    const result = await window.tokenMonitor.downloadTokscaleFromNpm();
-    if (result?.error) throw new Error(result.error);
-    mergeTokscalePayload(result);
-    setTokscaleMessage(t('settings.tokscale.downloaded', { version: versionText(result.version) }), 'success');
-  } catch (error) {
-    setTokscaleMessage(error.message, 'error');
-  } finally {
-    state.tokscaleBusy = false;
-    renderTokscaleStatus();
-  }
-}
-
-async function resetTokscaleToBundled() {
-  state.tokscaleBusy = true;
-  setTokscaleMessage(t('settings.tokscale.resetting'));
-  renderTokscaleStatus();
-  try {
-    state.tokscaleStatus = await window.tokenMonitor.resetTokscaleToBundled();
-    state.tokscaleCheck = null;
-    setTokscaleMessage(t('settings.tokscale.usingBundled'), 'success');
-  } catch (error) {
-    setTokscaleMessage(error.message, 'error');
-  } finally {
-    state.tokscaleBusy = false;
-    renderTokscaleStatus();
-  }
 }
 function easeOutQuart(t) { return 1 - Math.pow(1 - t, 4); }
 
@@ -1161,32 +1449,7 @@ function animateTotalNumber(el, from, to, duration) {
 const rowNumberAnimations = new Map();
 const rowBarAnimations = new Map();
 const rowRenderFingerprints = new WeakMap();
-const largeSessionContainmentScheduler = createAfterLayoutScheduler(
-  typeof requestAnimationFrame === 'function' ? requestAnimationFrame : null,
-  typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame : null
-);
-
-function updateLargeSessionContainment(enabled, { remeasure = false } = {}) {
-  els.breakdown.classList.toggle('large-session-list', enabled);
-  if (!enabled) {
-    largeSessionContainmentScheduler.cancel();
-    els.breakdown.classList.remove('large-session-list-ready');
-    return;
-  }
-  if (remeasure) {
-    largeSessionContainmentScheduler.cancel();
-    els.breakdown.classList.remove('large-session-list-ready');
-  }
-  if (largeSessionContainmentScheduler.pending() || els.breakdown.classList.contains('large-session-list-ready')) return;
-  // Let Chromium lay out every new row without size containment first. The
-  // `auto` intrinsic size can then retain each row's real block size before
-  // off-screen rendering is enabled, avoiding scroll-geometry corrections.
-  largeSessionContainmentScheduler.schedule(() => {
-    if (els.breakdown.classList.contains('large-session-list')) {
-      els.breakdown.classList.add('large-session-list-ready');
-    }
-  });
-}
+const toolDetailData = new WeakMap();
 
 function prefersReducedMotion() {
   return motionPreferenceApi.shouldReduceMotion(state.settings?.reduceMotion, reducedMotionMedia?.matches);
@@ -1206,6 +1469,7 @@ function settleMotionAnimations() {
     delete el.dataset.motionTarget;
   }
   rowNumberAnimations.clear();
+  limitResetAnimator.settle(els.limitsPanel);
   for (const animation of document.getAnimations?.() || []) {
     try { animation.finish(); } catch (_) { animation.cancel(); }
   }
@@ -1331,7 +1595,15 @@ function animateBreakdownFrom(snapshot, { duration = 420 } = {}) {
   }
 }
 
-function animateBarBetween(fill, fromScale, toScale, delay = 0, duration = 420) {
+function animateBarBetween(
+  fill,
+  fromScale,
+  toScale,
+  delay = 0,
+  duration = 420,
+  easing = 'cubic-bezier(0.22, 1, 0.36, 1)',
+  startedAt = null
+) {
   if (!fill?.animate) return;
   const previous = rowBarAnimations.get(fill);
   const previousIsActive = previous?.animation.pending || previous?.animation.playState === 'running';
@@ -1345,9 +1617,10 @@ function animateBarBetween(fill, fromScale, toScale, delay = 0, duration = 420) 
   ], {
     duration,
     delay,
-    easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+    easing,
     fill: 'backwards'
   });
+  if (startedAt !== null) animation.startTime = startedAt;
   const motion = { animation, target: toScale };
   const forget = () => {
     if (rowBarAnimations.get(fill) === motion) rowBarAnimations.delete(fill);
@@ -1442,23 +1715,131 @@ function applyBarScale(fill, scale) {
   animateBarBetween(fill, 0, safeScale, 0, 420);
 }
 
-function rowWidth(value, max) {
-  if (Number(value) <= 0) return 0;
-  return max > 0 ? Math.max(2, Math.min(100, (value / max) * 100)) : 0;
+function animateCachedLimitBarsFromZero() {
+  if (!state.animateBarsFromZero || prefersReducedMotion()) return;
+  for (const fill of els.limitsPanel?.querySelectorAll('.limit-meter-fill') || []) {
+    const targetScale = Math.max(
+      0,
+      Math.min(1, Number(fill.style.getPropertyValue('--bar-scale')) || 0)
+    );
+    animateBarBetween(fill, 0, targetScale, 0, 420);
+  }
 }
 
 function rowTemplate(rowData) {
-  const { key, name, platform, client, subtitle, detail, kind } = rowData;
+  const { key, name, platform, client, subtitle, activity, detail, kind } = rowData;
   const row = document.createElement('div');
   row.dataset.key = key;
   if (platform) row.dataset.platform = platform;
   if (client) row.dataset.client = client;
   if (kind) row.dataset.kind = kind;
-  row.innerHTML = '<div class="row-head"><div class="row-name"><span class="row-mark"></span><div class="row-label"><span class="row-title"></span><span class="row-subtitle"></span><span class="row-detail"></span></div></div><div class="row-metrics"><div class="row-value"></div><div class="row-cost"></div></div></div><div class="row-body"><div class="bar"><div class="bar-fill"></div></div><div class="row-accordion"><div class="row-accordion-inner"></div></div></div>';
+  // `.row-live` is absolutely positioned over the mark's corner and `.row-context`
+  // is the third metrics line; both stay empty and hidden on every row that is
+  // not a live session, so the shared template keeps building one shape.
+  row.innerHTML = `<div class="row-head"><div class="row-name"><span class="row-mark"></span><span class="row-live" aria-hidden="true">${rowLiveMarkup}</span><div class="row-label"><span class="row-title"></span><span class="row-subtitle"></span><span class="row-activity"></span><span class="row-detail"></span></div></div><div class="row-metrics"><div class="row-value"></div><div class="row-cost"></div><div class="row-context hidden"><span class="row-context-meter"><span class="row-context-fill"></span></span><span class="row-context-value"></span></div></div></div><div class="row-body"><div class="bar"><div class="bar-fill"></div></div><div class="row-accordion"><div class="row-accordion-inner"></div></div></div>`;
   row.querySelector('.row-title').textContent = name;
   row.querySelector('.row-subtitle').textContent = subtitle || '';
+  row.querySelector('.row-activity').textContent = activity || '';
   row.querySelector('.row-detail').textContent = detail || '';
+  bindHoverMarquee(row.querySelector('.row-title'));
+  bindHoverMarquee(row.querySelector('.row-subtitle'));
+  bindHoverMarquee(row.querySelector('.row-activity'));
+  bindHoverMarquee(row.querySelector('.row-detail'));
   return row;
+}
+
+const DEVICE_DELETE_CONFIRMATION_MS = 3000;
+const armedDeviceDeleteButtons = new Set();
+const devicesBeingDeleted = new Set();
+const deviceDeleteConfirmationTimers = new WeakMap();
+
+function clearDeviceDeleteConfirmationTimer(remove) {
+  const timer = deviceDeleteConfirmationTimers.get(remove);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  deviceDeleteConfirmationTimers.delete(remove);
+}
+
+function resetDeviceDeleteConfirmation(remove, defaultText = remove.dataset.idleText || '') {
+  clearDeviceDeleteConfirmationTimer(remove);
+  armedDeviceDeleteButtons.delete(remove);
+  remove.dataset.confirm = '';
+  remove.querySelector('.device-delete-label').textContent = defaultText;
+}
+
+function armDeviceDeleteConfirmation(remove) {
+  clearDeviceDeleteConfirmationTimer(remove);
+  armedDeviceDeleteButtons.add(remove);
+  remove.dataset.confirm = 'true';
+  remove.querySelector('.device-delete-label').textContent = remove.dataset.confirmText;
+  const timer = setTimeout(() => resetDeviceDeleteConfirmation(remove), DEVICE_DELETE_CONFIRMATION_MS);
+  deviceDeleteConfirmationTimers.set(remove, timer);
+}
+
+document.addEventListener('pointerdown', (event) => {
+  for (const remove of armedDeviceDeleteButtons) {
+    if (remove !== event.target && !remove.contains?.(event.target)) {
+      resetDeviceDeleteConfirmation(remove);
+    }
+  }
+});
+
+let homeSessionRenderPending = false;
+const overflowText = window.TokenMonitorOverflowText.create({
+  document, window, prefersReducedMotion,
+  enabled: element => Boolean(element.closest('.session-mode, .home-session-row') || element.id === 'syncConnectionEndpoint'),
+  onLeave: () => requestAnimationFrame(() => {
+    if (homeSessionRenderPending && state.breakdown === 'home'
+      && visibleStatsSurface() === 'main' && state.stats) renderHome();
+  })
+});
+
+function bindHoverMarquee(element) { overflowText.bind(element); }
+function setHoverMarqueeText(element, value) { overflowText.setText(element, value); }
+
+bindHoverMarquee(els.syncConnectionEndpoint);
+
+// Two clicks to remove from sync settings: the first arms the button, the
+// second deletes. The usage view has no device-management actions.
+function createDeviceRemoveButton(deviceId, deleteText, deleteConfirmText) {
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'device-delete-button';
+  remove.dataset.deviceId = deviceId;
+  remove.dataset.idleText = deleteText;
+  remove.dataset.confirmText = deleteConfirmText;
+  remove.disabled = devicesBeingDeleted.has(deviceId);
+  const label = document.createElement('span');
+  label.className = 'device-delete-label';
+  label.textContent = deleteText;
+  remove.append(label);
+  const resetConfirmation = () => resetDeviceDeleteConfirmation(remove);
+  remove.addEventListener('blur', resetConfirmation);
+  remove.addEventListener('click', async () => {
+    if (devicesBeingDeleted.has(deviceId)) return;
+    if (remove.dataset.confirm !== 'true') {
+      armDeviceDeleteConfirmation(remove);
+      return;
+    }
+    remove.disabled = true;
+    devicesBeingDeleted.add(deviceId);
+    try {
+      await window.tokenMonitor.deleteDevice(deviceId);
+      resetConfirmation();
+      await refreshStats();
+    } catch (_) {
+      resetConfirmation();
+    } finally {
+      devicesBeingDeleted.delete(deviceId);
+      // Stats may have replaced the original button while IPC was pending.
+      for (const current of [remove, ...document.querySelectorAll('.device-delete-button')]) {
+        if (current.dataset.deviceId !== deviceId) continue;
+        current.disabled = false;
+        resetDeviceDeleteConfirmation(current);
+      }
+    }
+  });
+  return remove;
 }
 
 function renderDeviceAccordion(accordionInner, deviceDetail) {
@@ -1472,7 +1853,7 @@ function renderDeviceAccordion(accordionInner, deviceDetail) {
       Math.round(tool.percent),
       tool.color,
       tool.models.map((model) => [model.key, model.value])
-    ])
+      ])
   ]);
   if (accordionInner.dataset.signature === signature) return;
 
@@ -1541,10 +1922,201 @@ function renderDeviceAccordion(accordionInner, deviceDetail) {
   accordionInner.dataset.signature = signature;
 }
 
-function updateRow(row, { name, subtitle, detail, value, cost, max, color, barBackground, accordionRows, deviceDetail, stale, platform, local, client, kind, cacheReadTokens, outputTokens, unclassifiedTokens, tokenDataUnavailable, sessionDetailAvailable }) {
-  const width = rowWidth(value, max);
+function appendAccordionMetricRow(content, labelText, valueText, percent = null, className = '') {
+  const item = document.createElement('div');
+  item.className = `accordion-row${className ? ` ${className}` : ''}`;
+  const label = document.createElement('div');
+  label.className = 'accordion-label';
+  const name = document.createElement('span');
+  name.className = 'accordion-item-name';
+  name.textContent = labelText;
+  label.append(name);
+  if (percent !== null) {
+    const share = document.createElement('span');
+    share.className = 'accordion-pct';
+    share.textContent = toolDetailsApi.detailPercentLabel(percent);
+    label.append(share);
+  }
+  const metric = document.createElement('div');
+  metric.className = 'accordion-value';
+  metric.textContent = valueText;
+  item.append(label, metric);
+  content.append(item);
+}
+
+function renderToolDetailAccordion(accordionInner, detail) {
+  toolDetailData.set(accordionInner, detail);
+  const modelRows = Array.isArray(detail.modelRows) ? detail.modelRows : [];
+  const hasTokenDetails = detail.tokenDetailsAvailable === true;
+  const hasModels = modelRows.length > 0;
+  const labels = {
+    tokens: t('dashboard.heatmap.tokens'),
+    models: t('views.model'),
+    cacheHit: t('dashboard.tooltip.inputCacheHit'),
+    cacheMiss: t('dashboard.tooltip.inputCacheMiss'),
+    output: t('dashboard.tooltip.output'),
+    unclassified: t('dashboard.tooltip.unclassified')
+  };
+  const tokenParts = hasTokenDetails
+    ? fixedPeriodRangesApi.tokenComponentBreakdown({
+      totalTokens: detail.value,
+      cacheReadTokens: detail.cacheReadTokens,
+      outputTokens: detail.outputTokens,
+      unclassifiedTokens: detail.unclassifiedTokens
+    })
+    : null;
+  const mode = state.toolDetailMode === 'models' && hasModels ? 'models' : 'tokens';
+  const signature = JSON.stringify([
+    detail.name,
+    detail.value,
+    mode,
+    labels,
+    tokenParts,
+    modelRows.map((model) => [model.key, model.value, model.cost, Math.round(model.percent)])
+  ]);
+  if (accordionInner.dataset.signature === signature) return;
+
+  const content = document.createElement('div');
+  content.className = 'accordion-content tool-detail-content';
+
+  if (mode === 'tokens' && hasTokenDetails) {
+    const inputPercentages = toolDetailsApi.tokenInputPercentages(tokenParts);
+    appendAccordionMetricRow(content, labels.cacheHit, formatNumber(tokenParts.cacheRead), inputPercentages.hit);
+    appendAccordionMetricRow(content, labels.cacheMiss, formatNumber(tokenParts.cacheMiss), inputPercentages.miss);
+    appendAccordionMetricRow(content, labels.output, formatNumber(tokenParts.output));
+    if (tokenParts.unclassified > 0) {
+      appendAccordionMetricRow(content, labels.unclassified, formatNumber(tokenParts.unclassified));
+    }
+  }
+
+  if (mode === 'models' && hasModels) {
+    for (const model of modelRows) {
+      const metric = model.value > 0 ? formatNumber(model.value) : formatCost(model.cost);
+      const label = model.unattributed === true ? labels.unclassified : model.name;
+      appendAccordionMetricRow(content, label, metric, model.value > 0 ? model.percent : null, 'tool-model-row');
+    }
+  }
+
+  accordionInner.replaceChildren(content);
+  accordionInner.dataset.signature = signature;
+}
+
+function activeToolDetail() {
+  if (visibleStatsSurface() !== 'main' || state.breakdown !== 'tool') return null;
+  const accordionInner = els.breakdown.querySelector('.row.expanded .row-accordion-inner');
+  const detail = accordionInner ? toolDetailData.get(accordionInner) : null;
+  if (!accordionInner || !detail) return null;
+  const hasTokenDetails = detail.tokenDetailsAvailable === true;
+  const hasModels = Array.isArray(detail.modelRows) && detail.modelRows.length > 0;
+  return hasTokenDetails && hasModels ? { accordionInner, detail } : null;
+}
+
+function renderActiveToolDetail() {
+  const active = activeToolDetail();
+  if (!active) return;
+  renderToolDetailAccordion(active.accordionInner, active.detail);
+}
+
+function renderToolDetailFooter() {
+  const active = activeToolDetail();
+  els.toolDetailFooter.classList.toggle('hidden', !active);
+  syncLiveTokenRateFooterState();
+  if (!active) return;
+  const mode = state.toolDetailMode;
+  els.toolDetailFooter.setAttribute('aria-label', active.detail.name);
+  els.toolDetailFooterTokens.textContent = t('dashboard.heatmap.tokens');
+  els.toolDetailFooterModels.textContent = t('views.model');
+  els.toolDetailFooterTokens.setAttribute('aria-pressed', String(mode === 'tokens'));
+  els.toolDetailFooterModels.setAttribute('aria-pressed', String(mode === 'models'));
+}
+
+function setActiveToolDetailMode(mode) {
+  const active = activeToolDetail();
+  if (!active || (mode !== 'tokens' && mode !== 'models') || state.toolDetailMode === mode) return;
+  state.toolDetailMode = mode;
+  renderToolDetailAccordion(active.accordionInner, active.detail);
+  renderToolDetailFooter();
+}
+
+// The live-session pair: a dot on the tool mark for "this is being written to
+// right now", and a fuel gauge for how much of its context window is left. The
+// dot is drawn only while the agent is working and the gauge only while the
+// session is recent, so a list of several hundred past sessions is untouched.
+function updateRowContext(row, context, promptCache, contextSnapshot) {
+  const gauge = row.querySelector('.row-context');
+  if (!gauge) return;
+  const percentLeft = context ? Number(context.percentLeft) : NaN;
+  if (!Number.isFinite(percentLeft)) {
+    gauge.classList.toggle('hidden', !promptCache);
+    gauge.dataset.tone = '';
+    gauge.querySelector('.row-context-meter').classList.add('hidden');
+    gauge.querySelector('.row-context-value').textContent = promptCache ? t('session.cacheEstimate', { minutes: promptCache.minutes }) : '';
+    sessionRowsApi.setSessionTooltip(gauge, promptCache ? contextSnapshot : null, promptCache, t, limitWindowsView);
+    return;
+  }
+  gauge.classList.remove('hidden');
+  gauge.querySelector('.row-context-meter').classList.remove('hidden');
+  // Headroom is what decides the colour whichever way the number is written:
+  // a gauge reading "93% used" is the same emergency as one reading "7% left".
+  gauge.dataset.tone = String(context.tone || '');
+  // The session gauge has its own Remaining/Used preference rather than
+  // following AI Tool Limits: that setting describes provider quota meters,
+  // where the number a plan is sold on is what is left, while a context
+  // window is a budget being spent and the clients themselves show used.
+  // Default is used, matching Codex and Claude Code's own readouts.
+  const showUsed = state.settings?.sessionContextMetric !== 'remaining';
+  const percent = showUsed ? Number(context.percentUsed) : percentLeft;
+  sessionRowsApi.setSessionTooltip(gauge, context, promptCache, t, limitWindowsView);
+  gauge.querySelector('.row-context-value').textContent = `${percent}%`;
+  gauge.querySelector('.row-context-fill').style.setProperty('--bar-scale', String(percent / 100));
+}
+
+// Flare the row's live dot once when that session's transcript actually moved,
+// reusing the titlebar dot's one-shot pattern (remove, reflow, re-add) rather
+// than running a perpetual pulse: a session that is open but idle should look
+// different from one that is generating right now, and an `infinite` animation
+// in an always-open widget never lets the compositor idle. The reduced-motion
+// rules already neutralise every animation, so this needs no guard of its own.
+// A session row already leads with the client's own icon, so its state mark is a
+// small dot at the icon's corner rather than the dock card's glyph stack: a
+// spinner or a check drawn over a vendor logo reads as part of the logo and
+// muddies it, and the card has no such icon to compete with.
+//
+// The old idiom is kept - a green dot means "active right now" - with the dot
+// simply not drawn once the transcript says the turn is over. No spinner, no
+// check, no idle placeholder: a quiet row shows nothing, exactly as before.
+const rowLiveMarkup = '<span class="row-live-dot"></span><span class="row-live-waiting"></span>';
+
+function updateRowLive(row, activityState, activityAt) {
+  const dot = row.querySelector('.row-live');
+  if (!dot) return;
+  // Running keeps the green dot; explicit waiting gets a static attention mark.
+  // Finished and historical rows stay quiet.
+  const active = activityState === 'running';
+  dot.classList.toggle('is-active', active);
+  dot.classList.toggle('is-waiting', activityState === 'waiting');
+  dot.title = activityState === 'waiting' ? t('session.waiting') : active ? (t('session.running') || 'Running') : '';
+  dot.setAttribute('aria-label', dot.title);
+  dot.setAttribute('role', 'img');
+  dot.setAttribute('aria-hidden', dot.title ? 'false' : 'true');
+  const previous = Number(row.dataset.activityAt || 0);
+  const next = Number(activityAt) || 0;
+  if (next > 0) row.dataset.activityAt = String(next);
+  // Never on a first render: a list that flashes every dot as it arrives says
+  // nothing about which session just moved.
+  if (!active || !previous || next <= previous) return;
+  dot.classList.remove('pulse');
+  void dot.offsetWidth;
+  dot.classList.add('pulse');
+}
+
+function updateRow(row, { name, subtitle, activity, detail, value, cost, unpricedTokens, barValue, max, color, barBackground, accordionRows, deviceDetail, stale, platform, local, client, kind, modelSource, cacheReadTokens, outputTokens, unclassifiedTokens, modelRows, modelLabel, modelTooltipEntries, tokenDataUnavailable, sessionDetailAvailable, sessionGroup, running, activityState, context, promptCache, contextSnapshot, sortTime }) {
+  const width = rowWidth(barValue, max);
   const isExpanded = row.classList.contains('expanded');
-  row.className = `row${kind ? ` ${kind}-row` : ''}${stale ? ' stale' : ''}${local ? ' local' : ''}`;
+  // `running` still drives the row class for layout, but the mark's own state
+  // comes from `activityState`, which is what reads the transcript's turn-end
+  // boundary rather than only the recency window.
+  row.className = `row${kind ? ` ${kind}-row` : ''}${stale ? ' stale' : ''}${local ? ' local' : ''}${running ? ' running' : ''}`;
   row.title = local ? 'This device' : '';
   
   if (cacheReadTokens !== undefined || outputTokens !== undefined || unclassifiedTokens !== undefined) {
@@ -1557,13 +2129,17 @@ function updateRow(row, { name, subtitle, detail, value, cost, max, color, barBa
   if (platform !== undefined) row.dataset.platform = platform || '';
   if (client !== undefined) row.dataset.client = client || '';
   if (kind !== undefined) row.dataset.kind = kind || '';
+  if (sessionGroup) row.dataset.sessionGroup = sessionGroup;
+  else delete row.dataset.sessionGroup;
   if (kind === 'session' && client === 'reasonix') {
     row.dataset.detailUnavailable = sessionDetailAvailable === true ? 'false' : 'true';
   } else if (row.hasAttribute('data-detail-unavailable')) {
     row.removeAttribute('data-detail-unavailable');
   }
+  const interactive = Boolean(sessionGroup) || (kind === 'session'
+    && sessionRowsApi.sessionRowDetailAvailable({ client, sessionDetailAvailable }));
   const mark = row.querySelector('.row-mark');
-  const iconKind = iconKindFor({ key: row.dataset.key, platform: row.dataset.platform || '', client: row.dataset.client || '' }, state.breakdown);
+  const iconKind = iconKindFor({ key: row.dataset.key, platform: row.dataset.platform || '', client: row.dataset.client || '', modelSource }, state.breakdown);
   if (iconKind.kind === 'icon') {
     mark.className = `row-mark row-icon ${iconKind.iconClass}`;
     mark.style.background = '';
@@ -1571,13 +2147,49 @@ function updateRow(row, { name, subtitle, detail, value, cost, max, color, barBa
     mark.className = 'row-mark dot';
     mark.style.background = color;
   }
-  row.querySelector('.row-title').textContent = name;
+  const titleEl = row.querySelector('.row-title');
+  setHoverMarqueeText(titleEl, name);
   const subtitleEl = row.querySelector('.row-subtitle');
-  subtitleEl.textContent = subtitle || '';
+  // A multi-model session abbreviates to "N models"; that label opens the same
+  // tooltip the context gauge carries, one row per model with its tokens and
+  // share of the session. A titled row prints the label inside the
+  // client · model line, so the trigger is just the "N models" span; an
+  // untitled row folds it into the title instead, whose whole text then opens
+  // the tooltip. The trigger mirrors the row's own wording rather than adding
+  // chrome, so there is nothing extra on a single-model row.
+  const modelEntries = Array.isArray(modelTooltipEntries) && modelTooltipEntries.length > 1
+    ? modelTooltipEntries : null;
+  const subtitleShowsModel = Boolean(modelEntries && modelLabel && String(subtitle || '').endsWith(modelLabel));
+  if (subtitleShowsModel) {
+    const models = document.createElement('span');
+    models.className = 'session-models';
+    models.textContent = modelLabel;
+    // Inside the marquee's own wrapper, so a long line still scrolls on hover.
+    const subtitleContent = subtitleEl.querySelector('.overflow-text-content') || subtitleEl;
+    subtitleContent.replaceChildren(document.createTextNode(subtitle.slice(0, -modelLabel.length)), models);
+    overflowText.update(subtitleEl);
+    limitWindowsView.setDetailTooltip(models, modelEntries);
+  } else {
+    setHoverMarqueeText(subtitleEl, subtitle);
+  }
+  if (!subtitleShowsModel && modelEntries && modelLabel && String(name || '').endsWith(modelLabel)) {
+    limitWindowsView.setDetailTooltip(titleEl, modelEntries);
+  } else if (titleEl.classList.contains('limit-detail-tooltip-wrap')) {
+    limitWindowsView.setDetailTooltip(titleEl, null);
+  }
   subtitleEl.classList.toggle('hidden', !subtitle);
+  // The activity line carries time, calls, cache hit and tok/s; a narrow window
+  // fades and scrolls it on hover the way the title does rather than wrapping.
+  const activityEl = row.querySelector('.row-activity');
+  setHoverMarqueeText(activityEl, activity);
+  activityEl.classList.toggle('hidden', !activity);
+  // A titled session already has name, client/model and activity lines. Move
+  // its ID into Details, but keep the ID when only two lines remain so untitled
+  // sessions can still be distinguished (including when titles are disabled).
+  const shownDetail = kind === 'session' && interactive && activity ? '' : detail;
   const detailEl = row.querySelector('.row-detail');
-  detailEl.textContent = detail || '';
-  detailEl.classList.toggle('hidden', !detail);
+  setHoverMarqueeText(detailEl, shownDetail);
+  detailEl.classList.toggle('hidden', !shownDetail);
   const valueEl = row.querySelector('.row-value');
   if (tokenDataUnavailable === true) {
     row.dataset.tokenDataUnavailable = 'true';
@@ -1589,7 +2201,17 @@ function updateRow(row, { name, subtitle, detail, value, cost, max, color, barBa
   }
   valueEl.dataset.motionValue = String(Number(value) || 0);
   row.dataset.motionValue = String(Number(value) || 0);
-  row.querySelector('.row-cost').textContent = tokenDataUnavailable === true ? '' : formatCost(cost || 0);
+  const costEl = row.querySelector('.row-cost');
+  const costLabelText = formatCost(cost || 0, unpricedTokens);
+  costEl.textContent = tokenDataUnavailable === true ? ''
+    : unpricedTokens > 0 ? (cost > 0 ? `${formatCost(cost)} + ?` : '—') : costLabelText;
+  costEl.title = tokenDataUnavailable === true ? '' : costLabelText;
+  // The row builder already applied the shared gate (recent enough to have a
+  // reading), so this draws whatever arrived rather than re-deciding from
+  // `running` - that second gate is exactly what made the dock card and this
+  // list disagree about whether a session still had a gauge.
+  updateRowContext(row, context, promptCache, contextSnapshot);
+  updateRowLive(row, activityState || (running === true ? 'running' : 'idle'), sortTime);
   const fill = row.querySelector('.bar-fill');
   fill.style.background = barBackground || color;
   applyBarScale(fill, width / 100);
@@ -1629,66 +2251,44 @@ function updateRow(row, { name, subtitle, detail, value, cost, max, color, barBa
     }
     row.classList.add('has-accordion');
     if (isExpanded) row.classList.add('expanded');
-  } else if ((cacheReadTokens !== undefined || outputTokens !== undefined || unclassifiedTokens !== undefined) && value > 0 && kind !== 'session') {
-    const {
-      cacheRead,
-      cacheMiss,
-      output,
-      unclassified,
-      hitPct,
-      missPct
-    } = fixedPeriodRangesApi.tokenComponentBreakdown({
-      totalTokens: value,
+  } else if (kind !== 'session' && value > 0 && (
+    cacheReadTokens !== undefined
+    || outputTokens !== undefined
+    || unclassifiedTokens !== undefined
+    || (Array.isArray(modelRows) && modelRows.length > 0)
+  )) {
+    renderToolDetailAccordion(accordionInner, {
+      name,
+      value,
       cacheReadTokens,
       outputTokens,
-      unclassifiedTokens
+      unclassifiedTokens,
+      modelRows,
+      tokenDetailsAvailable: cacheReadTokens !== undefined || outputTokens !== undefined || unclassifiedTokens !== undefined
     });
-    
-    delete accordionInner.dataset.signature;
-    accordionInner.innerHTML = `
-      <div class="accordion-content">
-        <div class="accordion-row">
-          <div class="accordion-label">${t('dashboard.tooltip.inputCacheHit')} <span class="accordion-pct">${hitPct}%</span></div>
-          <div class="accordion-value">${formatNumber(cacheRead)}</div>
-        </div>
-        <div class="accordion-row">
-          <div class="accordion-label">${t('dashboard.tooltip.inputCacheMiss')} <span class="accordion-pct">${missPct}%</span></div>
-          <div class="accordion-value">${formatNumber(cacheMiss)}</div>
-        </div>
-        <div class="accordion-row">
-          <div class="accordion-label">${t('dashboard.tooltip.output')}</div>
-          <div class="accordion-value">${formatNumber(output)}</div>
-        </div>
-        ${unclassified > 0 ? `
-        <div class="accordion-row">
-          <div class="accordion-label">${t('dashboard.tooltip.unclassified')}</div>
-          <div class="accordion-value">${formatNumber(unclassified)}</div>
-        </div>` : ''}
-      </div>
-    `;
     row.classList.add('has-accordion');
     if (isExpanded) row.classList.add('expanded');
   } else {
     accordionInner.replaceChildren();
     delete accordionInner.dataset.signature;
+    delete accordionInner.dataset.detailMode;
     row.classList.remove('has-accordion');
     row.classList.remove('expanded');
   }
-  if (row.classList.contains('has-accordion')) {
-    if (row.tabIndex !== 0) row.tabIndex = 0;
-    setAttributeIfChanged(row, 'role', 'button');
-    setAttributeIfChanged(row, 'aria-expanded', String(row.classList.contains('expanded')));
-    const tokenLabel = tokenDataUnavailable === true
-      ? (t('detailTokenUnavailable') || 'Unavailable')
-      : formatNumber(value);
-    const costLabel = tokenDataUnavailable === true ? '' : `, ${t('dashboard.stat.totalCost')}: ${formatCost(cost || 0)}`;
-    setAttributeIfChanged(row, 'aria-label', `${name}, ${t('dashboard.stat.totalTokens')}: ${tokenLabel}${costLabel}`);
-  } else {
-    if (row.hasAttribute('tabindex')) row.removeAttribute('tabindex');
-    if (row.hasAttribute('role')) row.removeAttribute('role');
-    if (row.hasAttribute('aria-expanded')) row.removeAttribute('aria-expanded');
-    if (row.hasAttribute('aria-label')) row.removeAttribute('aria-label');
-  }
+  const rowHead = row.querySelector('.row-head');
+  const hasAccordion = row.classList.contains('has-accordion');
+  const tokenLabel = tokenDataUnavailable === true
+    ? (t('detailTokenUnavailable') || 'Unavailable')
+    : formatNumber(value);
+  const costLabel = tokenDataUnavailable === true ? '' : `, ${t('dashboard.stat.totalCost')}: ${formatCost(cost || 0, unpricedTokens)}`;
+  sessionRowsApi.applyBreakdownRowSemantics(row, rowHead, {
+    interactive,
+    hasAccordion,
+    expanded: row.classList.contains('expanded'),
+    ariaLabel: hasAccordion
+      ? `${name}, ${t('dashboard.stat.totalTokens')}: ${tokenLabel}${costLabel}`
+      : name
+  });
 }
 
 function applyHomeListMark(mark, iconKind, color) {
@@ -1701,26 +2301,118 @@ function applyHomeListMark(mark, iconKind, color) {
   mark.style.background = color;
 }
 
+function sessionPageButton(direction) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `session-page-button session-page-${direction}`;
+  const icon = document.createElement('span');
+  icon.className = 'session-page-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  button.append(icon);
+  button.addEventListener('click', () => {
+    state.sessionPage += direction === 'previous' ? -1 : 1;
+    state.rowSignature = '';
+    els.breakdown.scrollTop = 0;
+    render();
+  });
+  return button;
+}
+
+function sessionPager() {
+  const pager = document.createElement('nav');
+  pager.className = 'session-pager';
+  const status = document.createElement('span');
+  status.className = 'session-page-status';
+  pager.append(
+    sessionPageButton('previous'),
+    status,
+    sessionPageButton('next')
+  );
+  return pager;
+}
+
+function renderSessionPager(page) {
+  const visible = page?.paginated === true;
+  els.sessionPagerHost.classList.toggle('hidden', !visible);
+  const signature = visible
+    ? JSON.stringify([currentLocale(), page.page, page.pageCount, page.start, page.end, page.total])
+    : '';
+  if (signature === state.sessionPagerSignature) return;
+  state.sessionPagerSignature = signature;
+  if (!visible) {
+    els.sessionPagerHost.replaceChildren();
+    return;
+  }
+  let pager = els.sessionPagerHost.querySelector('.session-pager');
+  if (!pager) {
+    pager = sessionPager();
+    els.sessionPagerHost.append(pager);
+  }
+  pager.setAttribute('aria-label', t('sessions.pagination'));
+  const previous = pager.querySelector('.session-page-previous');
+  const next = pager.querySelector('.session-page-next');
+  for (const [button, labelKey] of [
+    [previous, 'sessions.pagePrevious'],
+    [next, 'sessions.pageNext']
+  ]) {
+    button.setAttribute('aria-label', t(labelKey));
+    button.title = t(labelKey);
+  }
+  previous.disabled = page.page === 0;
+  next.disabled = page.page >= page.pageCount - 1;
+  pager.querySelector('.session-page-status').textContent = t('sessions.pageRange', page);
+}
+
 function renderRows(rows, { incompleteHint = '' } = {}) {
-  const largeSessionList = isLargeSessionBreakdown(state.breakdown, rows.length);
+  if (sessionTooltipShouldHoldRender()) return;
   if (rows.length === 0 && !incompleteHint) {
-    updateLargeSessionContainment(false);
     els.breakdown.replaceChildren();
+    renderSessionPager(null);
     state.rowSignature = '';
     return;
   }
-  const max = Math.max(1, ...rows.map((row) => row.value));
-  const liveMotionSnapshot = !state.periodMotionActive && !state.animateBarsFromZero
-    ? captureBreakdownMotion()
-    : null;
+  const page = breakdownPage(rows, { breakdown: state.breakdown, page: state.sessionPage });
+  state.sessionPage = page.page;
+  renderSessionPager(page);
+  const visibleRows = page.rows;
+  const max = barScaleMax(rows);
   const hintText = incompleteHint ? t(incompleteHint) : '';
-  const signature = JSON.stringify([state.breakdown, hintText, rows.map((row) => row.key)]);
+  const signature = JSON.stringify([
+    state.breakdown,
+    hintText,
+    page.page,
+    page.total,
+    visibleRows.map((row) => row.key)
+  ]);
   const children = Array.from(els.breakdown.children);
   const existingHint = children.find((child) => child.classList.contains('breakdown-incomplete-hint'));
-  const existing = new Map(children.filter((child) => child !== existingHint).map((child) => [child.dataset.key, child]));
+  const existing = new Map(children
+    .filter((child) => child !== existingHint)
+    .map((child) => [child.dataset.key, child]));
   const structureChanged = signature !== state.rowSignature;
+  const renderContext = {
+    breakdown: state.breakdown,
+    currency: currentCurrency(),
+    currencyRatesEffective: state.settings?.currencyRatesEffective || null,
+    locale: currentLocale(),
+    showToolIcons: toolIconsEnabled(state.settings?.showToolIcons),
+    // The context gauge carries its own Remaining/Used preference, so flipping
+    // either it or the limits meters has to invalidate these rows.
+    showLimitUsed: state.settings?.showLimitUsed === true,
+    sessionContextMetric: state.settings?.sessionContextMetric === 'remaining' ? 'remaining' : 'used'
+  };
+  const nextFingerprints = new Map(visibleRows.map((row) => [
+    row.key,
+    rowRenderFingerprint(row, max, renderContext)
+  ]));
+  const rowsChanged = structureChanged || visibleRows.some((row) => (
+    rowRenderFingerprints.get(existing.get(row.key)) !== nextFingerprints.get(row.key)
+  ));
+  const liveMotionSnapshot = rowsChanged && !state.periodMotionActive && !state.animateBarsFromZero
+    ? captureBreakdownMotion()
+    : null;
   if (structureChanged) {
-    const nodes = rows.map((row) => existing.get(row.key) || rowTemplate(row));
+    const nodes = visibleRows.map((row) => existing.get(row.key) || rowTemplate(row));
     if (incompleteHint) {
       const hint = existingHint || document.createElement('p');
       hint.className = 'breakdown-incomplete-hint';
@@ -1731,30 +2423,19 @@ function renderRows(rows, { incompleteHint = '' } = {}) {
     els.breakdown.replaceChildren(...nodes);
     state.rowSignature = signature;
   }
-  updateLargeSessionContainment(largeSessionList, { remeasure: structureChanged });
   const current = new Map(Array.from(els.breakdown.children)
     .filter((child) => !child.classList.contains('breakdown-incomplete-hint'))
     .map((child) => [child.dataset.key, child]));
-  const renderContext = {
-    breakdown: state.breakdown,
-    currency: currentCurrency(),
-    currencyRatesEffective: state.settings?.currencyRatesEffective || null,
-    locale: currentLocale(),
-    showToolIcons: toolIconsEnabled(state.settings?.showToolIcons)
-  };
-  for (const rowData of rows) {
+  for (const rowData of visibleRows) {
     const row = current.get(rowData.key);
     if (!row) continue;
-    const fingerprint = rowRenderFingerprint(rowData, max, renderContext);
+    const fingerprint = nextFingerprints.get(rowData.key);
     if (rowRenderFingerprints.get(row) === fingerprint) continue;
-    updateRow(row, { ...rowData, max });
+    updateRow(row, { ...rowData, barValue: rowData.barValue ?? rowData.value, max });
     rowRenderFingerprints.set(row, fingerprint);
   }
+  renderToolDetailFooter();
   if (liveMotionSnapshot) animateBreakdownFrom(liveMotionSnapshot, { duration: 600 });
-}
-
-function deviceLabel(device) {
-  return device.deviceId || device.hostname || 'device';
 }
 
 function deviceColor(stale) {
@@ -1767,23 +2448,22 @@ function deviceRuntimeLabel(value) {
   return String(value || '');
 }
 
-function deviceSyncedLabel(value) {
+function relativeAgeLabel(value) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return '';
   const diffMs = Math.max(0, Date.now() - date.getTime());
-  let age;
-  if (diffMs < 45_000) age = t('settings.age.justNow');
-  else {
-    const minutes = Math.round(diffMs / 60000);
-    if (minutes < 60) age = t('settings.age.minutesAgo', { minutes });
-    else {
-      const hours = Math.round(minutes / 60);
-      age = hours < 24
-        ? t('settings.age.hoursAgo', { hours })
-        : t('settings.age.daysAgo', { days: Math.round(hours / 24) });
-    }
-  }
-  return t('devices.synced', { age });
+  if (diffMs < 45_000) return t('settings.age.justNow');
+  const minutes = Math.round(diffMs / 60000);
+  if (minutes < 60) return t('settings.age.minutesAgo', { minutes });
+  const hours = Math.round(minutes / 60);
+  return hours < 24
+    ? t('settings.age.hoursAgo', { hours })
+    : t('settings.age.daysAgo', { days: Math.round(hours / 24) });
+}
+
+function deviceSyncedLabel(value) {
+  const age = relativeAgeLabel(value);
+  return age ? t('devices.synced', { age }) : '';
 }
 
 function stableColor(value, colors) {
@@ -1829,9 +2509,10 @@ function deviceRowsForPeriod() {
     const metaParts = [deviceBreakdownApi.devicePlatformLabel(device.platform, device.osName, device.osVersion), version, deviceSyncedLabel(device.updatedAt)].filter(Boolean);
     return {
       key: device.deviceId,
-      name: deviceLabel(device),
+      name: deviceBreakdownApi.deviceLabel(device),
       value: breakdown.totalTokens,
       cost: Number(period.costUsd || 0),
+      unpricedTokens: Number(period.unpricedTokens || 0),
       color: deviceColor(Boolean(device.stale)),
       stale: Boolean(device.stale),
       platform: device.platform || '',
@@ -1839,7 +2520,8 @@ function deviceRowsForPeriod() {
       deviceDetail: {
         ...breakdown,
         emptyText: breakdown.totalTokens > 0 ? t('devices.detailsUnavailable') : t('home.noTools'),
-        metaParts
+        metaParts,
+        deviceId: device.deviceId
       }
     };
   }).sort((a, b) => b.value - a.value);
@@ -1863,17 +2545,19 @@ function attributionComponent(period, field, key) {
   );
 }
 
-function periodAttributionRows(period, values, costs) {
+function periodAttributionRows(period, values, costs, unpricedTokens) {
   const rows = usageAttributionRowsApi.attributionRows(values, costs, {
     totalValue: period?.totalTokens,
-    totalCost: period?.costUsd
+    totalCost: period?.costUsd,
+    totalUnpricedTokens: period?.unpricedTokens,
+    unpricedTokens
   });
   return usageAttributionRowsApi.visibleAttributionRows(rows, formatCost);
 }
 
 function toolRowsForPeriod(period) {
-  const clientRows = periodAttributionRows(period, period?.clients, period?.clientCosts)
-    .map(({ key: client, value, cost }) => ({ key: client, name: client === usageAttributionRowsApi.UNATTRIBUTED_KEY ? t('dashboard.tooltip.unclassified') : clientLabels[client] || client, value, cost, color: clientColors[client] || clientColors.default, stale: false, cacheReadTokens: attributionComponent(period, 'clientCacheReads', client), cacheWriteTokens: attributionComponent(period, 'clientCacheWrites', client), outputTokens: attributionComponent(period, 'clientOutputs', client), unclassifiedTokens: attributionComponent(period, 'clientUnclassifiedTokens', client) }));
+  const clientRows = periodAttributionRows(period, period?.clients, period?.clientCosts, period?.clientUnpricedTokens)
+    .map(({ key: client, value, cost, unpricedTokens }) => ({ key: client, unpricedTokens, name: client === usageAttributionRowsApi.UNATTRIBUTED_KEY ? t('dashboard.tooltip.unclassified') : clientLabels[client] || client, value, cost, color: clientColors[client] || clientColors.default, stale: false, cacheReadTokens: attributionComponent(period, 'clientCacheReads', client), cacheWriteTokens: attributionComponent(period, 'clientCacheWrites', client), outputTokens: attributionComponent(period, 'clientOutputs', client), unclassifiedTokens: attributionComponent(period, 'clientUnclassifiedTokens', client), modelRows: toolDetailsApi.visibleModelRowsForTool(period, client, formatCost) }));
   if (clientRows.length > 0) {
     const usageSortedRows = clientRows.sort((a, b) => b.value - a.value);
     return clientDisplayPreferencesApi.applyClientDisplayPreferences(usageSortedRows, state.settings?.clientDisplayOrder, state.settings?.hiddenClients, KNOWN_CLIENTS, state.settings?.pinnedClients);
@@ -1882,35 +2566,66 @@ function toolRowsForPeriod(period) {
   return deviceRowsForPeriod();
 }
 
-function modelRowsForPeriod(period) {
-  const modelRows = periodAttributionRows(period, period?.models, period?.modelCosts).map(({ key: model, value, cost }) => ({
+function modelRowsForPeriod(period, rankingMetric = state.settings?.modelRankingMetric) {
+  const unknownSource = usageAttributionRowsApi.unknownModelSource(period);
+  const modelRows = periodAttributionRows(period, period?.models, period?.modelCosts, period?.modelUnpricedTokens).map(({ key: model, value, cost, unpricedTokens, unattributed }) => ({
     key: model,
+    unpricedTokens,
     name: model === usageAttributionRowsApi.UNATTRIBUTED_KEY ? t('dashboard.tooltip.unclassified') : model,
     value,
     cost,
-    color: modelColor(model),
+    unattributed,
+    modelSource: model === 'unknown' ? unknownSource : null,
+    color: model === 'unknown' ? (unknownSource ? clientColors[unknownSource] : 'var(--muted)') : modelColor(model),
     stale: false,
     cacheReadTokens: attributionComponent(period, 'modelCacheReads', model),
     cacheWriteTokens: attributionComponent(period, 'modelCacheWrites', model),
     outputTokens: attributionComponent(period, 'modelOutputs', model),
     unclassifiedTokens: attributionComponent(period, 'modelUnclassifiedTokens', model)
   }));
-  if (modelRows.length > 0) return modelRows.sort((a, b) => b.value - a.value);
+  if (modelRows.length > 0) {
+    return usageAttributionRowsApi.rankRowsWithValues(modelRows, rankingMetric);
+  }
   if (Number(period?.totalTokens || 0) === 0) return [];
   return toolRowsForPeriod(period);
 }
 
-function sessionRowsForPeriod(period) {
-  const rows = sessionRowsApi.sessionRowsForPeriod(period, {
+function rawSessionRowsForPeriod(period) {
+  return sessionRowsApi.sessionRowsForPeriod(period, {
     clientLabels,
     clientColors,
     modelColor,
     stableColor,
     fallbackColors: fallbackModelColors,
     archivedLabel: t('session.archived'),
+    unattributedLabel: t('dashboard.tooltip.unclassified'),
+    sourcePeriods: state.stats?.periods,
+    grokBotSessionIds: state.stats?.grokBotSessionIds,
     nativeSessions: state.stats?.nativeSessions?.[state.period] || {}
   });
-  if (rows.length > 0) return rows.sort((a, b) => b.sortTime - a.sortTime || b.value - a.value || b.cost - a.cost || a.name.localeCompare(b.name));
+}
+
+function sessionRowsForPeriod(period) {
+  const rows = rawSessionRowsForPeriod(period);
+  if (rows.length > 0) {
+    rows.sort((a, b) => b.sortTime - a.sortTime || b.value - a.value || b.cost - a.cost || a.name.localeCompare(b.name));
+    return sessionRowsApi.groupSessionRows(rows, {
+      backgroundReviews: {
+        label: t('sessions.backgroundReviews'),
+        countLabel: (count) => t('sessions.backgroundReviewCount', { count }),
+        summaryLabel: ({ latestTime, latestValue }) => [
+          latestTime ? t('sessions.backgroundReviewLatest', { time: latestTime }) : '',
+          latestValue > 0 ? formatCompact(latestValue, effectiveCompactTokenUnits(), currentLocale()) : ''
+        ].filter(Boolean).join(' · ')
+      },
+      grokBot: {
+        label: t('sessions.grokBot'),
+        countLabel: (count) => t('sessions.grokBotCount', { count }),
+        summaryLabel: ({ latestTime }) => latestTime
+          ? t('sessions.backgroundReviewLatest', { time: latestTime }) : ''
+      }
+    });
+  }
   if (Number(period?.totalTokens || 0) === 0) return [];
   return modelRowsForPeriod(period);
 }
@@ -1980,18 +2695,6 @@ function ensureBreakdownVisible() {
   if (next !== state.breakdown) setBreakdown(next);
 }
 
-function limitStatusLabel(status) {
-  if (status === 'ok') return 'Live';
-  if (status === 'disabled') return 'Disabled';
-  if (status === 'notConfigured') return 'Not signed in';
-  if (status === 'noSyncedData') return 'No synced data';
-  if (status === 'unauthorized') return 'Sign in again';
-  if (status === 'rateLimited') return 'Limited';
-  if (status === 'sourceRateLimited') return 'Usage API limited';
-  if (status === 'unavailable') return 'Unavailable';
-  return 'Error';
-}
-
 function syncProvenanceActive() {
   return state.mode === 'sync' || Boolean(String(state.settings?.hubUrl || '').trim());
 }
@@ -2004,32 +2707,6 @@ function limitProviderProvenance(provider) {
   });
 }
 
-function limitProviderMeta(provider, provenance = null) {
-  const sourceDevice = limitProviderPresentationApi.limitProviderMainDeviceLabel(provenance, { showSource: Boolean(state.settings?.showLimitSource) });
-  if (provider.stale) {
-    const parts = ['Stale', formatUpdatedAge(provider.updatedAt).replace('Updated ', '')];
-    if (sourceDevice) parts.push(sourceDevice);
-    return parts.join(' · ');
-  }
-  if (provider.status === 'ok') {
-    const parts = [];
-    if (state.settings?.showLimitSource) {
-      const sourceLabel = limitProviderPresentationApi.limitProviderSourceLabel(provider) || LIMIT_SOURCE_LABELS[provider.source];
-      if (sourceLabel) parts.push(sourceLabel);
-    }
-    if (sourceDevice) parts.push(sourceDevice);
-    return `${formatUpdatedAge(provider.updatedAt)}${parts.length ? ` · ${parts.join(' · ')}` : ''}`;
-  }
-  return limitStatusLabel(provider.status, false);
-}
-
-function limitProviderPlan(provider) {
-  if (provider?.status && provider.status !== 'ok' && !provider.stale) return limitStatusLabel(provider.status, false);
-  const label = String(provider?.planLabel || provider?.accountLabel || '').trim();
-  if (label) return limitProviderPresentationApi.limitProviderDisplayLabel(label);
-  return provider?.status && provider.status !== 'ok' ? limitStatusLabel(provider.status, false) : '';
-}
-
 // ---------------------------------------------------------------------------
 // Subscriptions
 //
@@ -2040,11 +2717,6 @@ function limitProviderPlan(provider) {
 
 function subscriptionList() {
   return subscriptionApi.normalizeSubscriptions(state.settings?.subscriptions, { currencyApi });
-}
-
-function subscriptionProviderLabel(providerId) {
-  const entry = LIMIT_PROVIDERS.find((provider) => provider.id === providerId);
-  return entry?.settingsLabel || entry?.label || providerId;
 }
 
 // Keyed off the same list the label comes from, because a `.row-icon-<id>` with
@@ -2065,16 +2737,19 @@ function isCreditsProvider(provider) {
 // local account as the only candidate: matchProviderAccount()'s sole-account
 // fallback would then bind a remote subscription to whatever is signed in here.
 // Local entries come first so this device wins a tie on identical accounts.
+// The two copies are compared with the matcher's own identity rule
+// (accountIdentity.sameAccount), not with a value built out of the record: the
+// aggregate's copy of this device's account is a different object, and it is not
+// the same record down to the fields a value would have read.
 function limitProvidersForSubscriptions() {
-  const seen = new Set();
-  const merged = [];
-  for (const provider of [...(localDeviceLimitsProviders() || []), ...(state.stats?.limits?.providers || [])]) {
-    const key = subscriptionAccountValue(provider);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(provider);
-  }
-  return merged;
+  // This device's own records first, so they win a tie with the aggregate's copy
+  // of one account. Which records are distinct accounts is decided over the whole
+  // list, not pair by pair: a keyless copy carries an address instead of a key,
+  // and an address is not enough to answer that question about one pair at a time.
+  return accountIdentityApi.dedupeAccounts([
+    ...(localDeviceLimitsProviders() || []),
+    ...(state.stats?.limits?.providers || [])
+  ]);
 }
 
 // Every configured account, balance ones included. They used to be hidden behind
@@ -2090,12 +2765,23 @@ function subscriptionAccountChoices() {
     label: accountIdentityApi.accountTitleLabel(provider, visible, {
       maskEmail: state.settings?.maskLimitAccountEmails === true,
       index
-    }) || subscriptionProviderLabel(provider.provider)
+    }) || subscriptionText.providerLabel(provider.provider)
   }));
 }
 
+// The picker's value for one choice, which is only ever compared against another
+// choice from the same freshly built list: distinct per account, stable for one
+// record. It carries the address as well, so the two accounts a provider reports
+// by address alone are two choices rather than one — while "is this the same
+// account?" stays with accountIdentity.sameAccount(), where the matcher's rule
+// lives.
 function subscriptionAccountValue(provider) {
-  return [provider?.provider || '', provider?.accountKey || '', provider?.accountName || ''].join('\0');
+  return [
+    String(provider?.provider || '').trim().toLowerCase(),
+    String(provider?.accountKey || '').trim(),
+    String(provider?.accountEmail || provider?.email || '').trim(),
+    String(provider?.accountName || '').trim()
+  ].join('\0');
 }
 
 // The plan the account already reports ("Pro", "Plus") is nearly always what the
@@ -2113,434 +2799,18 @@ function subscriptionSelectedAccount() {
   return subscriptionAccountChoices().find((choice) => choice.value === value)?.provider || null;
 }
 
-function subscriptionAmountText(subscription) {
-  const code = currencyApi.normalizeCurrency(subscription?.currency);
-  const symbol = currencyApi.CURRENCY_RATES[code]?.symbol || `${code} `;
-  return `${symbol}${subscriptionApi.amountUnits(subscription).toFixed(2)}`;
-}
-
-function subscriptionCadenceText(subscription) {
-  const count = Number(subscription?.intervalCount) || 1;
-  const unit = subscription?.interval === 'year'
-    ? t('settings.subscriptions.unitYear')
-    : t('settings.subscriptions.unitMonth');
-  return count === 1 ? unit : t('settings.subscriptions.everyN', { count, unit });
-}
-
-function subscriptionPriceText(subscription) {
-  return `${subscriptionAmountText(subscription)} / ${subscriptionCadenceText(subscription)}`;
-}
-
-// "0 days left" reads like a bug on the day itself, which is exactly the day the
-// user is most likely to be looking.
-function subscriptionDaysText(days) {
-  return days === 0
-    ? t('subscription.tooltip.today')
-    : t('subscription.tooltip.daysLeft', { days });
-}
-
-function subscriptionDateText(dateString) {
-  if (!dateString) return '';
-  // Construct in local time from the calendar parts so the rendered day always
-  // matches the stored one, whatever the timezone.
-  return subscriptionLocalDate(dateString)?.toLocaleDateString(currentLocale(), {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric'
-  }) || '';
-}
-
-// The settings rows are two dense lines inside a ~300px panel and the date is the
-// longest thing on the second one, so there it is the numeric short form the
-// locale itself defines. Everywhere with room to spell it out — the tooltip
-// above all — still uses subscriptionDateText().
-function subscriptionShortDateText(dateString) {
-  if (!dateString) return '';
-  return subscriptionLocalDate(dateString)?.toLocaleDateString(currentLocale(), { dateStyle: 'short' }) || '';
-}
-
-function subscriptionLocalDate(dateString) {
-  const [year, month, day] = String(dateString).split('-').map(Number);
-  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
-  return new Date(year, month - 1, day);
-}
-
-// Usage cost is keyed by client, and every provider whose id names a tracked
-// client can be compared against it. Providers with no same-named client
-// (openrouter, deepseek, thirdparty, zai…) simply produce nothing, which is the
-// correct answer: their spend is either pay-as-you-go or spread across clients
-// with no way to attribute it.
-function subscriptionUsageCostUsd(providerId) {
-  if (!Object.prototype.hasOwnProperty.call(clientLabels, providerId)) return null;
-  const month = state.stats?.periods?.month;
-  const cost = Number(month?.clientCosts?.[providerId] || 0);
-  return cost > 0 ? cost : null;
-}
-
-// Matched against every account the provider has, never against a one-element
-// list of the row being rendered: matchProviderAccount() falls back to "the
-// provider has exactly one account, so there is no ambiguity", and a single-row
-// universe makes that fallback true for every sibling. That is what put one
-// Codex subscription's card on all three Codex accounts.
-function subscriptionForProvider(provider) {
-  const id = String(provider?.provider || '').toLowerCase();
-  const accounts = limitProvidersForSubscriptions();
-  const identity = subscriptionAccountValue(provider);
-  for (const subscription of subscriptionList()) {
-    if (subscription.provider !== id) continue;
-    const account = subscriptionApi.matchProviderAccount(subscription, accounts);
-    if (account && subscriptionAccountValue(account) === identity) return subscription;
-  }
-  return null;
-}
-
-// Every subscription recorded against a provider, paired with the account it
-// resolves to. Drives the group header, which stands for all of them at once.
-function subscriptionsForProviderGroup(providerId) {
-  const id = String(providerId || '').toLowerCase();
-  const accounts = limitProvidersForSubscriptions();
-  return subscriptionList()
-    .filter((subscription) => subscription.provider === id)
-    .map((subscription) => ({
-      subscription,
-      account: subscriptionApi.matchProviderAccount(subscription, accounts)
-    }));
-}
-
 // The record already held against an account, if any. One account holds one
 // record: a second one saved without complaint and then never appeared — the
 // card resolves the first match and stops — which read as the new entry having
 // replaced the old one.
-function subscriptionForAccountValue(list, providerId, accountValue, excludeId) {
+function subscriptionForAccount(list, providerId, account, excludeId) {
+  if (!account) return null;
   const accounts = limitProvidersForSubscriptions();
   return list.find((entry) => {
     if (entry.id === excludeId || entry.provider !== providerId) return false;
     const bound = subscriptionApi.matchProviderAccount(entry, accounts);
-    return Boolean(bound) && subscriptionAccountValue(bound) === accountValue;
+    return Boolean(bound) && accountIdentityApi.sameAccount(bound, account);
   }) || null;
-}
-
-// Rows are {label, value} pairs so the tooltip stays a table and the caller does
-// not have to know which shape it is looking at.
-// Keyed off what the user recorded, never off the account's balance marker: the
-// marker only seeds the choice, and reading it here would show subscription rows
-// for a ledger the moment a provider started reporting a balance.
-function subscriptionTooltipRows(subscription, provider, includeRollup) {
-  const today = subscriptionApi.todayString();
-  return subscriptionApi.isTopUp(subscription)
-    ? topUpTooltipRows(subscription, provider, today, includeRollup)
-    : subscriptionPlanTooltipRows(subscription, provider, today, includeRollup);
-}
-
-// How long the user has been paying, plus what that adds up to. Months is the
-// unit people quote a subscription in, but it rounds a three-week-old plan down
-// to "0 months" — which reads as a bug beside a non-zero total, and does so for
-// most of the first month of every subscription anyone records. Below a month
-// the honest unit is days. A start date that has not arrived yet has no elapsed
-// time and nothing paid, so it says so instead of reporting zero of both.
-//
-// Once coverage has lapsed the clock stops there: a plan bought for one month
-// and never renewed stays "1 month", it does not keep ageing after it ended.
-function subscriptionElapsedText(subscription, today) {
-  const stop = subscriptionApi.coverageStopDate(subscription);
-  const asOf = stop && stop < today ? stop : today;
-  const daysSinceStart = subscriptionApi.daysBetween(subscription.startDate, asOf);
-  if (daysSinceStart !== null && daysSinceStart < 0) return t('subscription.tooltip.notStarted');
-
-  const months = subscriptionApi.subscribedMonths(subscription, asOf);
-  const elapsed = months >= 1
-    ? t('subscription.tooltip.months', { months })
-    : t('subscription.tooltip.daysCount', { days: Math.max(0, daysSinceStart || 0) });
-  const code = currencyApi.normalizeCurrency(subscription.currency);
-  const symbol = currencyApi.CURRENCY_RATES[code]?.symbol || `${code} `;
-  const paid = subscriptionApi.paidToDateMinor(subscription, today) / 100;
-  return `${elapsed} · ${t('subscription.tooltip.paidTotal', { total: `${symbol}${paid.toFixed(2)}` })}`;
-}
-
-function subscriptionPlanTooltipRows(subscription, provider, today, includeRollup) {
-  const rows = [];
-  rows.push({ label: t('subscription.tooltip.price'), value: subscriptionPriceText(subscription) });
-
-  const endDate = subscriptionApi.coverageEndDate(subscription, today);
-  const daysLeft = subscriptionApi.daysUntilRenewal(subscription, today);
-  const whenLabel = subscription.autoRenew
-    ? t('subscription.tooltip.nextCharge')
-    : t('subscription.tooltip.validUntil');
-  // A lapsed plan has no days left to count down. Saying so beats a negative
-  // number, and beats the silent roll-forward that used to keep a cancelled
-  // plan permanently four days from renewing.
-  const whenSuffix = daysLeft === null
-    ? ''
-    : ` · ${daysLeft < 0 ? t('subscription.tooltip.expired') : subscriptionDaysText(daysLeft)}`;
-  rows.push({ label: whenLabel, value: `${subscriptionDateText(endDate)}${whenSuffix}` });
-  if (!subscription.autoRenew) {
-    rows.push({ label: t('subscription.tooltip.autoRenew'), value: t('subscription.tooltip.autoRenewOff') });
-  }
-
-  rows.push({
-    label: t('subscription.tooltip.subscribed'),
-    value: subscriptionElapsedText(subscription, today)
-  });
-
-  // The rollup covers every account of the provider at once, so it belongs on
-  // whichever row stands for the provider as a whole. When a group header is
-  // rendered that is the header, and repeating the same three lines under each
-  // member is the noise the header exists to avoid.
-  if (!includeRollup) return rows;
-
-  // tokscale records which client produced the tokens, never which signed-in
-  // account did, so three logins share one usage figure. Charging that figure
-  // against a single account would claim it three times over; the rollup is the
-  // only honest denominator.
-  const usageCostUsd = subscriptionUsageCostUsd(subscription.provider);
-  if (usageCostUsd === null) return rows;
-  const rollup = subscriptionApi.providerRollup(subscriptionList(), subscription.provider, currencyApi, today);
-  const multiple = subscriptionApi.valueMultiple(rollup.monthlyUsd, usageCostUsd);
-  if (multiple === null) return rows;
-
-  rows.push({ separator: true });
-  if (rollup.count > 1) {
-    rows.push({
-      label: t('subscription.tooltip.providerTotal', { provider: subscriptionProviderLabel(subscription.provider) }),
-      value: t('subscription.tooltip.providerTotalValue', {
-        count: rollup.count,
-        total: formatCost(rollup.monthlyUsd)
-      })
-    });
-  }
-  rows.push({
-    label: t('subscription.tooltip.monthUsage'),
-    // Prefixed with "≈" and titled below: this is tokscale's equivalent API
-    // pricing, not money owed. Under a subscription nothing is billed per token.
-    value: `≈ ${formatCost(usageCostUsd)}${rollup.count > 1 ? ` · ${t('subscription.tooltip.allAccounts')}` : ''}`,
-    title: t('subscription.tooltip.monthUsageNote')
-  });
-  rows.push({
-    label: t('subscription.tooltip.valueMultiple'),
-    value: `${multiple.toFixed(1)}×`
-  });
-  return rows;
-}
-
-// The group header stands for every account at once, so it summarises rather
-// than picking one of them. Usage and the value multiple are already provider
-// level on the per-account card; here the price is too.
-function subscriptionGroupTooltipRows(providerId, today) {
-  const rollup = subscriptionApi.providerRollup(subscriptionList(), providerId, currencyApi, today);
-  const rows = [{
-    label: t('subscription.tooltip.providerTotal', { provider: subscriptionProviderLabel(providerId) }),
-    value: t('subscription.tooltip.providerTotalValue', {
-      count: rollup.count,
-      total: formatCost(rollup.monthlyUsd)
-    })
-  }];
-
-  const usageCostUsd = subscriptionUsageCostUsd(providerId);
-  if (usageCostUsd === null) return rows;
-  rows.push({ separator: true });
-  rows.push({
-    label: t('subscription.tooltip.monthUsage'),
-    value: `≈ ${formatCost(usageCostUsd)} · ${t('subscription.tooltip.allAccounts')}`,
-    title: t('subscription.tooltip.monthUsageNote')
-  });
-  const multiple = subscriptionApi.valueMultiple(rollup.monthlyUsd, usageCostUsd);
-  if (multiple !== null) {
-    rows.push({ label: t('subscription.tooltip.valueMultiple'), value: `${multiple.toFixed(1)}×` });
-  }
-  return rows;
-}
-
-function topUpMinorText(subscription, amountMinor) {
-  const code = currencyApi.normalizeCurrency(subscription?.currency);
-  const symbol = currencyApi.CURRENCY_RATES[code]?.symbol || `${code} `;
-  return `${symbol}${(amountMinor / 100).toFixed(2)}`;
-}
-
-function topUpTooltipRows(subscription, provider, today, includeRollup) {
-  const rows = [];
-  const last = subscriptionApi.lastTopUp(subscription);
-  if (last) {
-    rows.push({
-      label: t('subscription.tooltip.lastTopUp'),
-      value: `${subscriptionDateText(last.date)} · ${topUpMinorText(subscription, last.amountMinor)}`
-    });
-  }
-  const monthMinor = subscriptionApi.topUpMonthMinor(subscription, today);
-  if (monthMinor > 0) {
-    rows.push({
-      label: t('subscription.tooltip.topUpMonth'),
-      value: topUpMinorText(subscription, monthMinor)
-    });
-  }
-  const entries = subscriptionApi.topUpEntries(subscription);
-  if (entries.length > 1) {
-    rows.push({
-      label: t('subscription.tooltip.topUpTotal'),
-      value: `${topUpMinorText(subscription, subscriptionApi.topUpTotalMinor(subscription))} · ${t('subscription.tooltip.topUpCount', { count: entries.length })}`
-    });
-  }
-
-  const creditsWindow = (provider?.windows || []).find(isCreditsWindow) || null;
-  const balance = creditsAmount(provider, creditsWindow);
-  if (balance === null) return topUpRollupRows(rows, subscription, today, includeRollup);
-  const balanceCurrency = String(creditsWindow?.currency || provider?.balance?.currency || subscription.currency);
-  rows.push({ label: t('subscription.tooltip.balance'), value: formatMoney(balance, balanceCurrency) });
-
-  const projection = subscriptionApi.topUpProjection(subscription, balance, today, {
-    currencyApi,
-    balanceCurrency
-  });
-  if (!projection || projection.dailyBurn <= 0) return topUpRollupRows(rows, subscription, today, includeRollup);
-  rows.push({
-    label: t('subscription.tooltip.burnRate'),
-    value: t('subscription.tooltip.perDay', { amount: formatMoney(projection.dailyBurn, balanceCurrency) })
-  });
-  if (projection.exhaustDate) {
-    rows.push({
-      label: t('subscription.tooltip.exhausts'),
-      value: `${subscriptionDateText(projection.exhaustDate)} · ${subscriptionDaysText(projection.daysRemaining)}`
-    });
-  }
-  return topUpRollupRows(rows, subscription, today, includeRollup);
-}
-
-// A ledger earns the same provider-level comparison a plan gets: what went in
-// this month against what the month's tokens would have cost.
-function topUpRollupRows(rows, subscription, today, includeRollup) {
-  if (!includeRollup) return rows;
-  const usageCostUsd = subscriptionUsageCostUsd(subscription.provider);
-  if (usageCostUsd === null) return rows;
-  const rollup = subscriptionApi.providerRollup(subscriptionList(), subscription.provider, currencyApi, today);
-  const multiple = subscriptionApi.valueMultiple(rollup.monthlyUsd, usageCostUsd);
-  if (multiple === null) return rows;
-  rows.push({ separator: true });
-  rows.push({
-    label: t('subscription.tooltip.monthUsage'),
-    value: `≈ ${formatCost(usageCostUsd)}`,
-    title: t('subscription.tooltip.monthUsageNote')
-  });
-  rows.push({ label: t('subscription.tooltip.valueMultiple'), value: `${multiple.toFixed(1)}×` });
-  return rows;
-}
-
-// No heading. The card is already reached by hovering a plan label, and every
-// row names itself — a "Subscription" line above them only repeats what the
-// gesture said, and the other tooltips in this panel carry no title either.
-function subscriptionCardNode(rows) {
-  if (rows.length === 0) return null;
-  const card = document.createElement('span');
-  card.className = 'limit-detail-tooltip subscription-tooltip';
-  for (const row of rows) {
-    if (row.separator) {
-      const rule = document.createElement('span');
-      rule.className = 'subscription-tooltip-rule';
-      card.append(rule);
-      continue;
-    }
-    // display:contents on the row lets label and value land directly in the
-    // card's two-column grid, so the existing tooltip cell styling applies.
-    const line = document.createElement('span');
-    line.className = 'limit-detail-tooltip-row';
-    const label = document.createElement('span');
-    label.textContent = row.label;
-    const value = document.createElement('span');
-    if (row.warn) value.className = 'subscription-tooltip-warn';
-    value.textContent = row.value;
-    if (row.title) {
-      label.title = row.title;
-      value.title = row.title;
-    }
-    line.append(label, value);
-    card.append(line);
-  }
-  return card;
-}
-
-// A group header is rendered whenever a provider has more than one account, and
-// it is the row that stands for the provider as a whole — which is what decides
-// where the provider-wide rollup goes.
-//
-// Counted from the list renderLimits() groups on, deliberately not from
-// limitProvidersForSubscriptions(): that one narrows to this device so a
-// subscription binds to an account you actually hold, while the question here is
-// only what the panel drew. In sync mode the two lists differ, and answering
-// from the wrong one puts the rollup on every member row of a group.
-function subscriptionProviderHasGroupHeader(providerId) {
-  const id = String(providerId || '').toLowerCase();
-  return (state.stats?.limits?.providers || [])
-    .filter((account) => String(account?.provider || '').toLowerCase() === id).length > 1;
-}
-
-// An account row shows its own subscription and nothing else. A group header
-// stands for all of them, so it summarises — except when only one account is
-// recorded, where the summary would just restate that one card with less in it.
-function subscriptionCardForRow(provider) {
-  if (provider?.accountGroup === true) {
-    const entries = subscriptionsForProviderGroup(provider.provider);
-    if (entries.length === 0) return null;
-    if (entries.length === 1) {
-      return subscriptionCardNode(
-        subscriptionTooltipRows(entries[0].subscription, entries[0].account || provider, true)
-      );
-    }
-    return subscriptionCardNode(
-      subscriptionGroupTooltipRows(provider.provider, subscriptionApi.todayString())
-    );
-  }
-  const subscription = subscriptionForProvider(provider);
-  if (!subscription) return null;
-  return subscriptionCardNode(
-    subscriptionTooltipRows(subscription, provider, !subscriptionProviderHasGroupHeader(provider.provider))
-  );
-}
-
-// The card opens upward, but the limits list scrolls inside a clipping panel, so
-// on the topmost row every pixel of it landed outside that panel and vanished.
-// Measured on open rather than on render: the row's offset within the panel
-// changes as the user scrolls. Kept to a class flip so the card's own placement
-// stays declarative.
-function positionSubscriptionTooltip(wrap, card) {
-  const clip = wrap.closest('.limits-panel');
-  if (!clip) return;
-  const roomAbove = wrap.getBoundingClientRect().top - clip.getBoundingClientRect().top;
-  card.classList.toggle('is-below', roomAbove < card.offsetHeight + 5);
-}
-
-// Wraps the plan label so hovering it reveals the subscription card. Reuses the
-// limit-detail tooltip plumbing, which already holds off the six-second list
-// re-render while the pointer is inside (limitDetailTooltipShouldHoldRender).
-//
-// Deliberately not behind a preference: an account with no record decorates
-// nothing, so having recorded one IS the switch. A separate toggle only made it
-// possible to enter the data and see nothing happen.
-function decoratePlanWithSubscription(plan, provider) {
-  const card = subscriptionCardForRow(provider);
-  if (!card) return plan;
-
-  const wrap = document.createElement('div');
-  wrap.className = 'limit-plan limit-detail-tooltip-wrap subscription-plan-wrap';
-  wrap.classList.toggle('has-opened', state.limitDetailTooltipHasOpened);
-  wrap.tabIndex = 0;
-  const trigger = document.createElement('span');
-  trigger.className = 'subscription-plan-trigger';
-  trigger.textContent = plan.textContent;
-  wrap.append(trigger, card);
-
-  const markOpened = () => {
-    state.limitDetailTooltipHasOpened = true;
-    state.limitDetailTooltipActive = true;
-    wrap.classList.add('has-opened');
-    positionSubscriptionTooltip(wrap, card);
-  };
-  const release = () => {
-    state.limitDetailTooltipActive = false;
-    flushPendingLimitDetailTooltipRender();
-  };
-  wrap.addEventListener('pointerenter', markOpened);
-  wrap.addEventListener('focusin', markOpened);
-  wrap.addEventListener('pointerleave', release);
-  wrap.addEventListener('focusout', release);
-  return wrap;
 }
 
 // The title's job is to say WHICH record this is, so it names the account. The
@@ -2552,7 +2822,7 @@ function decoratePlanWithSubscription(plan, provider) {
 // picked, it survives the provider being signed out or still loading, and it
 // keeps sibling rows distinct in exactly the moment the plan name could not.
 function subscriptionRowTitle(subscription, account) {
-  const providerLabel = subscriptionProviderLabel(subscription.provider);
+  const providerLabel = subscriptionText.providerLabel(subscription.provider);
   return [providerLabel, subscriptionRowAccountLabel(subscription, account) || subscription.planName]
     .filter(Boolean)
     .join(' · ');
@@ -2580,18 +2850,18 @@ function subscriptionRowMeta(subscription, account) {
   if (subscriptionApi.isTopUp(subscription)) {
     const monthMinor = subscriptionApi.topUpMonthMinor(subscription, today);
     parts.push(t('settings.subscriptions.topUpMonthMeta', {
-      total: topUpMinorText(subscription, monthMinor)
+      total: subscriptionText.topUpMinorText(currencyApi, subscription, monthMinor)
     }));
     const last = subscriptionApi.lastTopUp(subscription);
     if (last) {
-      parts.push(t('settings.subscriptions.topUpLastMeta', { date: subscriptionShortDateText(last.date) }));
+      parts.push(t('settings.subscriptions.topUpLastMeta', { date: subscriptionText.shortDateText(currentLocale(), last.date) }));
     }
     return parts.join(' · ');
   }
-  parts.push(subscriptionPriceText(subscription));
+  parts.push(subscriptionText.priceText(t, currencyApi, subscription));
   const endDate = subscriptionApi.coverageEndDate(subscription, today);
   if (endDate) {
-    const date = subscriptionShortDateText(endDate);
+    const date = subscriptionText.shortDateText(currentLocale(), endDate);
     parts.push(t(subscription.autoRenew ? 'settings.subscriptions.renewsOn' : 'settings.subscriptions.endsOn', { date }));
   }
   return parts.join(' · ');
@@ -2796,7 +3066,7 @@ function renderSubscriptionPickers() {
   for (const id of providerIds) {
     const option = document.createElement('option');
     option.value = id;
-    option.textContent = subscriptionProviderLabel(id);
+    option.textContent = subscriptionText.providerLabel(id);
     providerSelect.append(option);
   }
   if (providerIds.includes(previousProvider)) providerSelect.value = previousProvider;
@@ -2838,6 +3108,7 @@ function renderSubscriptionTotal() {
 }
 
 function renderSubscriptionSettings() {
+  if (!isSettingsSurfaceVisible()) return;
   renderSubscriptionNote();
   renderSubscriptionOrphanNotice();
   renderSubscriptionSyncError();
@@ -2916,7 +3187,11 @@ async function saveSubscriptions(list, base, { render = true } = {}) {
 function subscriptionWriteErrorKey(error) {
   const message = error?.message || '';
   if (/stale_write/.test(message)) return 'settings.subscriptions.errorStaleWrite';
+  if (/icloud_adoption_unconfirmed/.test(message)) return 'settings.subscriptions.errorIcloudAdoptionUnconfirmed';
   if (/hub_rejected/.test(message)) return 'settings.subscriptions.errorHubRejected';
+  if (/icloud_(?:unavailable|stopped)|icloud_write_failed|root-create-failed|subscription-write-failed/.test(message)) {
+    return 'settings.subscriptions.errorIcloudWrite';
+  }
   if (/write_failed/.test(message)) return 'settings.subscriptions.errorWriteFailed';
   if (/hub_changed/.test(message)) return 'settings.subscriptions.errorHubChanged';
   return 'settings.subscriptions.errorHubWrite';
@@ -2950,9 +3225,11 @@ function renderSubscriptionSyncError() {
 function renderSubscriptionNote() {
   const el = els.subscriptionNote;
   if (!el) return;
-  const key = state.settings?.subscriptionsShared
-    ? 'settings.subscriptions.noteShared'
-    : 'settings.subscriptions.note';
+  const key = state.settings?.hubMode === 'icloud'
+    ? 'settings.subscriptions.noteIcloud'
+    : state.settings?.subscriptionsShared
+      ? 'settings.subscriptions.noteShared'
+      : 'settings.subscriptions.note';
   el.dataset.i18n = key;
   el.textContent = t(key);
 }
@@ -3193,7 +3470,7 @@ function renderSubscriptionTopUpEntries() {
     row.className = 'subscription-topup-row';
     const date = document.createElement('span');
     date.className = 'subscription-topup-date';
-    date.textContent = subscriptionDateText(entry.date);
+    date.textContent = subscriptionText.dateText(currentLocale(), entry.date);
     const amount = document.createElement('span');
     amount.className = 'subscription-topup-amount';
     amount.textContent = `${symbol}${(entry.amountMinor / 100).toFixed(2)}`;
@@ -3402,7 +3679,7 @@ async function submitSubscription() {
     ? list.find((entry) => entry.id === state.subscriptionEditingId)
     : null;
 
-  if (subscriptionForAccountValue(list, providerId, accountValue, editing?.id)) {
+  if (subscriptionForAccount(list, providerId, account, editing?.id)) {
     setSubscriptionError(t('settings.subscriptions.errorDuplicate'));
     return;
   }
@@ -3453,13 +3730,14 @@ function configuredLimitProviderOrder() {
 }
 
 function configuredLimitProviderSelection() {
-  const raw = state.settings?.limitProviders;
+  const raw = state.pendingLimitProviderSelection?.limitProviders ?? state.settings?.limitProviders;
   const source = raw === undefined || raw === null ? DEFAULT_LIMIT_PROVIDER_ORDER : raw;
   return limitProviderOrderApi.normalizeLimitProviderSelection(source, LIMIT_PROVIDERS);
 }
 
 function enabledLimitProviderSet() {
-  if (state.settings?.limitsEnabled === false) return new Set();
+  const limitsEnabled = state.pendingLimitProviderSelection?.limitsEnabled ?? state.settings?.limitsEnabled;
+  if (limitsEnabled === false) return new Set();
   return new Set(configuredLimitProviderSelection());
 }
 
@@ -3467,135 +3745,32 @@ function limitProviderEnabled(providerName) {
   return enabledLimitProviderSet().has(providerName);
 }
 
-function limitProviderSelectionIncluding(providerName) {
-  const selected = new Set(configuredLimitProviderSelection());
-  selected.add(providerName);
-  return LIMIT_PROVIDERS
-    .map((provider) => provider.id)
-    .filter((id) => selected.has(id))
-    .join(',');
-}
-
 function missingLimitProviderStatus() {
   return state.mode === 'sync' || String(state.settings?.hubUrl || '').trim() ? 'noSyncedData' : 'notConfigured';
 }
 
-function windowForKind(provider, kind) {
-  return (provider?.windows || []).find((window) => window.kind === kind) || null;
-}
 
-function windowsForKind(provider, kind) {
-  return (provider?.windows || []).filter((window) => window.kind === kind);
-}
 
-function antigravityQuotaGroups(provider) {
-  const entries = (provider?.windows || [])
-    .filter((window) => window.kind === 'session' || window.kind === 'weekly')
-    .map((window) => {
-      const presentation = limitProviderPresentationApi.antigravityQuotaWindow(window);
-      return presentation ? { ...presentation, window } : null;
-    });
-  // Legacy GetUserStatus pools have model names rather than group + period
-  // labels. Keep their existing flat layout instead of guessing a hierarchy.
-  if (entries.length === 0 || entries.some((entry) => entry === null)) return [];
-  const groups = new Map();
-  for (const entry of entries) {
-    if (!groups.has(entry.groupLabel)) groups.set(entry.groupLabel, []);
-    groups.get(entry.groupLabel).push(entry);
-  }
-  return [...groups].map(([label, windows]) => ({ label, windows }));
-}
 
-function formatLimitAmount(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return '';
-  return `$${number.toFixed(2)}`;
-}
 
-function formatBalanceAmount(value, source) {
-  return formatMoney(value, source?.currency);
-}
 
-function formatBalanceSpendAmount(value, balance) {
-  return formatBalanceAmount(value, balance);
-}
 
-// Absolute count for windows that expose units (credits). It follows the same
-// display mode as percent bars: remaining/total in quota mode, used/total in
-// used mode.
-function formatLimitCount(window, showUsed = false) {
-  const used = Number(window?.used);
-  const limit = Number(window?.limit);
-  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return '';
-  const trim = (n) => Number(Math.max(0, n).toFixed(2)).toString();
-  return `${trim(showUsed ? used : limit - used)}/${trim(limit)}`;
-}
 
-// Command Code credits are USD, so the count under the bar is money rather than
-// the raw units formatLimitCount prints: "$8.78 / $10.00", or nothing at all for
-// a pool with no allowance (the headline already carries its amount).
-function formatCommandcodeCreditsDetail(window) {
-  const remaining = Number(window?.remaining);
-  const limit = Number(window?.limit);
-  if (!Number.isFinite(remaining) || !Number.isFinite(limit) || limit <= 0) return '';
-  const showUsed = Boolean(state.settings?.showLimitUsed);
-  const value = showUsed ? Math.max(0, limit - remaining) : remaining;
-  return `${formatMoney(value, window?.currency)} / ${formatMoney(limit, window?.currency)}`;
-}
 
-// One-line Overage value: "12.5 credits · $3.20" (credits used, then est. cost).
-// Either piece may be absent; the row only renders when at least one is present.
-function formatKiroOverageValue(window) {
-  const parts = [];
-  const credits = Number(window?.used);
-  if (Number.isFinite(credits)) parts.push(`${Number(credits.toFixed(2))} credits`);
-  const cost = Number(window?.remaining);
-  if (Number.isFinite(cost)) parts.push(formatLimitAmount(cost));
-  return parts.join(' · ');
-}
 
-function formatCodexResetCreditsValue(resetCredits) {
-  const available = Number(resetCredits?.availableCount);
-  if (!Number.isFinite(available)) return '';
-  const count = Math.max(0, Math.floor(available));
-  if (count <= 0) return '';
-  return `${count} reset${count === 1 ? '' : 's'}`;
-}
 
-function codexResetCreditExpirationDates(resetCredits) {
-  const values = Array.isArray(resetCredits?.expirations) ? resetCredits.expirations : [];
-  const dates = values
-    .map((value) => new Date(value))
-    .filter((date) => !Number.isNaN(date.getTime()))
-    .sort((a, b) => a.getTime() - b.getTime());
-  if (dates.length > 0) return dates;
-  const fallback = resetCredits?.nextExpiresAt ? new Date(resetCredits.nextExpiresAt) : null;
-  return fallback && !Number.isNaN(fallback.getTime()) ? [fallback] : [];
-}
 
-function codexResetCreditExpiryLabel(date) {
-  const diffMs = date.getTime() - Date.now();
-  return diffMs <= 0 ? 'now' : formatDuration(diffMs);
-}
 
-function codexResetCreditExpiryDetailLabel(date) {
-  const diffMs = date.getTime() - Date.now();
-  return diffMs <= 0 ? 'Expires now' : `Expires in ${formatDuration(diffMs)}`;
-}
 
-// Shared by Codex reset credits and Claude prepaid grants.
-function expiryDateLabel(date) {
-  return new Intl.DateTimeFormat(currentLocale(), {
-    month: 'numeric',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit'
-  }).format(date);
-}
+
 
 function limitDetailTooltipShouldHoldRender() {
   if (!state.limitDetailTooltipActive || !els.limitsPanel) return false;
   return Boolean(els.limitsPanel.querySelector('.limit-detail-tooltip-wrap:hover, .limit-detail-tooltip-wrap:focus-within'));
+}
+
+function sessionTooltipShouldHoldRender() {
+  return Boolean(document.querySelector('.home-session-row .is-hover-reading, .home-session-meta .limit-detail-tooltip-wrap:hover, .home-session-meta .limit-detail-tooltip-wrap:focus-within, .row-context.limit-detail-tooltip-wrap:hover, .row-context.limit-detail-tooltip-wrap:focus-within, .row-label .limit-detail-tooltip-wrap:hover, .row-label .limit-detail-tooltip-wrap:focus-within, .session-group-run .is-hover-reading, .session-group-run:focus-within, .detail-ex-title.limit-detail-tooltip-wrap:hover, .detail-ex-title.limit-detail-tooltip-wrap:focus-within'));
 }
 
 function flushPendingLimitDetailTooltipRender() {
@@ -3604,283 +3779,17 @@ function flushPendingLimitDetailTooltipRender() {
   renderLimits();
 }
 
-function codexSwitchPopoverShouldHoldRender() {
-  if (!state.codexSwitchPopoverActive || !els.limitsPanel) return false;
-  return Boolean(els.limitsPanel.querySelector(
-    '.limit-account-switch-zone:hover, .limit-account-switch-zone:focus-within, .limit-account-active-zone:hover, .limit-account-active-zone:focus-within'
-  ));
-}
 
-function flushPendingCodexSwitchPopoverRender() {
-  if (!state.codexSwitchPopoverRenderPending || state.breakdown !== 'limits') return;
-  state.codexSwitchPopoverRenderPending = false;
-  renderLimits();
-}
 
-function codexResetCreditsNode(resetCredits) {
-  const valueText = formatCodexResetCreditsValue(resetCredits);
-  if (!valueText) return null;
-  const expirationDates = codexResetCreditExpirationDates(resetCredits);
-  const item = document.createElement('div');
-  item.className = 'limit-window limit-window-wide limit-window-note limit-reset-credits';
-  const line = document.createElement('div');
-  line.className = 'limit-reset-credits-line';
-  const value = document.createElement('span');
-  value.className = 'limit-reset-credits-value';
-  value.textContent = valueText;
-  line.append(value);
-  if (expirationDates.length > 0) {
-    const expiryGroup = document.createElement('span');
-    expiryGroup.className = 'limit-reset-credits-expiry-group';
-    const timeline = document.createElement('span');
-    timeline.className = 'limit-reset-credits-timeline';
-    const summaryParts = expirationDates.slice(0, 3).map(codexResetCreditExpiryLabel);
-    const hiddenExpirationCount = expirationDates.length - summaryParts.length;
-    if (hiddenExpirationCount > 0) summaryParts.push(`+${hiddenExpirationCount}`);
-    summaryParts.forEach((text, index) => {
-      const time = document.createElement('span');
-      time.className = 'limit-reset-credits-time';
-      if (index > 0) {
-        const separator = document.createElement('span');
-        separator.className = 'limit-reset-credits-separator';
-        separator.textContent = '·';
-        separator.setAttribute('aria-hidden', 'true');
-        time.append(separator);
-      }
-      time.append(document.createTextNode(text));
-      timeline.append(time);
-    });
-    expiryGroup.append(timeline);
-    if (expirationDates.length > 0) {
-      // A date paired with a bare duration doesn't read as `<name>: <value>`, so
-      // the spoken label is supplied rather than derived from the cells. Keep
-      // this detail available for a single reset as well as multiple resets.
-      const infoNode = limitDetailInfoNode(
-        expirationDates.map((date) => [expiryDateLabel(date), codexResetCreditExpiryLabel(date)]),
-        '',
-        expirationDates.map((date, index) => `Reset ${index + 1}: ${codexResetCreditExpiryDetailLabel(date)}`).join(', ')
-      );
-      if (infoNode) expiryGroup.append(infoNode);
-    }
-    line.append(expiryGroup);
-  }
-  item.append(line);
-  item.setAttribute('aria-label', ['Reset credits', valueText, expirationDates.map(codexResetCreditExpiryDetailLabel).join(', ')].filter(Boolean).join(', '));
-  return item;
-}
 
-function providerSpendEntries(balance) {
-  return [
-    ['Today', optionalFiniteNumber(balance?.todaySpend)],
-    ['Week', optionalFiniteNumber(balance?.weekSpend)],
-    ['Month', optionalFiniteNumber(balance?.monthSpend)],
-    ['All time', optionalFiniteNumber(balance?.allTimeSpend)]
-  ].filter(([, value]) => value !== null);
-}
 
-// The meter-less note row every balance/spend provider draws: a label on the
-// left, then an optional summary and an optional ⓘ tooltip on the right. The
-// wording stays with the callers — each provider says something different about
-// the same layout — so the spoken label is `label` plus whatever parts they pass.
-function limitNoteRowNode({ label, summary = '', detailEntries = null, ariaParts = [] }) {
-  const item = document.createElement('div');
-  item.className = 'limit-window limit-window-wide limit-window-note limit-spend';
-  const line = document.createElement('div');
-  line.className = 'limit-window-text limit-spend-line';
-  const labelNode = document.createElement('span');
-  labelNode.textContent = label;
-  const right = document.createElement('span');
-  right.className = 'limit-spend-right';
-  if (summary) {
-    const summaryNode = document.createElement('span');
-    summaryNode.className = 'limit-spend-summary';
-    summaryNode.textContent = summary;
-    right.append(summaryNode);
-  }
-  const infoNode = detailEntries ? limitDetailInfoNode(detailEntries, 'limit-spend-info-wrap') : null;
-  if (infoNode) right.append(infoNode);
-  line.append(labelNode, right);
-  item.append(line);
-  item.setAttribute('aria-label', [label, ...ariaParts].join(', '));
-  return item;
-}
 
-// Entries are rows of cells: `[label, value]`, or `[label, middle, value]` when
-// a row carries an extra field. Rows are grid cells (`display: contents`), so a
-// short row would slide into the next row's columns — pad every row to the
-// widest one and widen the grid to match. `ariaLabel` overrides the spoken label
-// for callers whose cells don't read as `<name>: <value>` on their own.
-function limitDetailInfoNode(entries, extraClass = '', ariaLabel = '') {
-  if (!Array.isArray(entries) || entries.length === 0) return null;
-  const columns = entries.reduce((widest, entry) => Math.max(widest, entry.length), 0);
-  const infoWrap = document.createElement('span');
-  infoWrap.className = ['limit-detail-tooltip-wrap', extraClass].filter(Boolean).join(' ');
-  infoWrap.classList.toggle('has-opened', state.limitDetailTooltipHasOpened);
-  const info = document.createElement('span');
-  info.className = 'limit-detail-tooltip-trigger';
-  info.textContent = 'i';
-  info.tabIndex = 0;
-  info.setAttribute(
-    'aria-label',
-    ariaLabel || entries.map(([entryLabel, ...rest]) => `${entryLabel}: ${rest.filter(Boolean).join(' ')}`).join(', ')
-  );
-  const tooltip = document.createElement('span');
-  tooltip.className = ['limit-detail-tooltip', columns > 2 ? 'limit-detail-tooltip-triple' : '']
-    .filter(Boolean).join(' ');
-  tooltip.setAttribute('role', 'tooltip');
-  entries.forEach((entry) => {
-    const row = document.createElement('span');
-    row.className = 'limit-detail-tooltip-row';
-    for (let column = 0; column < columns; column += 1) {
-      const cell = document.createElement('span');
-      cell.textContent = entry[column] ?? '';
-      row.append(cell);
-    }
-    tooltip.append(row);
-  });
-  const markOpened = () => {
-    state.limitDetailTooltipHasOpened = true;
-    state.limitDetailTooltipActive = true;
-    infoWrap.classList.add('has-opened');
-  };
-  const release = () => {
-    requestAnimationFrame(() => {
-      if (limitDetailTooltipShouldHoldRender()) return;
-      state.limitDetailTooltipActive = false;
-      flushPendingLimitDetailTooltipRender();
-    });
-  };
-  infoWrap.addEventListener('pointerenter', markOpened);
-  infoWrap.addEventListener('focusin', markOpened);
-  infoWrap.addEventListener('pointerleave', release);
-  infoWrap.addEventListener('focusout', release);
-  infoWrap.append(info, tooltip);
-  return infoWrap;
-}
 
-function providerSpendNode(balance) {
-  const entries = providerSpendEntries(balance);
-  if (entries.length === 0) return null;
-  const preferredSummary = entries.filter(([label]) => label === 'Today' || label === 'Month');
-  const summaryEntries = preferredSummary.length > 0 ? preferredSummary : entries.slice(0, 2);
-  const formatted = entries.map(([entryLabel, value]) => [entryLabel, formatBalanceSpendAmount(value, balance)]);
-  return limitNoteRowNode({
-    label: 'Spend',
-    summary: summaryEntries
-      .map(([label, value]) => `${label} ${formatBalanceSpendAmount(value, balance)}`)
-      .join(' · '),
-    // Only worth a tooltip when it would say more than the summary already does.
-    detailEntries: entries.length > summaryEntries.length ? formatted : null,
-    ariaParts: formatted.map(([entryLabel, value]) => `${entryLabel} ${value}`)
-  });
-}
 
-function thirdPartySpendNode(provider, quotaWindow) {
-  const balance = provider?.balance || null;
-  const usage = provider?.usageSummary || null;
-  const currency = balance?.currency || 'USD';
-  const allTimeSpend = optionalFiniteNumber(balance?.allTimeSpend);
-  const monthSpend = optionalFiniteNumber(balance?.monthSpend);
-  const entries = [];
-  const total = optionalFiniteNumber(quotaWindow?.limit);
-  const requestCount = optionalFiniteNumber(balance?.requestCount);
-  const quotaGroup = String(balance?.quotaGroup || '').trim();
-  const expiresAt = balance?.expiresAt ? new Date(balance.expiresAt) : null;
-  if (total !== null) entries.push([t('settings.thirdparty.totalQuota'), formatMoney(total, currency)]);
-  if (requestCount !== null) {
-    entries.push([t('settings.thirdparty.requests'), Math.max(0, Math.trunc(requestCount)).toLocaleString()]);
-  }
-  if (quotaGroup) entries.push([t('settings.thirdparty.group'), quotaGroup]);
-  if (expiresAt && !Number.isNaN(expiresAt.getTime())) {
-    entries.push([t('settings.thirdparty.expires'), expiresAt.toLocaleDateString()]);
-  }
-  const usageCountEntry = (key, value) => {
-    const number = optionalFiniteNumber(value);
-    if (number !== null) entries.push([t(key), Math.max(0, Math.trunc(number)).toLocaleString()]);
-  };
-  if (usage) {
-    usageCountEntry('settings.thirdparty.monthRequests', usage.requests);
-    usageCountEntry('settings.thirdparty.monthTokens', usage.totalTokens);
-    usageCountEntry('settings.thirdparty.inputTokens', usage.inputTokens);
-    usageCountEntry('settings.thirdparty.outputTokens', usage.outputTokens);
-    const cacheTokens = [usage.cacheReadTokens, usage.cacheCreationTokens]
-      .map(optionalFiniteNumber)
-      .filter((value) => value !== null)
-      .reduce((sum, value) => sum + value, 0);
-    if (cacheTokens > 0) usageCountEntry('settings.thirdparty.cacheTokens', cacheTokens);
-    const averageDurationMs = optionalFiniteNumber(usage.averageDurationMs);
-    if (averageDurationMs !== null) {
-      const duration = averageDurationMs < 1000
-        ? `${Math.round(averageDurationMs)} ms`
-        : `${(averageDurationMs / 1000).toFixed(averageDurationMs < 10000 ? 1 : 0)} s`;
-      entries.push([t('settings.thirdparty.avgResponse'), duration]);
-    }
-    const standardCost = optionalFiniteNumber(usage.standardCost);
-    if (standardCost !== null) entries.push([t('settings.thirdparty.standardCost'), formatMoney(standardCost, currency)]);
-  }
-  if (allTimeSpend === null && monthSpend === null && entries.length === 0) return null;
-  // Without a spend figure the row has nothing to summarize, so it retitles
-  // itself and leans entirely on the tooltip.
-  const summary = [
-    ...(monthSpend !== null ? [`Month ${formatMoney(monthSpend, currency)}`] : []),
-    ...(allTimeSpend !== null ? [`All time ${formatMoney(allTimeSpend, currency)}`] : [])
-  ].join(' · ');
-  return limitNoteRowNode({
-    label: summary ? 'Spend' : 'Details',
-    summary,
-    detailEntries: entries,
-    ariaParts: [
-      ...(summary ? [summary] : []),
-      ...entries.map(([entryLabel, value]) => `${entryLabel} ${value}`)
-    ]
-  });
-}
-
-// One tooltip row per prepaid grant: amount, expiry date, time left, the same
-// shape Codex's reset credits use. `aria` spells the expiry out, since the
-// terse columns no longer say what the date and duration mean.
-function claudePrepaidGrantRows(tranches, currency) {
-  return tranches
-    .filter((tranche) => optionalFiniteNumber(tranche?.amount) !== null)
-    .map((tranche) => {
-      const money = formatMoney(tranche.amount, tranche.currency || currency);
-      const expiresAt = tranche.expiresAt ? new Date(tranche.expiresAt) : null;
-      if (!expiresAt || Number.isNaN(expiresAt.getTime())) {
-        return { cells: [money, '', 'No expiry'], aria: `${money} no expiry` };
-      }
-      const diffMs = expiresAt.getTime() - Date.now();
-      const remaining = diffMs <= 0 ? 'Expired' : formatDuration(diffMs);
-      return {
-        cells: [money, expiryDateLabel(expiresAt), remaining],
-        aria: diffMs <= 0 ? `${money} expired` : `${money} expires in ${remaining}`
-      };
-    });
-}
-
-// Claude's prepaid credits. Deliberately meter-less: the headline is a sum of
-// grants whose expiries belong to its parts, so a bar would need a denominator
-// this pool doesn't report. Expiries live in the tooltip instead.
-function claudeBalanceNode(provider) {
-  // Also checked here, not just in the collector: a record collected before the
-  // setting was switched off is still in state, and the row should disappear on
-  // the toggle rather than on the next refresh.
-  if (state.settings?.claudePrepaidBalanceEnabled === false) return null;
-  const balance = provider?.balance || null;
-  const amount = optionalFiniteNumber(balance?.amount);
-  if (amount === null) return null;
-  const currency = balance?.currency || 'USD';
-  const tranches = Array.isArray(balance.tranches) ? balance.tranches : [];
-  const grants = claudePrepaidGrantRows(tranches, currency);
-  return limitNoteRowNode({
-    label: 'Balance',
-    summary: formatMoney(amount, currency),
-    detailEntries: grants.map((grant) => grant.cells),
-    ariaParts: [formatMoney(amount, currency), ...grants.map((grant) => grant.aria)]
-  });
-}
 
 const {
   creditsAmount,
+  creditsCurrency,
   creditsMeterPercent,
   formatCompactMoney,
   formatMoney,
@@ -3888,147 +3797,127 @@ const {
   spendWindow
 } = window.TokenMonitorLimitBalanceDisplay;
 
+const { limitWindowLabel, mimoAccountGroups, mimoProductLabel } = window.TokenMonitorLimitWindowLabels;
+const { limitWindowText } = window.TokenMonitorLimitWindowText;
+
+// The Limits rows are built by the shared view, which the edge dock also calls
+// so its card is the same DOM rather than a second rendering of the same data.
+// Everything the builder needs from this page is handed over here; it reads no
+// globals of its own.
+const limitWindowsView = window.TokenMonitorLimitWindowsView.createLimitWindowsView({
+  document,
+  t,
+  settings: () => state.settings,
+  currentLocale,
+  presentation: limitProviderPresentationApi,
+  // The row's "· imac-m1" needs this device's id, whether sync is on and the
+  // device list to name a reading's source against — the page's own context,
+  // which the shared view cannot read for itself.
+  provenanceContext: () => ({
+    localDeviceId: state.settings?.deviceId || '',
+    syncActive: syncProvenanceActive(),
+    devices: state.stats?.devices || []
+  }),
+  motion: limitResetMotionApi,
+  tooltip: {
+    hasOpened: () => state.limitDetailTooltipHasOpened,
+    markOpened() {
+      state.limitDetailTooltipHasOpened = true;
+      state.limitDetailTooltipActive = true;
+    },
+    release() {
+      requestAnimationFrame(() => {
+        if (limitDetailTooltipShouldHoldRender()) return;
+        state.limitDetailTooltipActive = false;
+        flushPendingLimitDetailTooltipRender();
+        if (state.breakdown === 'home' || state.breakdown === 'session') render();
+      });
+    }
+  },
+  formatCompact,
+  compactTokenThreshold: () => compactTokenApi.compactTokenUnitThreshold(
+    effectiveCompactTokenUnits(), currentLocale()
+  ),
+  formatMoney,
+  formatCompactMoney: (value, currency) => formatCompactMoney(
+    value, currency, state.settings?.compactTokenUnits, currentLocale()
+  ),
+  formatPercent,
+  formatDuration,
+  formatLimitBoundary,
+  limitFillPercent,
+  limitModeSuffix,
+  optionalFiniteNumber,
+  colorWithAlpha,
+  applyBarScale,
+  creditsAmount,
+  creditsCurrency,
+  creditsMeterPercent,
+  isCreditsWindow,
+  spendWindow,
+  limitWindowLabel,
+  limitWindowText,
+  mimoAccountGroups,
+  mimoProductLabel,
+  accountIdentity: accountIdentityApi,
+  accountControl: codexAccountControl,
+  codexAccounts: {
+    matchesActive: (provider) => codexActiveAccountMatchesProvider(provider),
+    switchTarget: (provider) => codexSwitchAccountForProvider(provider),
+    canSwitchSystemAccount: () => Boolean(window.tokenMonitor?.codex?.switchSystemAccount)
+  },
+  hasMark: (id) => limitMarksWithIcon.has(id),
+  formatAgo: (ms) => formatAgo(ms),
+  openExternal: (url) => window.tokenMonitor.openExternal?.(url),
+  // The subscription side of the plan cell. The records are the user's own, so
+  // they are read at paint time rather than captured; the tooltip's own rows are
+  // built by the view from these.
+  subscriptionApi,
+  subscriptionText,
+  currencyApi,
+  formatCost,
+  subscriptions: () => state.settings?.subscriptions,
+  subscriptionAccounts: () => limitProvidersForSubscriptions(),
+  monthClientCosts: () => state.stats?.periods?.month?.clientCosts,
+  resetForecast: () => ({ busy: state.codexResetForecastBusy, forecast: state.codexResetForecast })
+});
+
+const {
+  codexResetForecastExpired,
+  limitAccountTitle,
+  limitProviderPlan,
+  renderLimitProviderGroup,
+  renderLimitProviderSolo
+} = limitWindowsView;
+
+
 function optionalFiniteNumber(value) {
   if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
 
-function openrouterCreditsWindow(provider) {
-  const windows = Array.isArray(provider?.windows) ? provider.windows : [];
-  // Older hubs normalized windows before `metric` existed. Keep the label
-  // fallback only for those mixed-version payloads.
-  return windows.find((window) => window?.metric === 'credits')
-    || windows.find((window) => !window?.metric && window?.label === 'Credits')
-    || null;
-}
 
-function thirdPartyQuotaWindow(provider) {
-  const windows = Array.isArray(provider?.windows) ? provider.windows : [];
-  return windows.find((window) => window?.metric === 'credits') || null;
-}
 
-function formatLimitWindowValue(window, fillPercent, hasPercent, showUsed) {
-  if (hasPercent) return `${formatPercent(fillPercent)} ${limitModeSuffix(showUsed)}`;
-  if (!window) return '--';
-  const remaining = Number(window?.remaining);
-  if (Number.isFinite(remaining)) {
-    return window?.showMeter === false ? formatLimitAmount(remaining) : `${formatLimitAmount(remaining)} left`;
-  }
-  const limit = Number(window?.limit);
-  if (Number.isFinite(limit)) return `${formatLimitAmount(limit)} cap`;
-  return '';
-}
 
 function formatHomeLimitWindowValue(window, showUsed) {
   if (window?.planStatus === 'expired') return t('limits.mimo.planExpired');
+  if (String(window?.detail || '').toLowerCase() === 'unlimited') return t('settings.thirdparty.unlimited');
   if (isCreditsWindow(window)) {
     if (window.remaining == null) {
       return String(window.detail || '').toLowerCase() === 'unlimited'
         ? t('settings.thirdparty.unlimited')
         : (window.detail || '--');
     }
-    return formatCompactMoney(window.remaining, window.currency);
+    return formatCompactMoney(window.remaining, window.currency, state.settings?.compactTokenUnits, currentLocale());
   }
   const percent = limitFillPercent(window?.remainingPercent, window?.usedPercent, showUsed);
   return `${formatPercent(percent)} ${limitModeSuffix(showUsed)}`;
 }
 
-function creditsBalanceValue(provider, credits) {
-  const amount = creditsAmount(provider, credits);
-  if (amount !== null) {
-    return formatCompactMoney(amount, credits?.currency || provider?.balance?.currency);
-  }
-  return String(credits?.detail || '').toLowerCase() === 'unlimited'
-    ? t('settings.thirdparty.unlimited')
-    : '';
-}
 
-function mimoTokenPlanWindowFromBalance(balance) {
-  if (!balance) return null;
-  if (balance.planStatus === 'expired') return null;
-  const used = optionalFiniteNumber(balance.planUsed);
-  const limit = optionalFiniteNumber(balance.planLimit);
-  const percent = optionalFiniteNumber(balance.planPercent);
-  const hasUsed = used !== null;
-  const hasLimit = limit !== null;
-  const hasPercent = percent !== null;
-  if (!hasUsed && !hasLimit && !hasPercent) return null;
-  const resolvedPercent = hasPercent
-    ? Math.max(0, Math.min(100, percent))
-    : (hasUsed && hasLimit && limit > 0 ? Math.max(0, Math.min(100, (used / limit) * 100)) : null);
-  return {
-    kind: 'billing',
-    label: 'Token Plan',
-    used: hasUsed ? used : null,
-    limit: hasLimit ? limit : null,
-    remaining: hasUsed && hasLimit ? Math.max(0, limit - used) : null,
-    usedPercent: resolvedPercent,
-    remainingPercent: resolvedPercent == null ? null : Math.max(0, Math.min(100, 100 - resolvedPercent)),
-    showMeter: true
-  };
-}
 
-function limitMeterNode(color, percent, tone = 1) {
-  const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
-  const meter = document.createElement('div');
-  meter.className = 'limit-meter';
-  meter.style.background = colorWithAlpha(color, 0.16);
-  const fill = document.createElement('div');
-  fill.className = 'limit-meter-fill';
-  applyBarScale(fill, safePercent / 100);
-  fill.style.background = color;
-  fill.style.opacity = tone;
-  meter.append(fill);
-  return meter;
-}
 
-function limitWindowNode(label, window, color, tone = 1, valueOverride = null, detailText = '') {
-  const remaining = Number(window?.remainingPercent);
-  const used = Number(window?.usedPercent);
-  const showMeter = window?.showMeter !== false;
-  const hasPercent = showMeter && (Number.isFinite(remaining) || Number.isFinite(used));
-  // valueOverride windows carry a fixed (money/amount) label — keep their meter
-  // on "remaining" so bar and label stay consistent; only percent-labelled
-  // windows honour the used-mode flip.
-  const showUsed = Boolean(state.settings?.showLimitUsed) && valueOverride == null;
-  const fillPercent = limitFillPercent(remaining, used, showUsed);
-  const item = document.createElement('div');
-  item.className = 'limit-window';
-  const text = document.createElement('div');
-  text.className = 'limit-window-text';
-  const name = document.createElement('span');
-  name.textContent = window?.label || label;
-  const value = document.createElement('span');
-  value.textContent = valueOverride != null ? valueOverride : formatLimitWindowValue(window, fillPercent, hasPercent, showUsed);
-  text.append(name, value);
-  const meter = limitMeterNode(color, fillPercent, tone);
-  const reset = document.createElement('div');
-  reset.className = 'limit-reset';
-  const resetText = window?.resetsAt
-    ? formatReset(window.resetsAt)
-    : window?.resetDescription || '';
-  if (detailText) {
-    // Keep the reset text left-aligned (consistent with every other provider)
-    // and add the absolute count on the right, under the top-line percentage.
-    reset.classList.add('limit-reset-split');
-    const resetSpan = document.createElement('span');
-    resetSpan.textContent = resetText;
-    const detailSpan = document.createElement('span');
-    detailSpan.className = 'limit-detail';
-    detailSpan.textContent = detailText;
-    reset.append(resetSpan, detailSpan);
-  } else {
-    reset.textContent = resetText;
-  }
-  if (showMeter) {
-    item.append(text, meter, reset);
-  } else {
-    item.classList.add('limit-window-note');
-    item.append(text, reset);
-  }
-  return item;
-}
 
 function providersByLimitProviderId(providers) {
   const byId = new Map();
@@ -4041,17 +3930,6 @@ function providersByLimitProviderId(providers) {
   return byId;
 }
 
-function renderLimitProviderMark(id, color) {
-  const mark = document.createElement('span');
-  if (limitMarksWithIcon.has(id)) {
-    mark.className = `limit-icon limit-icon-${id}`;
-  } else {
-    mark.className = 'dot';
-    mark.style.background = color;
-  }
-  return mark;
-}
-
 function codexSwitchAccountForProvider(provider) {
   if (!provider || provider.provider !== 'codex') return null;
   if (!provider.accountKey && !provider.accountEmail) return null;
@@ -4059,16 +3937,6 @@ function codexSwitchAccountForProvider(provider) {
     if (account.enabled === false) return false;
     return accountIdentityApi.codexAccountMatchesProvider(account, provider);
   }) || null;
-}
-
-function codexProviderMatchesProvider(left, right) {
-  if (!left || !right || left.provider !== 'codex' || right.provider !== 'codex') return false;
-  const leftKey = String(left.accountKey || '').trim();
-  const rightKey = String(right.accountKey || '').trim();
-  if (leftKey && rightKey && leftKey === rightKey) return true;
-  const leftEmail = String(left.accountEmail || '').trim().toLowerCase();
-  const rightEmail = String(right.accountEmail || '').trim().toLowerCase();
-  return Boolean(leftEmail && rightEmail && leftEmail === rightEmail);
 }
 
 function codexActiveAccountMatchesProvider(provider) {
@@ -4127,6 +3995,7 @@ function scheduleCodexPendingActiveAccountExpiry() {
     renderLimits();
     renderCodexAccounts();
     renderSettingsSummaries();
+    maybeUpdateBarsIcon();
   }, delay);
 }
 
@@ -4138,6 +4007,12 @@ function setCodexPendingActiveAccount(account) {
   state.codexPendingActiveAccount = account;
   state.codexPendingActiveAccountUntil = Date.now() + CODEX_PENDING_ACTIVE_GRACE_MS;
   scheduleCodexPendingActiveAccountExpiry();
+}
+
+function applyCodexOptimisticActiveAccount(account) {
+  if (!account) return;
+  setCodexPendingActiveAccount(account);
+  state.codexActiveAccount = account;
 }
 
 function applyCodexActiveAccountFromStats() {
@@ -4158,967 +4033,88 @@ function applyCodexActiveAccountFromStats() {
   state.codexActiveAccount = activeAccount;
 }
 
-function applyCodexAccountLimitsRefresh(providers) {
-  const refreshed = (providers || []).filter((provider) => provider?.provider === 'codex');
-  if (!refreshed.length || !state.stats?.limits) return;
-  const used = new Set();
-  const existingProviders = state.stats.limits.providers || [];
-  const nextProviders = existingProviders.map((provider) => {
-    if (provider?.provider !== 'codex') return provider;
-    const index = refreshed.findIndex((candidate, candidateIndex) => (
-      !used.has(candidateIndex) && codexProviderMatchesProvider(candidate, provider)
-    ));
-    if (index === -1) return provider;
-    used.add(index);
-    return refreshed[index];
-  });
-  refreshed.forEach((provider, index) => {
-    if (!used.has(index)) nextProviders.push(provider);
-  });
-  state.stats = {
-    ...state.stats,
-    limits: {
-      ...state.stats.limits,
-      providers: nextProviders
-    }
-  };
-  applyCodexActiveAccountFromStats();
-  renderLimits();
-  maybeUpdateBarsIcon();
+function clearCodexResetForecastRetryTimer() {
+  if (state.codexResetForecastRetryTimer) clearTimeout(state.codexResetForecastRetryTimer);
+  state.codexResetForecastRetryTimer = null;
 }
 
-function renderLimitProviderHead(id, label, provider, color, options = {}) {
-  const head = document.createElement('div');
-  head.className = 'limit-head';
-  const titleBlock = document.createElement('div');
-  titleBlock.className = 'limit-title';
-  const name = document.createElement('div');
-  name.className = 'limit-name';
-  if (options.showIcon !== false) name.append(renderLimitProviderMark(options.markId || id, color));
-  const title = document.createElement('span');
-  title.className = 'limit-name-title';
-  title.textContent = options.title || label;
-  const provenance = limitProviderProvenance(provider);
-  // The ✓ marks the account THIS device's Codex is signed into
-  // (state.codexActiveAccount, derived locally by codexActiveAccountFromStats).
-  // It only disambiguates rows in the multi-account group, so it's gated on
-  // showActiveBadge. Never re-derive "live" from the row being rendered — in
-  // sync mode that row can be a remote device's record for a different account,
-  // which would move the ✓ onto the wrong one.
-  const activeCodexAccount = options.showActiveBadge && codexActiveAccountMatchesProvider(provider);
-  const switchAccount = options.allowSystemSwitch && !activeCodexAccount ? codexSwitchAccountForProvider(provider) : null;
-  if (switchAccount && window.tokenMonitor?.codex?.switchSystemAccount) {
-    const switchZone = document.createElement('span');
-    const switchPopover = document.createElement('span');
-    const switchButton = document.createElement('button');
-    const switching = state.codexSystemSwitchingAccountId === switchAccount.id;
-    const failed = state.codexSystemSwitchErrorAccountId === switchAccount.id && state.codexSystemSwitchError;
-    switchZone.className = 'limit-account-switch-zone';
-    switchZone.classList.toggle('has-opened', state.codexSwitchPopoverHasOpened);
-    switchZone.classList.toggle('is-switching', Boolean(switching));
-    switchZone.classList.toggle('is-error', Boolean(failed));
-    switchPopover.className = 'limit-account-switch-popover';
-    switchButton.type = 'button';
-    switchButton.className = 'limit-account-switch-button';
-    switchButton.disabled = Boolean(state.codexSystemSwitchingAccountId);
-    switchButton.title = failed || t('limits.codex.switchAccountTitle', {
-      account: switchAccount.email || t('settings.codex.unnamedAccount')
-    });
-    switchButton.setAttribute('aria-label', switchButton.title);
-    switchButton.textContent = switching
-      ? t('limits.codex.switching')
-      : failed
-        ? t('limits.codex.switchFailedShort')
-        : t('limits.codex.switchAccount');
-    const markCodexSwitchPopoverOpened = () => {
-      state.codexSwitchPopoverHasOpened = true;
-      state.codexSwitchPopoverActive = true;
-      switchZone.classList.add('has-opened');
+function renderCodexResetForecastUpdate() {
+  if (state.breakdown !== 'limits') return null;
+  const surface = visibleStatsSurface();
+  if (surface === 'main') renderLimits();
+  else if (!surface) statsRenderScheduler.request();
+  return surface;
+}
+
+async function refreshCodexResetForecast(options = {}) {
+  if (state.settings?.codexResetForecastEnabled !== true || !window.tokenMonitor.getCodexResetForecast) return;
+  if (state.codexResetForecastBusy) return;
+  clearCodexResetForecastRetryTimer();
+  state.codexResetForecastBusy = true;
+  state.codexResetForecastRequestedAt = Date.now();
+  try {
+    state.codexResetForecast = await window.tokenMonitor.getCodexResetForecast({ force: options.force === true });
+  } catch (error) {
+    state.codexResetForecast = {
+      status: 'unavailable',
+      checkedAt: new Date().toISOString(),
+      error: error.message
     };
-    const releaseCodexSwitchPopover = () => {
-      requestAnimationFrame(() => {
-        if (switchZone.matches(':hover, :focus-within')) return;
-        state.codexSwitchPopoverActive = false;
-        flushPendingCodexSwitchPopoverRender();
-      });
-    };
-    switchZone.addEventListener('pointerenter', markCodexSwitchPopoverOpened);
-    switchZone.addEventListener('focusin', markCodexSwitchPopoverOpened);
-    switchZone.addEventListener('pointerleave', releaseCodexSwitchPopover);
-    switchZone.addEventListener('focusout', releaseCodexSwitchPopover);
-    switchButton.addEventListener('click', async (event) => {
-      event.stopPropagation();
-      if (state.codexSystemSwitchingAccountId) return;
-      state.codexSystemSwitchingAccountId = switchAccount.id;
-      state.codexSystemSwitchErrorAccountId = '';
-      state.codexSystemSwitchError = '';
-      state.codexSwitchPopoverActive = false;
-      renderLimits();
-      try {
-        const result = await window.tokenMonitor.codex.switchSystemAccount(switchAccount.id);
-        if (!result?.ok) {
-          const message = result?.error || t('limits.codex.switchFailed');
-          state.codexSystemSwitchErrorAccountId = switchAccount.id;
-          state.codexSystemSwitchError = message;
-          state.codexAccountError = message;
-        } else {
-          state.codexAccountError = '';
-          state.settings.codexManagedAccounts = result.accounts || state.settings.codexManagedAccounts || [];
-          setCodexPendingActiveAccount(result.activeAccount || null);
-          state.codexActiveAccount = result.activeAccount;
-          renderLimits();
-          window.tokenMonitor.codex.refreshAccountLimits(switchAccount.id).then((refreshResult) => {
-            if (refreshResult?.ok) applyCodexAccountLimitsRefresh(refreshResult.providers || []);
-            else if (refreshResult?.error) console.log(`[codex] refresh account limits failed: ${refreshResult.error}`);
-          }).catch((refreshError) => {
-            console.log(`[codex] refresh account limits failed: ${refreshError?.message || refreshError}`);
-          });
-        }
-      } catch (error) {
-        const message = error?.message || t('limits.codex.switchFailed');
-        state.codexSystemSwitchErrorAccountId = switchAccount.id;
-        state.codexSystemSwitchError = message;
-        state.codexAccountError = message;
-      } finally {
-        state.codexSystemSwitchingAccountId = '';
-        renderLimits();
-        renderCodexAccounts();
-        renderSettingsSummaries();
-      }
-    });
-    switchPopover.append(switchButton);
-    switchZone.append(title, switchPopover);
-    name.append(switchZone);
-  } else if (activeCodexAccount) {
-    const activeZone = document.createElement('span');
-    const badge = document.createElement('span');
-    const activePopover = document.createElement('span');
-    const activeHint = t('limits.codex.activeAccountHint');
-    activeZone.className = 'limit-account-active-zone';
-    activeZone.tabIndex = 0;
-    activeZone.setAttribute('aria-label', activeHint);
-    badge.className = 'limit-live-badge';
-    badge.textContent = '\u2713';
-    activePopover.className = 'limit-account-active-popover';
-    activePopover.textContent = activeHint;
-    const markCodexActiveHintOpened = () => {
-      state.codexSwitchPopoverActive = true;
-    };
-    const releaseCodexActiveHint = () => {
-      requestAnimationFrame(() => {
-        if (activeZone.matches(':hover, :focus-within')) return;
-        state.codexSwitchPopoverActive = false;
-        flushPendingCodexSwitchPopoverRender();
-      });
-    };
-    activeZone.addEventListener('pointerenter', markCodexActiveHintOpened);
-    activeZone.addEventListener('focusin', markCodexActiveHintOpened);
-    activeZone.addEventListener('pointerleave', releaseCodexActiveHint);
-    activeZone.addEventListener('focusout', releaseCodexActiveHint);
-    activeZone.append(title, badge, activePopover);
-    name.append(activeZone);
-  } else {
-    name.append(title);
+  } finally {
+    state.codexResetForecastBusy = false;
+    if (renderCodexResetForecastUpdate() === 'main') maybeFetchCodexResetForecast();
   }
-  titleBlock.append(name);
-  // The multi-account group header has no quota of its own, and its accounts can
-  // update at different times (different devices too), so it omits the meta line
-  // entirely — each account row below shows its own "Updated" time.
-  if (!options.hideMeta) {
-    const meta = document.createElement('div');
-    meta.className = 'limit-meta';
-    const metaParts = [];
-    // A single Codex account stays clean like every other provider (just the
-    // "Updated" line). The email only matters when several accounts share the
-    // group, where it's each subrow's title (options.accountTitle) — not here.
-    if (provider.status === 'ok' || provider.stale) metaParts.push(limitProviderMeta(provider, provenance));
-    const metaText = metaParts.filter(Boolean).join(' · ');
-    if (metaText) meta.append(document.createTextNode(metaText));
-    titleBlock.append(meta);
+}
+
+function maybeFetchCodexResetForecast() {
+  if (state.settings?.codexResetForecastEnabled !== true) {
+    clearCodexResetForecastRetryTimer();
+    return;
   }
-  const plan = document.createElement('div');
-  plan.className = 'limit-plan';
-  plan.textContent = options.planText ?? limitProviderPlan(provider);
-  head.append(titleBlock, decoratePlanWithSubscription(plan, provider));
-  return head;
-}
-
-function renderProviderWindows(provider, color) {
-  const windows = document.createElement('div');
-  windows.className = 'limit-windows';
-  if (provider.provider === 'codex') {
-    const session = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    const monthly = windowForKind(provider, 'billing');
-    if (session) {
-      const sessionNode = limitWindowNode(session.label || 'Session', session, color, 0.95);
-      if (!weekly && !monthly) sessionNode.classList.add('limit-window-wide');
-      windows.append(sessionNode);
-    }
-    if (weekly) {
-      const weeklyNode = limitWindowNode(weekly.label || 'Weekly', weekly, color, 0.68);
-      if (!session && !monthly) weeklyNode.classList.add('limit-window-wide');
-      windows.append(weeklyNode);
-    }
-    if (monthly) {
-      const monthlyNode = limitWindowNode(monthly.label || 'Monthly', monthly, color, 0.68);
-      monthlyNode.classList.add('limit-window-wide');
-      windows.append(monthlyNode);
-    }
-    const resetNode = codexResetCreditsNode(provider.resetCredits);
-    if (resetNode) windows.append(resetNode);
-  } else if (provider.provider === 'cursor') {
-    windows.classList.add('limit-windows-cursor');
-    const billingWindows = windowsForKind(provider, 'billing');
-    const visibleWindows = billingWindows.length > 0 ? billingWindows : [null];
-    for (const billing of visibleWindows) {
-      const node = limitWindowNode('Billing cycle', billing, color, 0.68);
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-  } else if (provider.provider === 'antigravity') {
-    windows.classList.add('limit-windows-antigravity');
-    const quotaGroups = antigravityQuotaGroups(provider);
-    if (quotaGroups.length > 0) {
-      windows.classList.add('limit-windows-antigravity-grouped');
-      for (const group of quotaGroups) {
-        const groupNode = document.createElement('div');
-        groupNode.className = 'limit-window-group';
-        groupNode.setAttribute('role', 'group');
-        groupNode.setAttribute('aria-label', group.label);
-        const title = document.createElement('div');
-        title.className = 'limit-window-group-title';
-        title.textContent = group.label;
-        const groupWindows = document.createElement('div');
-        groupWindows.className = 'limit-window-group-items';
-        for (const entry of group.windows) {
-          const opacity = entry.window.kind === 'session' ? 0.95 : 0.78;
-          groupWindows.append(limitWindowNode(
-            entry.windowLabel,
-            { ...entry.window, label: entry.windowLabel },
-            color,
-            opacity
-          ));
-        }
-        groupNode.append(title, groupWindows);
-        windows.append(groupNode);
+  const nowMs = Date.now();
+  const retryAfterMs = Number(state.codexResetForecast?.retryAfterMs);
+  const refreshMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0
+    ? retryAfterMs
+    : (state.codexResetForecast?.error ? 30 * 1000 : 15 * 60 * 1000);
+  const checkedAtMs = Date.parse(state.codexResetForecast?.checkedAt || '');
+  const fallbackBaseMs = Number(state.codexResetForecastRequestedAt || nowMs);
+  const baseMs = Number.isFinite(checkedAtMs) ? checkedAtMs : fallbackBaseMs;
+  const remainingMs = Math.max(0, baseMs + refreshMs - nowMs);
+  if (state.codexResetForecastBusy) return;
+  if (!state.codexResetForecast || remainingMs <= 0) {
+    clearCodexResetForecastRetryTimer();
+    void refreshCodexResetForecast();
+  } else if (!state.codexResetForecastRetryTimer) {
+    state.codexResetForecastRetryTimer = setTimeout(() => {
+      state.codexResetForecastRetryTimer = null;
+      if (state.breakdown === 'limits' && visibleStatsSurface() === 'main') {
+        if (codexResetForecastExpired(state.codexResetForecast)) renderCodexResetForecastUpdate();
+        maybeFetchCodexResetForecast();
       }
-    } else {
-      const weeklyWindows = windowsForKind(provider, 'weekly');
-      const visibleWindows = weeklyWindows.length > 0 ? weeklyWindows : [null];
-      for (const quotaWindow of visibleWindows) {
-        const node = limitWindowNode(quotaWindow?.label || 'Weekly', quotaWindow, color, 0.78);
-        node.classList.add('limit-window-wide');
-        windows.append(node);
-      }
-    }
-  } else if (provider.provider === 'opencode') {
-    // Go reports session/weekly/monthly windows ($12/$30/$60); Zen reports a prepaid balance (and,
-    // when the account is active, rolling/weekly). The monthly window normalizes to kind 'billing'
-    // (see normalizeWindowKind). Show only the windows that exist — no empty `--` placeholders — and
-    // surface the Zen balance as a full-width, no-meter note when present.
-    const session = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    const monthly = windowForKind(provider, 'billing');
-    if (session) windows.append(limitWindowNode('Session', session, color, 0.95));
-    if (weekly) windows.append(limitWindowNode('Weekly', weekly, color, 0.68));
-    // Monthly spans the full row (like Balance) so it never leaves a half-empty grid cell.
-    if (monthly) {
-      const node = limitWindowNode('Monthly', monthly, color, 0.5);
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-    // Balance is a Zen-only concept. Show it only when a real balance number came
-    // back (incl. $0.00). It can't key off `source === 'web'` anymore — Go usage is
-    // now fetched over the web too, so a pure-Go account (no Zen, balanceUsd null)
-    // must not get a phantom `Balance —` line.
-    const hasBalance = typeof provider.balanceUsd === 'number' && Number.isFinite(provider.balanceUsd);
-    if (hasBalance) {
-      const node = limitWindowNode('Balance', { showMeter: false }, color, 0.68, formatLimitAmount(provider.balanceUsd));
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-  } else if (provider.provider === 'openrouter') {
-    windows.classList.add('limit-windows-openrouter');
-    const balance = provider.balance || null;
-    const currency = balance?.currency || 'USD';
-    const balanceAmount = optionalFiniteNumber(balance?.amount);
-    const creditsWindow = openrouterCreditsWindow(provider);
-    if (balanceAmount !== null) {
-      const balanceWindow = creditsWindow || (balanceAmount === 0
-        ? { usedPercent: 100, remainingPercent: 0, showMeter: true }
-        : { showMeter: false });
-      const balanceNode = limitWindowNode(
-        'Balance',
-        { ...balanceWindow, label: 'Balance' },
-        color,
-        0.95,
-        formatMoney(balanceAmount, currency)
-      );
-      balanceNode.classList.add('limit-window-wide', 'limit-window-no-reset');
-      windows.append(balanceNode);
-    }
-    for (const quotaWindow of (provider.windows || []).filter((window) => window !== creditsWindow)) {
-      const hasMeter = quotaWindow?.showMeter !== false;
-      const remaining = optionalFiniteNumber(quotaWindow?.remaining);
-      const limit = optionalFiniteNumber(quotaWindow?.limit);
-      const absoluteDetail = hasMeter && remaining !== null && limit !== null
-        ? `${formatMoney(remaining, 'USD')} left · ${formatMoney(limit, 'USD')} total`
-        : '';
-      const valueOverride = hasMeter ? null : (quotaWindow?.detail || '—');
-      const node = limitWindowNode(
-        quotaWindow?.label || 'Usage',
-        quotaWindow,
-        color,
-        hasMeter ? 0.85 : 0.6,
-        valueOverride,
-        absoluteDetail
-      );
-      node.classList.add('limit-window-wide');
-      if (!hasMeter) node.classList.add('limit-window-no-reset');
-      windows.append(node);
-    }
-    const spendNode = providerSpendNode(balance);
-    if (spendNode) windows.append(spendNode);
-  } else if (provider.provider === 'thirdparty') {
-    windows.classList.add('limit-windows-thirdparty');
-    const balance = provider.balance || null;
-    const currency = balance?.currency || 'USD';
-    const balanceAmount = optionalFiniteNumber(balance?.amount);
-    const quotaWindow = thirdPartyQuotaWindow(provider);
-    const balanceLabel = quotaWindow?.label || 'Balance';
-    if (balanceAmount !== null) {
-      const balanceValue = formatMoney(balanceAmount, currency);
-      // Balance presets without a fixed quota denominator (Sub2API reports the
-      // remaining USD balance plus an observed monthSpend) get the same
-      // display-layer meter DeepSeek uses: balance / (balance + month spend).
-      // Windows that already carry provider percentages pass through unchanged.
-      const meterPercent = creditsMeterPercent(provider, quotaWindow);
-      const balanceNode = limitWindowNode(
-        balanceLabel,
-        {
-          ...(quotaWindow || { showMeter: false }),
-          label: balanceLabel,
-          ...(meterPercent !== null ? { remainingPercent: meterPercent, showMeter: true } : {})
-        },
-        color,
-        0.95,
-        balanceValue
-      );
-      balanceNode.classList.add('limit-window-wide', 'limit-window-no-reset');
-      windows.append(balanceNode);
-    } else if (quotaWindow?.showMeter === false && quotaWindow.detail) {
-      const value = String(quotaWindow.detail).toLowerCase() === 'unlimited'
-        ? t('settings.thirdparty.unlimited')
-        : quotaWindow.detail;
-      const balanceNode = limitWindowNode(
-        balanceLabel,
-        { ...quotaWindow, label: balanceLabel },
-        color,
-        0.95,
-        value
-      );
-      balanceNode.classList.add('limit-window-wide', 'limit-window-no-reset');
-      windows.append(balanceNode);
-    }
-    const spendNode = thirdPartySpendNode(provider, quotaWindow);
-    if (spendNode) windows.append(spendNode);
-  } else if (provider.provider === 'deepseek') {
-    // DeepSeek does not expose a fixed quota denominator. This intentionally
-    // visualizes the balance relative to this month's inferred starting funds:
-    // current / (current + observed month spend).
-    windows.classList.add('limit-windows-deepseek');
-    const balance = provider.balance || null;
-    if (balance) {
-      const currency = balance.currency;
-      const balanceNode = limitWindowNode(
-        'Balance',
-        { remainingPercent: creditsMeterPercent(provider, null) },
-        color,
-        0.95,
-        formatMoney(balance.amount, currency)
-      );
-      balanceNode.classList.add('limit-window-wide', 'limit-window-no-reset');
-      windows.append(balanceNode);
-
-      const spendNode = providerSpendNode(balance);
-      if (spendNode) windows.append(spendNode);
-    }
-  } else if (provider.provider === 'mimo') {
-    windows.classList.add('limit-windows-mimo');
-    const balance = provider.balance || null;
-    const tokenPlan = windowForKind(provider, 'billing') || mimoTokenPlanWindowFromBalance(balance);
-    if (tokenPlan) {
-      const node = limitWindowNode(tokenPlan.label || 'Token Plan', tokenPlan, color, 0.68);
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    } else if (balance?.planStatus === 'expired') {
-      const node = limitWindowNode('Token Plan', { showMeter: false }, color, 0.68, t('limits.mimo.planExpired'));
-      node.classList.add('limit-window-wide', 'limit-window-no-reset');
-      windows.append(node);
-    }
-    const amount = optionalFiniteNumber(balance?.amount);
-    const giftBalance = optionalFiniteNumber(balance?.giftBalance);
-    const cashBalance = optionalFiniteNumber(balance?.cashBalance);
-    if (amount !== null || giftBalance !== null || cashBalance !== null) {
-      const detailParts = [];
-      if (giftBalance !== null) detailParts.push(`Gift ${formatMoney(giftBalance, balance.currency)}`);
-      if (cashBalance !== null) detailParts.push(`Cash ${formatMoney(cashBalance, balance.currency)}`);
-      const balanceText = formatMoney(amount, balance.currency) || '—';
-      const balanceNode = limitWindowNode(
-        'Balance',
-        { showMeter: false },
-        color,
-        0.68,
-        balanceText,
-        detailParts.join(' · ')
-      );
-      balanceNode.classList.add('limit-window-wide', 'limit-window-no-reset');
-      windows.append(balanceNode);
-    }
-  } else if (provider.provider === 'grok') {
-    // Grok exposes a single Monthly billing window (no session/weekly). Render it
-    // full-width so it doesn't share a row with an empty placeholder. This mirrors
-    // how Cursor's billing cycle and OpenCode's Monthly are handled.
-    windows.classList.add('limit-windows-grok');
-    const monthly = windowForKind(provider, 'billing');
-    if (monthly) {
-      const node = limitWindowNode(monthly.label || 'Monthly', monthly, color, 0.68);
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-  } else if (provider.provider === 'copilot') {
-    windows.classList.add('limit-windows-copilot');
-    const billingWindows = windowsForKind(provider, 'billing');
-    for (const billing of billingWindows) {
-      const node = limitWindowNode(billing?.label || 'Monthly', billing, color, 0.68);
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-  } else if (provider.provider === 'zai' || provider.provider === 'zaiteam') {
-    const fiveHour = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    const mcp = windowForKind(provider, 'billing');
-    if (fiveHour) {
-      const fiveHourNode = limitWindowNode('5-hour', fiveHour, color, 0.95);
-      if (!weekly) fiveHourNode.classList.add('limit-window-wide');
-      windows.append(fiveHourNode);
-    }
-    if (weekly) windows.append(limitWindowNode('Weekly', weekly, color, 0.68));
-    if (mcp) {
-      const mcpNode = limitWindowNode('MCP', mcp, color, 0.68);
-      mcpNode.classList.add('limit-window-wide');
-      windows.append(mcpNode);
-    }
-  } else if (provider.provider === 'volcengine') {
-    const session = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    const monthly = windowForKind(provider, 'billing');
-    if (session) {
-      const sessionNode = limitWindowNode(session.label || '5-hour', session, color, 0.95);
-      if (!weekly && !monthly && session.label) sessionNode.classList.add('limit-window-wide');
-      windows.append(sessionNode);
-    }
-    if (weekly) windows.append(limitWindowNode('Weekly', weekly, color, 0.68));
-    if (monthly) {
-      const monthlyNode = limitWindowNode('Monthly', monthly, color, 0.68);
-      monthlyNode.classList.add('limit-window-wide');
-      windows.append(monthlyNode);
-    }
-  } else if (provider.provider === 'kiro') {
-    // Kiro exposes monthly credits (plus an optional bonus pool), both billing
-    // windows. Render them full-width like Copilot's quota windows.
-    windows.classList.add('limit-windows-kiro');
-    const billingWindows = windowsForKind(provider, 'billing');
-    for (const billing of billingWindows) {
-      if (billing?.showMeter === false) {
-        // Overage: a single compact line like Cursor's "Credits $0.00" (no bar,
-        // no reset) with the credits used and estimated cost joined on the right.
-        const node = limitWindowNode(billing.label || 'Overage', billing, color, 0.6, formatKiroOverageValue(billing));
-        node.classList.add('limit-window-wide', 'limit-window-no-reset');
-        windows.append(node);
-      } else {
-        const node = limitWindowNode(
-          billing?.label || 'Credits',
-          billing,
-          color,
-          0.68,
-          null,
-          formatLimitCount(billing, Boolean(state.settings?.showLimitUsed))
-        );
-        node.classList.add('limit-window-wide');
-        windows.append(node);
-      }
-    }
-  } else if (provider.provider === 'qoder') {
-    windows.classList.add('limit-windows-qoder');
-    const credits = windowForKind(provider, 'billing');
-    if (credits) {
-      const node = limitWindowNode(
-        credits?.label || 'Credits',
-        credits,
-        color,
-        0.68,
-        null,
-        formatLimitCount(credits, Boolean(state.settings?.showLimitUsed))
-      );
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-  } else if (provider.provider === 'workbuddy' || provider.provider === 'trae') {
-    const credits = windowForKind(provider, 'billing');
-    const balance = provider.balance || null;
-    const value = creditsBalanceValue(provider, credits);
-    if (credits && value) {
-      const displayWindow = {
-        ...credits,
-        label: credits.label || 'Credits'
-      };
-      const node = limitWindowNode(
-        displayWindow.label,
-        displayWindow,
-        color,
-        0.95,
-        value
-      );
-      node.classList.add('limit-window-wide');
-      if (!displayWindow.resetsAt && !displayWindow.resetDescription) {
-        node.classList.add('limit-window-no-reset');
-      }
-      windows.append(node);
-      const spendNode = providerSpendNode(balance);
-      if (spendNode) windows.append(spendNode);
-    }
-  } else if (provider.provider === 'commandcode') {
-    // 5-hour and weekly are rate-limit windows (percent); the monthly grant and
-    // any rollover top-up are money, so they get the amount on the right of the
-    // reset line and span the row like Kimi's Monthly.
-    const fiveHour = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    if (fiveHour) {
-      const node = limitWindowNode('5-hour', fiveHour, color, 0.95);
-      if (!weekly) node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-    if (weekly) {
-      const node = limitWindowNode('Weekly', weekly, color, 0.68);
-      if (!fiveHour) node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-    for (const credits of windowsForKind(provider, 'billing')) {
-      const node = limitWindowNode(
-        credits.label || 'Monthly',
-        credits,
-        color,
-        0.5,
-        null,
-        formatCommandcodeCreditsDetail(credits)
-      );
-      node.classList.add('limit-window-wide');
-      // A grant with no known plan allowance has no meter, so there is no bar
-      // for a reset line to sit under either.
-      if (credits.showMeter === false) node.classList.add('limit-window-no-reset');
-      windows.append(node);
-    }
-  } else if (provider.provider === 'kimi') {
-    const fiveHour = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    const monthly = windowForKind(provider, 'billing');
-    if (fiveHour) {
-      const node = limitWindowNode(fiveHour.label || '5-hour', fiveHour, color, 0.95);
-      if (!weekly) node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-    if (weekly) {
-      const node = limitWindowNode(weekly.label || 'Weekly', weekly, color, 0.68);
-      if (!fiveHour) node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-    if (monthly) {
-      const node = limitWindowNode(
-        monthly.label || 'Monthly',
-        monthly,
-        color,
-        0.5,
-        null,
-        monthly.detail || ''
-      );
-      node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-  } else if (provider.provider === 'ollama') {
-    const session = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    if (session) {
-      const node = limitWindowNode('Session', session, color, 0.95);
-      if (!weekly) node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-    if (weekly) windows.append(limitWindowNode('Weekly', weekly, color, 0.68));
-  } else if (provider.provider === 'claude') {
-    // Claude usually shows session + one all-models weekly, but can carry a second
-    // model-scoped weekly (the temporary "Fable only" promo cap). Render every
-    // weekly the response actually has, and nothing when a bucket is absent — no
-    // empty placeholder — so the scoped bar appears only while the promo is live.
-    const session = windowForKind(provider, 'session');
-    if (session) windows.append(limitWindowNode(session.label || 'Session', session, color, 0.95));
-    for (const weekly of windowsForKind(provider, 'weekly')) {
-      const node = limitWindowNode(weekly.label || 'Weekly', weekly, color, 0.68);
-      // The all-models weekly pairs with Session in the two-column grid; a
-      // model-scoped weekly (the "Fable only" promo cap) has no partner, so span
-      // the full row instead of leaving a half-empty cell.
-      if (weekly.label) node.classList.add('limit-window-wide');
-      windows.append(node);
-    }
-    // Usage credits: "$2.35 / $20.00" with a meter when a monthly spend limit is
-    // set, "$2.35 spent" without one. Absent entirely when credits are off.
-    const usageCredits = spendWindow(provider);
-    if (usageCredits) {
-      const value = usageCredits.limit === null
-        ? `${formatMoney(usageCredits.used, usageCredits.currency)} spent`
-        : `${formatMoney(usageCredits.used, usageCredits.currency)} / ${formatMoney(usageCredits.limit, usageCredits.currency)}`;
-      const node = limitWindowNode('Usage credits', usageCredits, color, 0.5, value);
-      node.classList.add('limit-window-wide', 'limit-window-no-reset');
-      windows.append(node);
-    }
-    const balanceNode = claudeBalanceNode(provider);
-    if (balanceNode) windows.append(balanceNode);
-  } else {
-    // Default: render only the windows the provider actually has. Providers
-    // that only expose a single window shouldn't leave a half-empty bar next to
-    // the real one. (Grok is handled above; this branch covers minimax's
-    // session + weekly pair and any future session/weekly provider.)
-    const session = windowForKind(provider, 'session');
-    const weekly = windowForKind(provider, 'weekly');
-    if (session) windows.append(limitWindowNode(session.label || 'Session', session, color, 0.95));
-    if (weekly) windows.append(limitWindowNode(weekly.label || 'Weekly', weekly, color, 0.68));
+    }, remainingMs);
   }
-  return windows;
 }
 
-function renderLimitProviderRow(id, label, provider, color, options = {}) {
-  const row = document.createElement('div');
-  const classes = ['limit-row'];
-  if (options.accountRow) classes.push('limit-account-row');
-  if (provider.stale) classes.push('stale');
-  row.className = classes.join(' ');
-  row.append(
-    renderLimitProviderHead(id, label, provider, color, options),
-    renderProviderWindows(provider, color)
-  );
-  return row;
+function captureLimitResetMotion() {
+  // The refill motion itself lives in limits/resetAnimator.js — the edge
+  // dock's card plays it through the same animator, so this page keeps a
+  // scope-bound wrapper rather than a second copy.
+  return limitResetAnimator.capture(els.limitsPanel);
 }
 
-// Every limits surface (the limits panel and the Home cards) resolves account
-// titles here. One table keeps a provider from masking its email on one surface
-// while leaking it on the other, and from rendering two different titles for the
-// same account. Providers identified by email need no entry — the default below
-// already masks them.
-const LIMIT_ACCOUNT_TITLES = {
-  codex: codexAccountTitle,
-  opencode: opencodeAccountTitle,
-  openrouter: (provider, index) => namedApiAccountTitle(provider, index, 'openrouter'),
-  thirdparty: (provider, index) => namedApiAccountTitle(provider, index, 'thirdparty'),
-  volcengine: (provider, index, providers) => volcenginePlanAccountTitle(provider, index, providers)
-};
-
-function limitAccountTitle(id, provider, index, providerEntries = [provider]) {
-  const resolve = LIMIT_ACCOUNT_TITLES[String(id || '').trim().toLowerCase()];
-  return resolve
-    ? resolve(provider, index, providerEntries)
-    : limitAccountDefaultTitle(provider, index, providerEntries);
-}
-
-// maskLimitAccountEmails is display-only: it hides the address on the limits
-// surfaces without changing what is collected, synced, or stored.
-function limitAccountEmailsMasked() {
-  return state.settings?.maskLimitAccountEmails === true;
-}
-
-function limitAccountDefaultTitle(provider, index, providerEntries = [provider]) {
-  return accountIdentityApi.accountTitleLabel(provider, providerEntries, {
-    maskEmail: limitAccountEmailsMasked(),
-    index
-  }) || `Account ${index + 1}`;
-}
-
-function codexAccountTitle(provider, index, providers = [provider]) {
-  const label = accountIdentityApi.codexAccountDisplayLabel(provider, providers, {
-    maskEmail: limitAccountEmailsMasked(),
-    index,
-    // Limits presents raw account data such as email and Plus/Pro labels, so
-    // keep the provider's canonical English workspace name on this surface.
-    personalWorkspaceLabel: 'Personal'
-  });
-  if (label) return label;
-  // Never fall back to the plan label here — "Plus" as a title reads like an
-  // account name. The plan still shows on the right via limitProviderPlan().
-  return `Account ${index + 1}`;
-}
-
-function renderCodexAccountGroup(label, providers, color) {
-  const row = document.createElement('div');
-  row.className = `limit-row limit-row-group${providers.some((provider) => provider.stale) ? ' stale' : ''}`;
-  const groupProvider = { provider: 'codex', status: 'ok', windows: [], accountGroup: true };
-  const head = renderLimitProviderHead('codex', label, groupProvider, color, {
-    planText: t('settings.codex.nAccounts', { count: providers.length }),
-    hideMeta: true
-  });
-  const accountList = document.createElement('div');
-  accountList.className = 'limit-account-list';
-  providers.forEach((provider, index) => {
-    accountList.append(renderLimitProviderRow('codex', limitAccountTitle('codex', provider, index, providers), provider, color, {
-      accountRow: true,
-      accountTitle: true,
-      allowSystemSwitch: true,
-      showActiveBadge: true,
-      showIcon: false
-    }));
-  });
-  row.append(head, accountList);
-  return row;
-}
-
-function renderClaudeAccountGroup(label, providers, color) {
-  const row = document.createElement('div');
-  row.className = `limit-row limit-row-group${providers.some((provider) => provider.stale) ? ' stale' : ''}`;
-  const groupProvider = { provider: 'claude', status: 'ok', windows: [], accountGroup: true };
-  const head = renderLimitProviderHead('claude', label, groupProvider, color, {
-    planText: t('settings.claude.nAccounts', { count: providers.length }),
-    hideMeta: true
-  });
-  const accountList = document.createElement('div');
-  accountList.className = 'limit-account-list';
-  providers.forEach((provider, index) => {
-    accountList.append(renderLimitProviderRow('claude', limitAccountTitle('claude', provider, index, providers), provider, color, {
-      accountRow: true,
-      accountTitle: true,
-      showIcon: false
-    }));
-  });
-  row.append(head, accountList);
-  return row;
-}
-
-function mimoSettingsAccountTitle(account, index) {
-  return String(account?.accountEmail || '').trim() || `Account ${index + 1}`;
-}
-
-function renderMimoAccountGroup(label, providers, color) {
-  const row = document.createElement('div');
-  row.className = `limit-row limit-row-group${providers.some((provider) => provider.stale) ? ' stale' : ''}`;
-  const groupProvider = { provider: 'mimo', status: 'ok', windows: [], accountGroup: true };
-  const head = renderLimitProviderHead('mimo', label, groupProvider, color, {
-    planText: t('settings.mimo.nAccounts', { count: providers.length }),
-    hideMeta: true
-  });
-  const accountList = document.createElement('div');
-  accountList.className = 'limit-account-list';
-  providers.forEach((provider, index) => {
-    accountList.append(renderLimitProviderRow('mimo', limitAccountTitle('mimo', provider, index, providers), provider, color, {
-      accountRow: true,
-      accountTitle: true,
-      showIcon: false
-    }));
-  });
-  row.append(head, accountList);
-  return row;
-}
-
-function renderCursorAccountGroup(label, providers, color) {
-  const row = document.createElement('div');
-  row.className = `limit-row limit-row-group${providers.some((provider) => provider.stale) ? ' stale' : ''}`;
-  const groupProvider = { provider: 'cursor', status: 'ok', windows: [], accountGroup: true };
-  const head = renderLimitProviderHead('cursor', label, groupProvider, color, {
-    planText: t('settings.cursor.nAccounts', { count: providers.length }),
-    hideMeta: true
-  });
-  const accountList = document.createElement('div');
-  accountList.className = 'limit-account-list';
-  providers.forEach((provider, index) => {
-    accountList.append(renderLimitProviderRow('cursor', limitAccountTitle('cursor', provider, index, providers), provider, color, {
-      accountRow: true,
-      accountTitle: true,
-      showIcon: false
-    }));
-  });
-  row.append(head, accountList);
-  return row;
-}
-
-function opencodeAccountTitle(provider, index) {
-  const name = String(provider?.accountName || '').trim();
-  // The collector's canonical name is shown as-is. This column holds account
-  // names, which are user strings and almost never translated, so a localized
-  // phrase reads as a stray UI label among them — and the plan and source
-  // columns beside it are English for the same reason.
-  if (name) return name;
-  // Older synced clients put the user-defined profile name in accountLabel.
-  // Keep those rows identifiable while new clients carry profile and plan in
-  // separate fields. Go/Zen are plan labels, never account identities.
-  const legacyName = String(provider?.accountLabel || '').trim();
-  return legacyName && legacyName !== 'Go' && legacyName !== 'Zen'
-    ? legacyName
-    : `Account ${index + 1}`;
-}
-
-function renderOpenCodeAccountGroup(label, providers, color) {
-  const row = document.createElement('div');
-  row.className = 'limit-row limit-row-group';
-  const groupProvider = { provider: 'opencode', status: 'ok', windows: [], accountGroup: true };
-  const head = renderLimitProviderHead('opencode', label, groupProvider, color, {
-    planText: t('settings.opencode.nAccounts', { count: providers.length }),
-    hideMeta: true
-  });
-  const accountList = document.createElement('div');
-  accountList.className = 'limit-account-list';
-  providers.forEach((provider, index) => {
-    const legacyProfileLabel = !provider?.accountName
-      && provider?.accountLabel
-      && provider.accountLabel !== 'Go'
-      && provider.accountLabel !== 'Zen';
-    accountList.append(renderLimitProviderRow('opencode', limitAccountTitle('opencode', provider, index, providers), provider, color, {
-      accountRow: true,
-      showIcon: false,
-      ...(legacyProfileLabel ? { planText: '' } : {})
-    }));
-  });
-  row.append(head, accountList);
-  return row;
-}
-
-function namedApiAccountTitle(provider, index, providerId) {
-  const accountName = String(provider?.accountName || provider?.accountLabel || '').trim();
-  if (accountName.toLowerCase() === 'environment') return t(`settings.${providerId}.environment`);
-  return accountName || `Account ${index + 1}`;
-}
-
-// Both Volcengine plans sit on one account, so the row title carries the plan
-// name from accountLabel. accountTitleLabel reads accountName/accountEmail,
-// neither of which these rows have, so without this they would all render as
-// "Account N".
-function volcenginePlanAccountTitle(provider, index, providers) {
-  return String(provider?.accountLabel || '').trim() || limitAccountDefaultTitle(provider, index, providers);
-}
-
-// '' while healthy, because the title already shows the plan and there is no
-// second fact to put here; undefined once it is not, so the head falls back to
-// the status label the same way thirdPartyPlanText does.
-function volcenginePlanRowText(provider) {
-  return provider?.status === 'ok' ? '' : undefined;
-}
-
-function thirdPartyPlanText(provider) {
-  if (provider?.status !== 'ok') return undefined;
-  const adapterId = String(provider?.adapterId || '').toLowerCase();
-  if (adapterId === 'newapi-account') return 'New API · Account';
-  if (adapterId === 'newapi-token') return 'New API · API key';
-  if (adapterId === 'sub2api') return 'Sub2API · Account';
-  if (adapterId === 'custom') return 'Custom';
-  const planLabel = String(provider?.planLabel || '').toLowerCase();
-  if (planLabel === 'account') return 'Account';
-  if (planLabel === 'api key') return 'API key';
-  if (planLabel === 'custom') return 'Custom';
-  return undefined;
-}
-
-const THIRD_PARTY_ADAPTER_VISUALS = Object.freeze({
-  'newapi-account': { color: '#C738FB', markId: 'newapi' },
-  'newapi-token': { color: '#C738FB', markId: 'newapi' },
-  sub2api: { color: '#39D9E7', markId: 'sub2api' },
-  custom: { color: '#8A96A8', markId: 'thirdparty' }
-});
-
-function thirdPartyAdapterVisual(provider, fallbackColor) {
-  return THIRD_PARTY_ADAPTER_VISUALS[String(provider?.adapterId || '').toLowerCase()]
-    || { color: fallbackColor, markId: 'thirdparty' };
-}
-
-function thirdPartyAdapterFamily(provider) {
-  const adapterId = String(provider?.adapterId || '').toLowerCase();
-  if (adapterId === 'newapi-account' || adapterId === 'newapi-token') return 'newapi';
-  if (adapterId === 'sub2api') return 'sub2api';
-  if (adapterId === 'custom') return 'thirdparty';
-  return '';
-}
-
-function thirdPartySharedAdapterFamily(providers) {
-  const families = new Set((providers || []).map(thirdPartyAdapterFamily));
-  return families.size === 1 ? [...families][0] : null;
-}
-
-function renderNamedApiAccountGroup(providerId, label, providers, color, options = {}) {
-  const row = document.createElement('div');
-  row.className = `limit-row limit-row-group${providers.some((provider) => provider.stale) ? ' stale' : ''}`;
-  const groupProvider = { provider: providerId, status: 'ok', windows: [], accountGroup: true };
-  const head = renderLimitProviderHead(providerId, label, groupProvider, color, {
-    planText: options.groupPlanText,
-    hideMeta: true,
-    ...(options.groupMarkId ? { markId: options.groupMarkId } : {})
-  });
-  const accountList = document.createElement('div');
-  accountList.className = 'limit-account-list';
-  providers.forEach((provider, index) => {
-    const providerColor = options.colorForProvider?.(provider) || color;
-    const markId = options.markIdForProvider?.(provider);
-    accountList.append(renderLimitProviderRow(
-      providerId,
-      limitAccountTitle(providerId, provider, index, providers),
-      provider,
-      providerColor,
-      {
-        accountRow: true,
-        showIcon: Boolean(markId),
-        ...(markId ? { markId } : {}),
-        ...(options.planTextForProvider
-          ? { planText: options.planTextForProvider(provider) }
-          : {})
-      }
-    ));
-  });
-  row.append(head, accountList);
-  return row;
-}
-
-function renderOpenRouterAccountGroup(label, providers, color) {
-  return renderNamedApiAccountGroup('openrouter', label, providers, color, {
-    groupPlanText: t('settings.openrouter.nAccounts', { count: providers.length })
-  });
-}
-
-function renderThirdPartyAccountGroup(label, providers, color) {
-  const sharedFamily = thirdPartySharedAdapterFamily(providers);
-  return renderNamedApiAccountGroup('thirdparty', label, providers, color, {
-    groupPlanText: t('settings.thirdparty.nAccounts', { count: providers.length }),
-    groupMarkId: sharedFamily || 'thirdparty',
-    planTextForProvider: thirdPartyPlanText,
-    colorForProvider: (provider) => thirdPartyAdapterVisual(provider, color).color,
-    ...(sharedFamily === null
-      ? { markIdForProvider: (provider) => thirdPartyAdapterVisual(provider, color).markId }
-      : {})
-  });
-}
-
-// The Coding Plan and the Agent Plan are two subscriptions on one Volcengine
-// account, so they are rows of one card rather than two provider cards.
-function renderVolcengineAccountGroup(label, providers, color) {
-  return renderNamedApiAccountGroup('volcengine', label, providers, color, {
-    groupPlanText: t('settings.volcengine.nPlans', { count: providers.length }),
-    planTextForProvider: volcenginePlanRowText
-  });
+function animateLimitResets(snapshot) {
+  limitResetAnimator.animate(els.limitsPanel, snapshot);
 }
 
 function renderLimits() {
   if (!els.limitsPanel) return;
   const holdLimitDetailTooltipRender = limitDetailTooltipShouldHoldRender();
-  const holdCodexSwitchPopoverRender = codexSwitchPopoverShouldHoldRender();
+  const holdCodexSwitchPopoverRender = codexAccountControl.deferRender(els.limitsPanel);
   if (holdLimitDetailTooltipRender || holdCodexSwitchPopoverRender) {
     if (holdLimitDetailTooltipRender) state.limitDetailTooltipRenderPending = true;
-    if (holdCodexSwitchPopoverRender) state.codexSwitchPopoverRenderPending = true;
     return;
   }
   state.limitDetailTooltipRenderPending = false;
-  state.codexSwitchPopoverRenderPending = false;
   const limitsEnabled = state.settings?.limitsEnabled !== false;
   const enabled = enabledLimitProviderSet();
   const providers = providersByLimitProviderId(state.stats?.limits?.providers || []);
@@ -5143,14 +4139,17 @@ function renderLimits() {
       state.settings?.showLimitUsed === true,
       state.settings?.showToolIcons !== false,
       state.settings?.claudePrepaidBalanceEnabled !== false,
+      state.settings?.codexResetForecastEnabled === true,
+      state.settings?.showCodexAdditionalLimits !== false,
+      state.settings?.limitProviderHiddenItems || {},
       state.settings?.currency || '',
       state.settings?.currencyRatesEffective || null,
       state.settings?.subscriptions || [],
       state.settings?.codexManagedAccounts || [],
       state.codexActiveAccount || null,
-      state.codexSystemSwitchingAccountId || '',
-      state.codexSystemSwitchErrorAccountId || '',
-      state.codexSystemSwitchError || ''
+      ...codexAccountControl.stateSignature(),
+      state.codexResetForecastBusy,
+      state.codexResetForecast || null
     ],
     providerOrder: orderedProviders.map(({ id }) => id),
     providers: [...visibleProviderEntries.entries()]
@@ -5159,8 +4158,12 @@ function renderLimits() {
     state.limitPanelRenderSignature === renderSignature
     && els.limitsPanel.children.length === orderedProviders.length
   ) {
+    // View changes intentionally reuse the rendered Limits DOM. Replaying the
+    // entrance motion here keeps that cache from swallowing the normal bar fill.
+    animateCachedLimitBarsFromZero();
     return;
   }
+  const resetMotionSnapshot = captureLimitResetMotion();
   state.limitPanelRenderSignature = renderSignature;
   const nodes = [];
   const rows = orderedProviders;
@@ -5170,52 +4173,20 @@ function renderLimits() {
   }
   for (const { id, label } of rows) {
     const visibleProviders = visibleProviderEntries.get(id) || [{ provider: id, status: 'disabled', windows: [] }];
-    const color = id === 'mimo' ? clientColors.xiaomi : (clientColors[id] || clientColors.default);
-    if (id === 'claude' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderClaudeAccountGroup(label, visibleProviders, color));
-      continue;
-    }
-    if (id === 'codex' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderCodexAccountGroup(label, visibleProviders, color));
-      continue;
-    }
-    if (id === 'opencode' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderOpenCodeAccountGroup(label, visibleProviders, color));
-      continue;
-    }
-    if (id === 'openrouter' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderOpenRouterAccountGroup(label, visibleProviders, color));
-      continue;
-    }
-    if (id === 'thirdparty' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderThirdPartyAccountGroup(label, visibleProviders, color));
-      continue;
-    }
-    if (id === 'mimo' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderMimoAccountGroup(label, visibleProviders, color));
-      continue;
-    }
-    if (id === 'cursor' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderCursorAccountGroup(label, visibleProviders, color));
-      continue;
-    }
-    if (id === 'volcengine' && Array.isArray(visibleProviders) && visibleProviders.length > 1) {
-      nodes.push(renderVolcengineAccountGroup(label, visibleProviders, color));
+    const color = limitProviderColor(id);
+    // Several accounts of one provider are a group; one is a row. Both builders
+    // take the provider id and nothing else — which mark, colour and plan text
+    // each account takes is the view's own per-provider policy, so the dock card
+    // renders this loop's output without being told any of it.
+    if (Array.isArray(visibleProviders) && visibleProviders.length > 1) {
+      nodes.push(renderLimitProviderGroup(id, label, visibleProviders, color));
       continue;
     }
     const provider = Array.isArray(visibleProviders) ? visibleProviders[0] : visibleProviders;
-    const thirdPartyVisual = id === 'thirdparty' ? thirdPartyAdapterVisual(provider, color) : null;
-    const rowOptions = id === 'codex'
-      ? { accountTitle: true, allowSystemSwitch: true }
-      : id === 'thirdparty'
-        ? {
-            planText: thirdPartyPlanText(provider),
-            markId: thirdPartyVisual.markId
-          }
-        : undefined;
-    nodes.push(renderLimitProviderRow(id, label, provider, thirdPartyVisual?.color || color, rowOptions));
+    nodes.push(renderLimitProviderSolo(id, label, provider, color));
   }
   els.limitsPanel.replaceChildren(...nodes);
+  animateLimitResets(resetMotionSnapshot);
 }
 
 function serviceStatusLabel(status) {
@@ -5275,6 +4246,7 @@ function serviceStatusIconId(id) {
 }
 
 function renderServiceStatus() {
+  if (!serviceStatusSurfaceVisible()) return;
   if (!els.serviceStatusPanel) return;
   const rows = serviceStatusRows().map((provider) => {
     const row = document.createElement('button');
@@ -5392,12 +4364,13 @@ function updateServiceStatusAgoLabels() {
 }
 
 function onServiceStatusTick() {
-  if (state.breakdown !== 'status') { stopServiceStatusTicker(); return; }
+  if (!serviceStatusSurfaceVisible()) { stopServiceStatusTicker(); return; }
   updateServiceStatusAgoLabels();
   maybeFetchServiceStatus();
 }
 
 function ensureServiceStatusTicker() {
+  if (!serviceStatusSurfaceVisible()) { stopServiceStatusTicker(); return; }
   if (state.serviceStatusTicker) return;
   state.serviceStatusTicker = setInterval(onServiceStatusTick, 1000);
   onServiceStatusTick();
@@ -5409,18 +4382,31 @@ function stopServiceStatusTicker() {
   state.serviceStatusTicker = null;
 }
 
-async function openSessionDetail({ client, sessionId, sessionCost, title }) {
-  const request = { client, sessionId, sessionCost, title, period: state.period, detail: null };
+function applySessionDetailResult(request, options) {
+  if (state.openSession !== request) return;
+  request.renderOptions = options;
+  if (visibleStatsSurface() !== 'main') {
+    if (isRendererWindowHidden()) statsRenderScheduler.request();
+    return;
+  }
+  request.renderOptions = null;
+  renderSessionDetail(options);
+}
+
+async function openSessionDetail({ client, sessionId, sessionCost, title, returnTo = null }) {
+  const request = { kind: 'session', client, sessionId, sessionCost,
+    title: state.settings?.sessionTitlesEnabled === false && returnTo?.kind !== 'session-group' ? '' : title,
+    period: state.period, detail: null, returnTo };
   state.openSession = request;
   renderSessionDetail({ loading: true });
   try {
     const detail = await window.tokenMonitor.getSessionDetail({ client, sessionId, period: request.period, sessionCost });
     if (state.openSession === request) {
       request.detail = detail;
-      renderSessionDetail({ detail });
+      applySessionDetailResult(request, { detail });
     }
   } catch (_) {
-    if (state.openSession === request) renderSessionDetail({ error: true });
+    applySessionDetailResult(request, { error: true });
   }
 }
 
@@ -5438,6 +4424,16 @@ function closeSessionDetail() {
   render();
 }
 
+function sessionDetailBack() {
+  const returnTo = state.openSession?.returnTo;
+  if (returnTo?.kind === 'session-group') {
+    state.openSession = returnTo;
+    renderSessionGroupDetail(returnTo);
+    return;
+  }
+  closeSessionDetail();
+}
+
 function renderSessionDetail({ detail, loading, error } = {}) {
   els.breakdown.classList.add('hidden');
   els.sessionDetail.classList.remove('hidden');
@@ -5447,14 +4443,17 @@ function renderSessionDetail({ detail, loading, error } = {}) {
   head.replaceChildren();
   container.replaceChildren();
 
-  const back = document.createElement('button');
-  back.className = 'detail-back';
-  back.textContent = `‹ ${t('sessions') || 'Sessions'}`;
-  back.addEventListener('click', closeSessionDetail);
-  head.append(back);
+  head.append(sessionDetailBackButton());
+
+  const idLabel = sessionRowsApi.sessionDetailIdLabel(state.openSession?.client, state.openSession?.sessionId, detail);
+  if (idLabel) container.append(sessionIdLine(idLabel));
 
   if (loading) { container.append(detailNote(t('detailLoading') || 'Loading…')); return; }
-  if (error || (detail && detail.found === false)) { container.append(detailNote(t('detailNotFound') || 'Transcript not found on this machine.')); return; }
+  if (error || detail?.error) {
+    container.append(detailNote(t(detail?.error === 'line-too-large' ? 'detailRecordTooLarge' : 'detailReadFailed')));
+    return;
+  }
+  if (detail && detail.found === false) { container.append(detailNote(t('detailNotFound') || 'Transcript not found on this machine.')); return; }
 
   const rows = sessionDetailApi.exchangeRows(detail, { now: new Date(), sortBy: state.detailSort });
   if (rows.length === 0) { container.append(detailNote(t('detailEmpty') || 'No activity in this period.')); return; }
@@ -5470,6 +4469,178 @@ function renderSessionDetail({ detail, loading, error } = {}) {
 
   const max = Math.max(1, ...rows.map((row) => row.value));
   for (const row of rows) container.append(exchangeNode(row, max));
+}
+
+function sessionDetailTitle() {
+  const request = state.openSession;
+  // Group runs use a model/time heading, which is independent of session
+  // title visibility. Ordinary Details follow the current session metadata.
+  if (request?.returnTo?.kind === 'session-group') return request.title;
+  if (state.settings?.sessionTitlesEnabled === false) return '';
+  const period = request?.period || state.period;
+  const session = request?.client === 'reasonix'
+    ? state.stats?.nativeSessions?.[period]?.[request.sessionId]
+    : state.stats?.periods?.[period]?.sessions?.[`${request?.client}:${request?.sessionId}`];
+  return session?.title || request?.title || '';
+}
+
+function refreshSessionDetailHeading() {
+  if (state.openSession?.kind !== 'session') return;
+  const head = els.sessionDetailHead;
+  if ((head.querySelector('.detail-heading')?.textContent || '') === sessionDetailTitle()) return;
+  // Retain the body, loading/error state and sort control. Unchanged headings
+  // also retain their hover-reading motion through periodic stats updates.
+  head.replaceChildren(sessionDetailBackButton(), ...Array.from(head.children).slice(1));
+}
+
+function sessionDetailBackButton() {
+  const back = document.createElement('button');
+  const title = sessionDetailTitle();
+  const backLabel = state.openSession?.returnTo?.kind === 'session-group'
+    ? state.openSession.returnTo.summary?.name || t('sessions.backgroundReviews') : (t('sessions') || 'Sessions');
+  back.type = 'button';
+  back.className = title ? 'detail-back detail-back-titled' : 'detail-back';
+  if (!title) back.textContent = `‹ ${backLabel}`;
+  back.setAttribute('aria-label', title
+    ? t('sessions.backToWithTitle', { title, destination: backLabel })
+    : t('sessions.backTo', { destination: backLabel }));
+  if (!title) back.title = backLabel;
+  back.addEventListener('click', sessionDetailBack);
+
+  if (title) {
+    const arrow = document.createElement('span');
+    arrow.className = 'detail-back-arrow';
+    arrow.textContent = '‹';
+    arrow.setAttribute('aria-hidden', 'true');
+    const heading = document.createElement('span');
+    heading.className = 'detail-heading';
+    heading.textContent = title;
+    heading.title = title;
+    bindHoverMarquee(heading);
+    back.append(arrow, heading);
+  }
+
+  return back;
+}
+
+// Copy the conversation identity, not a multi-UUID rollout filename.
+function sessionIdLine(idLabel) {
+  const line = document.createElement('div');
+  line.className = 'detail-session-id';
+  const text = document.createElement('span');
+  text.className = 'detail-session-id-text';
+  text.textContent = idLabel;
+  text.title = idLabel;
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'detail-session-id-copy';
+  copy.textContent = '⧉';
+  copy.title = t('session.copyId');
+  copy.setAttribute('aria-label', t('session.copyId'));
+  copy.addEventListener('click', () => copyToClipboard(idLabel, copy));
+  line.append(text, copy);
+  return line;
+}
+
+function sessionGroupRunNode(row, max, parent) {
+  const wrap = document.createElement('div');
+  wrap.className = 'detail-exchange session-group-run';
+  const interactive = sessionRowsApi.sessionRowDetailAvailable(row);
+  const botGroup = parent.summary?.sessionGroup === 'cursor-grok-bot';
+  if (interactive) {
+    wrap.setAttribute('role', 'button');
+    wrap.setAttribute('tabindex', '0');
+  }
+  wrap.innerHTML = '<div class="detail-ex-head"><span class="detail-chev">›</span>'
+    + '<div class="detail-ex-label"><span class="detail-ex-title"></span><span class="detail-ex-sub"></span>'
+    + (botGroup ? '<span class="session-group-id"></span>' : '') + '</div>'
+    + '<div class="detail-ex-metrics"><span class="detail-ex-value"></span><span class="detail-ex-cost"></span></div></div>'
+    + '<div class="bar"><div class="bar-fill"></div></div>';
+  const time = sessionRowsApi.compactSessionTime(row.sortTime, new Date());
+  const title = (botGroup ? row.name : [row.modelLabel, time].filter(Boolean).join(' · '))
+    || parent.summary?.name || t('sessions.backgroundReviews');
+  const titleEl = wrap.querySelector('.detail-ex-title');
+  titleEl.textContent = title;
+  titleEl.title = title;
+  bindHoverMarquee(titleEl);
+  // A multi-model run reads "N models · time" here — the same label the
+  // Sessions list opens for its per-model shares, so the title opens it too.
+  if (row.modelTooltipEntries?.length > 1) {
+    limitWindowsView.setDetailTooltip(titleEl, row.modelTooltipEntries);
+  }
+  if (!interactive) wrap.querySelector('.detail-chev').textContent = '';
+  const sub = wrap.querySelector('.detail-ex-sub');
+  sub.textContent = botGroup ? [row.activity ? row.subtitle : '', row.activity || row.subtitle].filter(Boolean).join(' · ') : row.detail || '';
+  sub.title = sub.textContent;
+  bindHoverMarquee(sub);
+  if (botGroup) {
+    const id = wrap.querySelector('.session-group-id');
+    id.textContent = row.detail || '';
+    id.title = row.detail || '';
+    bindHoverMarquee(id);
+  }
+  wrap.querySelector('.detail-ex-value').textContent = formatNumber(row.value);
+  wrap.querySelector('.detail-ex-cost').textContent = formatCost(row.cost || 0, row.unpricedTokens);
+  applyBarScale(wrap.querySelector('.bar-fill'), rowWidth(row.value, max) / 100);
+  if (!interactive) return wrap;
+  const open = () => openSessionDetail({
+    client: row.client,
+    sessionId: String(row.key || '').replace(/^session:[^:]+:/, ''),
+    sessionCost: Number(row.cost || 0),
+    title,
+    returnTo: parent
+  });
+  wrap.addEventListener('click', open);
+  wrap.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    open();
+  });
+  return wrap;
+}
+
+function renderSessionGroupDetail(request) {
+  els.breakdown.classList.add('hidden');
+  els.sessionDetail.classList.remove('hidden');
+  els.sessionDetailHead.classList.remove('hidden');
+  const head = els.sessionDetailHead;
+  const container = els.sessionDetail;
+  head.replaceChildren();
+  container.replaceChildren();
+
+  const label = request?.summary?.name || t('sessions.backgroundReviews');
+  const back = document.createElement('button');
+  back.type = 'button';
+  back.className = 'detail-back detail-back-titled';
+  back.setAttribute('aria-label', t('sessions.backToWithTitle', {
+    title: label, destination: t('sessions') || 'Sessions'
+  }));
+  back.addEventListener('click', closeSessionDetail);
+  const arrow = document.createElement('span');
+  arrow.className = 'detail-back-arrow';
+  arrow.textContent = '‹';
+  arrow.setAttribute('aria-hidden', 'true');
+  const heading = document.createElement('span');
+  heading.className = 'detail-heading';
+  heading.textContent = label;
+  bindHoverMarquee(heading);
+  back.append(arrow, heading);
+  head.append(back);
+
+  const rows = request?.summary?.groupRows || [];
+  if (rows.length === 0) {
+    container.append(detailNote(t('detailEmpty') || 'No activity in this period.'));
+    return;
+  }
+  const overview = document.createElement('div');
+  overview.className = 'session-group-overview';
+  overview.innerHTML = '<span class="session-group-count"></span><span class="session-group-totals"></span>';
+  overview.querySelector('.session-group-count').textContent = request.summary.detail;
+  overview.querySelector('.session-group-totals').textContent = `${formatNumber(request.summary.value)} · ${formatCost(request.summary.cost || 0, request.summary.unpricedTokens)}`;
+  container.append(overview);
+
+  const max = Math.max(1, ...rows.map((row) => Number(row.value) || 0));
+  for (const row of rows) container.append(sessionGroupRunNode(row, max, request));
 }
 
 function detailNote(text) {
@@ -5498,12 +4669,13 @@ function exchangeNode(row, max) {
     exTitle.append(role, sep);
   }
   exTitle.append(document.createTextNode(row.title));
+  bindHoverMarquee(exTitle);
   wrap.querySelector('.detail-ex-sub').textContent = row.subtitle;
   const tokensAvailable = row.tokensAvailable !== false;
   wrap.querySelector('.detail-ex-value').textContent = tokensAvailable
     ? formatNumber(row.value)
     : (t('detailTokenUnavailable') || 'Unavailable');
-  wrap.querySelector('.detail-ex-cost').textContent = tokensAvailable ? formatCost(row.cost) : '';
+  wrap.querySelector('.detail-ex-cost').textContent = tokensAvailable ? formatCost(row.cost, row.unpricedTokens) : '';
   applyBarScale(wrap.querySelector('.bar-fill'), rowWidth(row.value, max) / 100);
 
   const turnsEl = wrap.querySelector('.detail-turns');
@@ -5537,11 +4709,17 @@ function turnNode(turn) {
   el.querySelector('.detail-turn-value').textContent = tokensAvailable
     ? formatNumber(turn.value)
     : (t('detailTokenUnavailable') || 'Unavailable');
-  el.querySelector('.detail-turn-cost').textContent = tokensAvailable ? formatCost(turn.cost) : '';
+  el.querySelector('.detail-turn-cost').textContent = tokensAvailable ? formatCost(turn.cost, turn.unpricedTokens) : '';
   return el;
 }
 
 let contentReadySignaled = false;
+
+function signalContentReady() {
+  if (contentReadySignaled || !state.settings || !state.stats) return;
+  contentReadySignaled = true;
+  window.tokenMonitor.signalContentReady?.();
+}
 
 function renderTrends() {
   const charts = window.TokenMonitorUsageCharts;
@@ -5606,6 +4784,32 @@ function viewLabelById(id) {
   return view ? viewLabel(view) : id;
 }
 
+function isSettingsPanelOpen() {
+  return Boolean(els.settingsPanel && !els.settingsPanel.classList.contains('hidden'));
+}
+
+function isRendererWindowHidden() {
+  return document.hidden || !state.windowVisible;
+}
+
+function visibleStatsSurface() {
+  return statsRenderSchedulerApi.visibleStatsSurface(
+    isRendererWindowHidden(),
+    state.floatingBubble.collapsed
+  );
+}
+
+function isSettingsSurfaceVisible() {
+  return !isRendererWindowHidden()
+    && !state.floatingBubble.collapsed
+    && isSettingsPanelOpen();
+}
+
+function serviceStatusSurfaceVisible() {
+  return visibleStatsSurface() === 'main'
+    && state.breakdown === 'status';
+}
+
 function openHomeSettings() {
   if (!els.settingsPanel) return;
   els.settingsPanel.classList.remove('hidden');
@@ -5614,6 +4818,7 @@ function openHomeSettings() {
   setSettingsSectionExpanded('main', true);
   state.homeSettingsExpanded = true;
   syncSettingsForm();
+  ensureServiceStatusTicker();
   requestAnimationFrame(() => {
     document.getElementById('homeSettingsContainer')?.scrollIntoView({ block: 'nearest' });
   });
@@ -5627,9 +4832,20 @@ function openTrendSettings() {
   setSettingsSectionExpanded('main', true);
   state.trendSettingsExpanded = true;
   syncSettingsForm();
+  ensureServiceStatusTicker();
   requestAnimationFrame(() => {
     document.getElementById('trendSettingsContainer')?.scrollIntoView({ block: 'nearest' });
   });
+}
+
+// Cleared when the panel closes, not when it opens: `syncSettingsForm()` runs on
+// every settings write, so clearing on the open path would wipe the field the
+// moment a filtered row's checkbox was ticked.
+function resetSettingsListSearch() {
+  state.toolSearchQuery = '';
+  state.limitProviderSearchQuery = '';
+  if (els.clientDisplaySearchInput) els.clientDisplaySearchInput.value = '';
+  if (els.limitProviderSearchInput) els.limitProviderSearchInput.value = '';
 }
 
 function openSettingsPanel() {
@@ -5637,6 +4853,8 @@ function openSettingsPanel() {
   if (state.viewSwitcherOpen) setViewSwitcherOpen(false);
   els.settingsPanel.classList.remove('hidden');
   els.shell.classList.add('settings-open');
+  syncSettingsForm();
+  ensureServiceStatusTicker();
   els.shell.style.transform = 'translateZ(0)';
   requestAnimationFrame(() => { els.shell.style.transform = ''; });
 }
@@ -5645,10 +4863,16 @@ function openViewFromTray(viewId) {
   if (!availableBreakdownIds().includes(viewId)) return;
   if (state.viewSwitcherOpen) setViewSwitcherOpen(false);
   stopWindowShortcutRecording();
+  resetSettingsListSearch();
+  syncModeSelect?.close();
+  syncContentForm?.closeHelp();
   els.settingsPanel?.classList.add('hidden');
   els.shell.classList.remove('settings-open');
   state.openSession = null;
-  renderBreakdownChange(viewId, { allowHidden: true });
+  // Navigating to the view already on screen changes no breakdown, so it never
+  // repaints on its own — but the open session was just cleared above.
+  if (!renderBreakdownChange(viewId, { allowHidden: true })) render();
+  ensureServiceStatusTicker();
 }
 
 const HOME_HISTORY_MAX_RETRIES = 3;
@@ -5904,6 +5128,7 @@ function hidePeriodContentForMessage(message) {
   els.trendsPanel.classList.add('hidden');
   els.sessionDetail.classList.add('hidden');
   els.sessionDetailHead.classList.add('hidden');
+  renderSessionPager(null);
 }
 
 function periodMenuButtons() {
@@ -6182,32 +5407,59 @@ function homeLimitRows() {
   const providerOrder = state.settings?.homeLimitProviderOrder || state.settings?.limitProviderOrder;
   const providerOptions = limitProviderOrderApi.orderedLimitProviders(LIMIT_PROVIDERS, providerOrder);
   const hasConfiguredOrder = Boolean(state.settings?.homeLimitProviderOrder);
+  const isWindowHidden = (providerId, window) => limitUsageItemsApi.isLimitWindowHidden(
+    state.settings?.limitProviderHiddenItems, providerId, window
+  );
   return homeOverviewApi.homeLimitAccountsForProviders({
+    // Hidden rows go before the compact pick, so Antigravity's tightest window
+    // per group is chosen among the ones the user still shows.
     providers: (state.stats?.limits?.providers || []).map((provider) => ({
       ...provider,
-      windows: limitProviderPresentationApi.limitProviderCompactWindows(provider, provider.windows)
+      windows: limitProviderPresentationApi.limitProviderCompactWindows(
+        provider,
+        (provider.windows || []).filter((window) => !isWindowHidden(provider.provider, window))
+      )
     })),
     providerOptions,
     enabledProviderIds: Array.from(enabled),
     hiddenProviderIds: Array.from(hiddenHomeLimitProviderSet()),
-    colors: clientColors,
+    isWindowHidden,
+    colors: { ...clientColors, factory: clientColors.droid },
     limit: state.settings?.homeLimitAccountCount ?? 3,
     sort: hasConfiguredOrder ? 'configured' : 'remaining',
+    accountPlan: (provider, index, providerEntries) => limitWindowsView.limitAccountPlan(provider, {
+      grouped: providerEntries.length > 1
+    }),
     accountColor: (provider, id, fallbackColor) => (
-      id === 'thirdparty' ? thirdPartyAdapterVisual(provider, fallbackColor).color : fallbackColor
+      id === 'thirdparty'
+        ? limitProviderPresentationApi.thirdPartyAdapterVisual(provider, fallbackColor).color
+        : fallbackColor
     ),
     accountIcon: (provider, id) => (
-      id === 'thirdparty' ? thirdPartyAdapterVisual(provider, clientColors.thirdparty).markId : id
+      id === 'thirdparty'
+        ? limitProviderPresentationApi.thirdPartyAdapterVisual(provider, clientColors.thirdparty).markId
+        : id
     ),
     accountName: (provider, index, providerEntries) => {
       const id = String(provider?.provider || '').trim().toLowerCase();
       const option = providerOptions.find((entry) => entry.id === id);
       const providerTitle = option?.label || id;
-      if (providerEntries.length > 1) {
+      const showProviderTitle = state.settings?.showHomeLimitProviderNames === true || state.settings?.showToolIcons === false;
+      // A provider's row count is its account count — except MiMo, whose two
+      // products of one account are two rows. Names resolve over the same
+      // logical-account grouping the Limits page groups by, so one account's
+      // lanes are told apart by their product word alone and only several
+      // accounts earn an account name.
+      const accountCount = id === 'mimo'
+        ? mimoAccountGroups(providerEntries).length
+        : providerEntries.length;
+      if (accountCount > 1) {
         const accountTitle = limitAccountTitle(id, provider, index, providerEntries);
-        return state.settings?.showHomeLimitProviderNames === true || state.settings?.showToolIcons === false
-          ? `${providerTitle} · ${accountTitle}`
-          : accountTitle;
+        return showProviderTitle ? `${providerTitle} · ${accountTitle}` : accountTitle;
+      }
+      if (id === 'mimo') {
+        const product = mimoProductLabel(provider);
+        if (product) return showProviderTitle ? `${providerTitle} · ${product}` : product;
       }
       return providerTitle;
     }
@@ -6223,6 +5475,7 @@ function homeLimitWindowLabel(window, providerId = '', visibleWindows = []) {
   }
   const key = {
     session: 'home.limit.session',
+    daily: 'home.limit.daily',
     weekly: 'home.limit.weekly',
     billing: 'home.limit.billing',
     monthly: 'home.limit.monthly'
@@ -6237,10 +5490,18 @@ function renderHomeLimitModule() {
   if (rows.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'home-module-empty';
-    empty.textContent = t('home.noLimits');
+    const providerOrder = state.settings?.homeLimitProviderOrder || state.settings?.limitProviderOrder;
+    const awaitingFirstData = homeOverviewApi.homeLimitsAwaitingFirstData({
+      providers: state.stats?.limits?.providers || [],
+      providerOptions: limitProviderOrderApi.orderedLimitProviders(LIMIT_PROVIDERS, providerOrder),
+      enabledProviderIds: Array.from(enabledLimitProviderSet()),
+      hiddenProviderIds: Array.from(hiddenHomeLimitProviderSet())
+    });
+    empty.textContent = t(awaitingFirstData ? 'home.limitsInitializing' : 'home.noLimits');
     body.append(empty);
     return module;
   }
+  const showBars = state.settings?.homeLimitDisplayMode === 'bars';
   for (const row of rows) {
     const item = document.createElement('div');
     item.className = 'home-limit-account';
@@ -6252,8 +5513,15 @@ function renderHomeLimitModule() {
     name.className = 'home-list-name';
     name.textContent = row.name;
     account.append(mark, name);
+    if (row.plan) {
+      const plan = document.createElement('span');
+      plan.className = 'home-limit-plan';
+      plan.textContent = row.plan;
+      plan.title = row.plan;
+      account.append(plan);
+    }
     const windows = document.createElement('div');
-    windows.className = 'home-limit-windows';
+    windows.className = showBars ? 'home-limit-windows home-limit-windows-bars' : 'home-limit-windows';
     for (const window of row.windows) {
       const metric = document.createElement('div');
       metric.className = 'home-limit-window';
@@ -6277,9 +5545,20 @@ function renderHomeLimitModule() {
       }
       line.append(label, value);
       metric.append(line);
-      const resetAt = formatReset(window.resetsAt);
+      // Money and fixed labels retain a remaining meter; only percentage
+      // labels follow the global used/remaining display preference.
+      if (showBars && window.showMeter !== false) {
+        const remainingPercent = optionalFiniteNumber(window.remainingPercent);
+        if (remainingPercent != null) {
+          const fillPercent = limitFillPercent(remainingPercent, null, showUsed && !isCreditsWindow(window) && !window.value);
+          const tone = window.kind === 'session' || window.kind === 'daily' ? 0.95 : 0.68;
+          const meter = limitWindowsView.limitMeterNode(row.color, fillPercent, tone);
+          meter.setAttribute('aria-hidden', 'true');
+          metric.append(meter);
+        }
+      }
       const resetLabel = window.resetsAt
-        ? resetAt || ''
+        ? formatLimitBoundary(window) || ''
         : window.resetDescription
         ? t('home.reset', { value: window.resetDescription })
         : '';
@@ -6300,7 +5579,7 @@ function renderHomeLimitModule() {
 
 function renderHomeModelModule(period) {
   const { module, body } = homeModuleShell('model', t('home.models'), 'model');
-  const rows = homeOverviewApi.homeModelRows(modelRowsForPeriod(period), period?.totalTokens, 5);
+  const rows = homeOverviewApi.homeModelRows(modelRowsForPeriod(period, 'tokens'), period?.totalTokens, 5);
   if (rows.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'home-module-empty';
@@ -6312,7 +5591,7 @@ function renderHomeModelModule(period) {
     const item = document.createElement('div');
     item.className = 'home-list-row home-model-row';
     const mark = document.createElement('span');
-    applyHomeListMark(mark, iconKindFor({ key: row.key || row.name }, 'model'), row.color);
+    applyHomeListMark(mark, iconKindFor({ key: row.key || row.name, modelSource: row.modelSource }, 'model'), row.color);
     const name = document.createElement('span');
     name.className = 'home-list-name';
     name.textContent = row.name;
@@ -6329,7 +5608,7 @@ function renderHomeModelModule(period) {
 }
 
 function homeToolSourceRows(period) {
-  return periodAttributionRows(period, period?.clients, period?.clientCosts).map(({ key: client, value }) => ({
+  return periodAttributionRows(period, period?.clients, period?.clientCosts, period?.clientUnpricedTokens).map(({ key: client, value }) => ({
     key: client,
     name: client === usageAttributionRowsApi.UNATTRIBUTED_KEY ? t('dashboard.tooltip.unclassified') : clientLabels[client] || client,
     value: Number(value || 0),
@@ -6362,6 +5641,172 @@ function renderHomeToolModule(period) {
     share.className = 'home-list-aux';
     share.textContent = formatPercent(row.share * 100);
     item.append(mark, name, value, share);
+    body.append(item);
+  }
+  return module;
+}
+
+function homeSessionAgo(value) {
+  if (!Number.isFinite(value) || value <= 0) return '';
+  const minutes = Math.round(Math.max(0, Date.now() - value) / 60000);
+  if (minutes < 1) return t('edgeDock.agoNow');
+  if (minutes < 60) return t('edgeDock.agoMinutes', { count: minutes });
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return t('edgeDock.agoHours', { count: hours });
+  return t('edgeDock.agoDays', { count: Math.round(hours / 24) });
+}
+
+function homeSessionContext(context, promptCache) {
+  const showUsed = state.settings?.sessionContextMetric !== 'remaining';
+  const percent = showUsed ? context.percentUsed : context.percentLeft;
+  const node = document.createElement('span');
+  node.className = 'home-session-context';
+  node.dataset.tone = context.tone || '';
+  const meter = document.createElement('span');
+  meter.className = 'home-session-context-meter';
+  const fill = document.createElement('span');
+  fill.className = 'home-session-context-fill';
+  fill.style.setProperty('--bar-scale', String(percent / 100));
+  meter.append(fill);
+  const value = document.createElement('span');
+  value.textContent = `${percent}%`;
+  node.append(meter, value);
+  sessionRowsApi.setSessionTooltip(node, context, promptCache, t, limitWindowsView);
+  return node;
+}
+
+function stopHomeSessionRepaint() {
+  clearTimeout(state.homeSessionRepaintTimer);
+  state.homeSessionRepaintTimer = null;
+}
+
+function scheduleHomeSessionRepaint() {
+  stopHomeSessionRepaint();
+  const rows = window.TokenMonitorEdgeDockPresentation.recentSessionRows(state.stats, 5, { includeRunningBeyondCap: true });
+  if (!rows.length) return;
+  const now = Date.now();
+  const expiry = window.TokenMonitorEdgeDockPresentation.nextRunningExpiryAt(rows, now);
+  // Refresh relative ages once a minute, or sooner when a running session expires.
+  const cacheExpiry = window.TokenMonitorSessionLive?.nextSessionStatusChangeAt(rows, now) || 0;
+  const nextExpiry = [expiry, cacheExpiry].filter((at) => at > now).sort((a, b) => a - b)[0];
+  const delay = nextExpiry ? Math.min(60_000, Math.max(1_000, nextExpiry - now + 50)) : 60_000;
+  state.homeSessionRepaintTimer = setTimeout(() => {
+    state.homeSessionRepaintTimer = null;
+    if (visibleStatsSurface() !== 'main' || state.breakdown !== 'home') return;
+    const current = els.homePanel?.querySelector('.home-module-session');
+    if (!current) return;
+    const hadFocus = document.activeElement === current;
+    const next = renderHomeSessionModule();
+    current.replaceWith(next);
+    if (hadFocus) next.focus();
+    scheduleHomeSessionRepaint();
+  }, delay);
+}
+
+// Keep the Sessions metrics slot current even when no collection arrives.
+let sessionStatusRepaintTimer = null;
+function stopSessionStatusRepaint() {
+  clearTimeout(sessionStatusRepaintTimer);
+  sessionStatusRepaintTimer = null;
+}
+function scheduleSessionStatusRepaint(period, incompleteHint = '') {
+  stopSessionStatusRepaint();
+  const now = Date.now();
+  const sessions = [
+    ...Object.entries(period?.sessions || {}).map(([key, session]) => window.TokenMonitorSessionLive.sessionWithActivity(period, key, session)),
+    ...Object.values(state.stats?.nativeSessions?.[state.period] || {})
+  ];
+  const next = window.TokenMonitorSessionLive.nextSessionStatusChangeAt(sessions, now);
+  if (!next) return;
+  sessionStatusRepaintTimer = setTimeout(() => {
+    sessionStatusRepaintTimer = null;
+    if (visibleStatsSurface() !== 'main' || state.breakdown !== 'session' || state.openSession) return;
+    renderRows(sessionRowsForPeriod(period), { incompleteHint });
+    scheduleSessionStatusRepaint(period, incompleteHint);
+  }, Math.min(60_000, Math.max(1_000, next - now + 50)));
+}
+
+function renderHomeSessionModule() {
+  const current = els.homePanel?.querySelector('.home-module-session');
+  if (current && sessionTooltipShouldHoldRender()) {
+    homeSessionRenderPending = true;
+    return current;
+  }
+  const rows = window.TokenMonitorEdgeDockPresentation.recentSessionRows(state.stats, 5, { includeRunningBeyondCap: true });
+  const runningCount = rows.filter((row) => window.TokenMonitorSessionLive.sessionActivityState(row) === 'running').length;
+  const meta = runningCount > 0 ? t('home.runningSessions', { count: runningCount }) : '';
+  const { module, body } = homeModuleShell('session', t('home.sessions'), 'session', meta);
+  if (rows.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'home-module-empty';
+    empty.textContent = t('home.noSessions');
+    body.append(empty);
+    return module;
+  }
+  for (const row of rows) {
+    const activityState = window.TokenMonitorSessionLive.sessionActivityState(row);
+    const item = document.createElement('div');
+    item.className = 'home-list-row home-session-row';
+    const mark = document.createElement('span');
+    applyHomeListMark(mark, iconKindFor({ client: row.client }, 'session'), clientColors[row.client] || stableColor(row.key, fallbackModelColors));
+    const stateMark = document.createElement('span');
+    stateMark.className = 'home-session-state';
+    stateMark.dataset.state = activityState;
+    stateMark.setAttribute('aria-hidden', 'true');
+    if (activityState === 'waiting') {
+      stateMark.setAttribute('aria-hidden', 'false');
+      stateMark.setAttribute('role', 'img');
+      stateMark.setAttribute('aria-label', t('session.waiting'));
+    }
+    stateMark.innerHTML = window.TokenMonitorSessionLive.sessionStateMarkup({
+      spin: 'home-session-spin',
+      check: 'home-session-check',
+      idle: 'home-session-idle',
+      waiting: 'home-session-waiting'
+    });
+    stateMark.title = t(activityState === 'waiting' ? 'session.waiting' : activityState === 'running' ? 'session.running'
+      : activityState === 'ended' ? 'session.finished' : 'session.idle');
+    const name = document.createElement('span');
+    name.className = 'home-list-name';
+    name.textContent = row.title || row.projectLabel || String(row.sessionId || '').slice(0, 12) || '—';
+    bindHoverMarquee(name);
+    const value = document.createElement('span');
+    value.className = 'home-list-value';
+    value.textContent = formatCompact(row.totalTokens);
+    const meta = document.createElement('div');
+    meta.className = 'home-session-meta';
+    const age = homeSessionAgo(Date.parse(row.lastUsedAt || row.startedAt || ''));
+    const description = document.createElement('span');
+    description.className = 'home-list-sub';
+    // The same "N models" hover the Sessions list draws: the label stays the
+    // row's own text, and the tooltip lists the models behind the count.
+    const modelLabel = sessionRowsApi.sessionModelLabel(row);
+    const modelEntries = sessionRowsApi.sessionModelTooltipEntries(row, {
+      unattributedLabel: t('dashboard.tooltip.unclassified'),
+      formatTokens: formatCompact
+    });
+    if (modelLabel && modelEntries.length > 1) {
+      const models = document.createElement('span');
+      models.className = 'session-models';
+      models.textContent = modelLabel;
+      limitWindowsView.setDetailTooltip(models, modelEntries);
+      description.append(models);
+      if (age) description.append(document.createTextNode(` · ${age}`));
+    } else {
+      description.textContent = [modelLabel, age].filter(Boolean).join(' · ');
+    }
+    meta.append(description);
+    const context = window.TokenMonitorSessionLive.sessionActivityState(row) !== 'idle' ? row.context : null;
+    const cache = window.TokenMonitorSessionLive.sessionPromptCacheForRow(row);
+    if (cache && !context) {
+      const badge = document.createElement('span');
+      badge.className = 'home-session-cache';
+      badge.textContent = t('session.cacheEstimate', { minutes: cache.minutes });
+      sessionRowsApi.setSessionTooltip(badge, row, cache, t, limitWindowsView);
+      meta.append(badge);
+    }
+    if (context) meta.append(homeSessionContext(context, cache));
+    item.append(mark, stateMark, name, value, meta);
     body.append(item);
   }
   return module;
@@ -6826,6 +6271,11 @@ function renderHomeTrendsModule() {
 
 function renderHome() {
   if (!els.homePanel) return;
+  if (sessionTooltipShouldHoldRender()) {
+    homeSessionRenderPending = true;
+    return;
+  }
+  homeSessionRenderPending = false;
   // The previous scroller (and its ResizeObserver) is about to be replaced; drop the
   // observer so at most one is live. Keep the active tooltip visible while the
   // replacement heatmap reconnects it to the same date cell.
@@ -6859,9 +6309,11 @@ function renderHome() {
     if (id === 'tool') return renderHomeToolModule(period);
     if (id === 'device') return renderHomeDeviceModule();
     if (id === 'model') return renderHomeModelModule(period);
+    if (id === 'session') return renderHomeSessionModule();
     return renderHomeTrendsModule();
   });
   els.homePanel.replaceChildren(...nodes);
+  if (moduleIds.includes('session')) scheduleHomeSessionRepaint();
   // setupHomeActivityScroller first runs while its module is detached, where
   // scrollWidth can equal clientWidth. Apply again synchronously now that the DOM is
   // attached, before the browser paints or hover restoration measures the new cell.
@@ -6875,8 +6327,45 @@ function renderHome() {
   // ResizeObserver repeats the scroll + hover restoration once layout fully settles.
 }
 
+let localSessionActivity = null;
+function applyLocalSessionActivity(stats) {
+  const incoming = localSessionActivity;
+  if (!stats || !incoming || incoming.snapshot?.id !== stats.snapshot?.id
+    || incoming.snapshot?.source !== stats.snapshot?.source) return stats;
+  return window.TokenMonitorSessionActivityProjection.applyActivityPatch(stats, incoming.patch);
+}
+
+function sessionStatsForDisplay(stats) {
+  const current = applyLocalSessionActivity(stats);
+  return state.settings?.sessionTitlesEnabled === false
+    ? window.TokenMonitorSessionTitleDisplay.withoutSessionTitleStats(current) : current;
+}
+
+function setRendererSettings(next) {
+  const titlesChanged = (state.settings?.sessionTitlesEnabled !== false) !== (next.sessionTitlesEnabled !== false);
+  state.settings = next;
+  if (titlesChanged) {
+    if (next.sessionTitlesEnabled === false) state.stats = sessionStatsForDisplay(state.stats);
+    // Main may have returned a titleless map while disabled. Pull it again
+    // when re-enabled, even if no new usage snapshot has arrived.
+    allTimeSessions.invalidate();
+    allTimeSessions.ensure();
+  }
+  if (titlesChanged) refreshSessionDetailHeading();
+}
+
 function render() {
+  const surface = visibleStatsSurface();
+  if (surface !== 'main') {
+    if (!surface) statsRenderScheduler.request();
+    return;
+  }
   if (!state.stats) return;
+  allTimeSessions.ensure();
+  stopHomeSessionRepaint();
+  stopSessionStatusRepaint();
+  els.toolDetailFooter.classList.add('hidden');
+  syncLiveTokenRateFooterState();
   renderSessionUsageArchiveStatus();
   ensureBreakdownVisible();
   renderViewSwitcher();
@@ -6909,14 +6398,11 @@ function render() {
     cancelNumberAnimation();
     els.totalTokens.textContent = fixedUnavailable ? '—' : formatNumber(Number(period.totalTokens || 0));
     updateTotalCompact(fixedUnavailable ? 0 : Number(period.totalTokens || 0));
-    els.cost.textContent = fixedUnavailable ? '' : formatCost(period.costUsd || 0);
+    setTotalCost(period.costUsd || 0, period.unpricedTokens, !fixedUnavailable);
     state.currentTotal = fixedUnavailable ? 0 : Number(period.totalTokens || 0);
     hidePeriodContentForMessage(fixedPeriodMessage(state.fixedPeriodSnapshot, detailUnavailable ? state.breakdown : ''));
     renderFloatingBubbleContent();
-    if (!contentReadySignaled) {
-      contentReadySignaled = true;
-      window.tokenMonitor.signalContentReady?.();
-    }
+    signalContentReady();
     return;
   }
   els.fixedPeriodMessage.classList.add('hidden');
@@ -6946,11 +6432,12 @@ function render() {
     updateTotalCompact(nextTotal);
   }
   state.currentTotal = nextTotal;
-  els.cost.textContent = formatCost(period.costUsd || 0);
+  setTotalCost(period.costUsd || 0, period.unpricedTokens);
   renderTokenRate();
   if (!state.refreshBusy && !state.refreshFeedbackTimer) setRefreshButtonState('idle');
   els.shell.classList.toggle('session-mode', state.breakdown === 'session');
   els.shell.classList.toggle('home-mode', state.breakdown === 'home');
+  if (state.breakdown !== 'session' || state.openSession) els.sessionPagerHost.classList.add('hidden');
   els.viewBackRow?.classList.toggle('hidden', state.breakdown === 'home' || !state.homeReturnVisible);
   // Leaving Home only CSS-hides the panel, so its heatmap scroller never sees a
   // pointerleave — dismiss the body-level tooltip here (renderHome covers rerenders).
@@ -6969,6 +6456,7 @@ function render() {
     els.serviceStatusPanel?.classList.add('hidden');
     els.trendsPanel.classList.add('hidden');
     els.limitsPanel.classList.remove('hidden');
+    maybeFetchCodexResetForecast();
     renderLimits();
   } else if (state.breakdown === 'trends') {
     els.homePanel.classList.add('hidden');
@@ -6992,6 +6480,21 @@ function render() {
     els.trendsPanel.classList.add('hidden');
     els.homePanel.classList.add('hidden');
     els.breakdown.classList.add('hidden');
+    if (state.openSession.kind === 'session-group') {
+      const latest = sessionRowsForPeriod(period).find((row) => row.key === state.openSession.summary.key);
+      if (!latest) { closeSessionDetail(); return; }
+      state.openSession.summary = latest;
+      // The rebuild replaces every run node, so a hovered run tooltip would die
+      // mid-read (and a keyboard focus with it); hold until it closes, as the
+      // session and home lists already do.
+      if (!sessionTooltipShouldHoldRender()) renderSessionGroupDetail(state.openSession);
+    }
+    refreshSessionDetailHeading();
+    if (state.openSession.renderOptions) {
+      const options = state.openSession.renderOptions;
+      state.openSession.renderOptions = null;
+      renderSessionDetail(options);
+    }
   } else {
     els.homePanel.classList.add('hidden');
     els.limitsPanel.classList.add('hidden');
@@ -7006,15 +6509,13 @@ function render() {
       incompleteHint = 'sessions.incomplete';
     }
     renderRows(rows, { incompleteHint });
+    if (state.breakdown === 'session') scheduleSessionStatusRepaint(period, incompleteHint);
   }
   
   renderFloatingBubbleContent();
   // Tell main the window has painted real content (not the static "0" defaults),
   // so a recreated window can stay hidden until it's populated. See loadWindowFile.
-  if (!contentReadySignaled) {
-    contentReadySignaled = true;
-    window.tokenMonitor.signalContentReady?.();
-  }
+  signalContentReady();
 }
 
 function setStatus(text, isError = false) {
@@ -7045,6 +6546,11 @@ function streamFailureText(failure) {
 }
 
 function statusTextFor(mode, connected) {
+  if (mode === 'sync' && state.settings?.hubMode === 'icloud') {
+    return String(state.icloudStatus?.state || '').toLowerCase() === 'available'
+      ? 'iCloud'
+      : 'Waiting…';
+  }
   if (mode === 'sync') return connected ? 'Live' : 'Offline';
   if (mode === 'local') return connected ? 'Local' : 'Collecting…';
   return 'Starting…';
@@ -7052,6 +6558,12 @@ function statusTextFor(mode, connected) {
 
 function liveDotTitle(mode, connected) {
   if (mode === 'sync') {
+    if (state.settings?.hubMode === 'icloud') {
+      const status = String(state.icloudStatus?.state || 'waiting');
+      return status === 'available'
+        ? t('settings.sync.icloudAvailable')
+        : t('settings.sync.icloudWaiting');
+    }
     if (connected) return t('status.hubStreamLive');
     const reason = streamFailureText(state.streamFailure);
     return reason ? `${t('status.hubStreamOffline')}: ${reason}` : t('status.hubStreamOffline');
@@ -7063,16 +6575,19 @@ function liveDotTitle(mode, connected) {
 function setLiveDot(connected) {
   els.liveDot.classList.toggle('live', Boolean(connected));
   els.liveDot.title = liveDotTitle(state.mode, connected);
+  if (!connected) for (const animation of els.liveDot.getAnimations()) animation.cancel();
 }
 
-// Flare the live dot once when fresh data arrives. Re-arming the one-shot
-// animation needs a class remove + forced reflow before re-adding.
+// A single opacity cue acknowledges fresh data without animating a shadow or
+// forcing layout to restart a CSS animation.
 function pulseLiveDot() {
   const dot = els.liveDot;
-  if (!dot || !dot.classList.contains('live')) return;
-  dot.classList.remove('pulse');
-  void dot.offsetWidth;
-  dot.classList.add('pulse');
+  if (!dot || !dot.classList.contains('live') || prefersReducedMotion() || isRendererWindowHidden()) return;
+  for (const animation of dot.getAnimations()) animation.cancel();
+  dot.animate([{ opacity: 0.4 }, { opacity: 1 }], {
+    duration: 420,
+    easing: 'cubic-bezier(0.22, 1, 0.36, 1)'
+  });
 }
 
 function refreshButtonIdleTitle() {
@@ -7120,22 +6635,6 @@ function settleRefreshButtonState(status) {
   }, REFRESH_BUTTON_FEEDBACK_MS);
 }
 
-// The main process rebuilds the TOTAL session list for display but ships it as a
-// display-only sibling (`allTimeSessionsView`) so it never pollutes the lossless
-// period export. Overlay it onto periods.allTime here, on the renderer's own copy, so
-// every session-view reader (list, archived count, detail lookup) sees it. See
-// injectLocalDeviceStatus in main.js.
-function overlayAllTimeSessions(stats) {
-  if (stats && stats.allTimeSessionsView && stats.periods?.allTime) {
-    const sessions = reasonixSessionGuard?.filterReasonixSyntheticSessions
-      ? reasonixSessionGuard.filterReasonixSyntheticSessions(stats.allTimeSessionsView)
-      : stats.allTimeSessionsView;
-    stats.allTimeSessionsView = sessions;
-    stats.periods.allTime.sessions = sessions;
-  }
-  return stats;
-}
-
 async function refreshStats(options = {}) {
   const feedback = options.feedback === true;
   if (feedback) {
@@ -7145,7 +6644,11 @@ async function refreshStats(options = {}) {
     setRefreshButtonState('refreshing');
   }
   try {
-    state.stats = overlayAllTimeSessions(await window.tokenMonitor.getStats(options));
+    const nextStats = await window.tokenMonitor.getStats(options);
+    observeLiveTokenRate(nextStats);
+    allTimeSessions.invalidate();
+    state.stats = sessionStatsForDisplay(allTimeSessions.attach(nextStats));
+    observeDisplayLiveTokenRates(nextStats);
     if (options.forceHistory === true) {
       // A manual history rescan is an explicit retry boundary. Let Home request the
       // corresponding full payload even when its revision is unchanged, and restore
@@ -7158,7 +6661,6 @@ async function refreshStats(options = {}) {
       state.homeHistorySignature = '';
     }
     applyCodexActiveAccountFromStats();
-    setStatus(statusTextFor(state.mode, state.streamConnected));
     const forceFixedPeriodHistory = options.forceHistory === true;
     if (fixedPeriodRangesApi.isDerived(state.period)) {
       await warmFixedPeriodHistory({
@@ -7182,7 +6684,9 @@ async function refreshStats(options = {}) {
     // live-dot tooltip + sync settings line, so keep the header status pill
     // hidden instead of surfacing the raw hub error (e.g. a 404 HTML page).
     console.log(`[refresh] getStats failed: ${error.message}`);
-    setStatus(statusTextFor(state.mode, state.streamConnected));
+    if (!isRendererWindowHidden() && !state.floatingBubble.collapsed) {
+      setStatus(statusTextFor(state.mode, state.streamConnected));
+    }
     if (feedback) settleRefreshButtonState('error');
   } finally {
     if (feedback) state.refreshBusy = false;
@@ -7219,6 +6723,7 @@ function setPeriod(period) {
     return false;
   }
   state.period = next;
+  state.sessionPage = 0;
   if (fixedPeriodRangesApi.isDerived(next) && state.fixedPeriodHistoryFailed) {
     void warmFixedPeriodHistory({ retryFailed: true, renderOnComplete: true });
   }
@@ -7235,6 +6740,7 @@ function setBreakdown(breakdown, options = {}) {
   }
   state.homeReturnVisible = options.fromHome === true && state.breakdown === 'home' && next !== 'home';
   state.breakdown = next;
+  state.sessionPage = 0;
   state.rowSignature = '';
   publishViewState();
   return true;
@@ -7285,24 +6791,39 @@ function applyFontSettings(settings) {
   const source = { ...(state.settings || {}), ...(settings || {}) };
   const root = document.documentElement.style;
   const { interfaceFont, displayFont } = fontSettingsApi.resolveEffectiveFontSettings(source);
+  document.documentElement.dataset.textSize = fontSettingsApi.normalizeTextSize(source.textSize);
+  root.setProperty('--ui-text-scale', String(fontSettingsApi.textScaleForSize(source.textSize)));
   root.setProperty('--ui-font', interfaceFont);
   root.setProperty('--display-font', displayFont);
 }
 
 function applyAppearanceSettings(settings) {
+  glassRenderingApi.applyNativeMaterialClasses(nativeMaterialState);
   const opacity = glassRenderingApi.renderedGlassOpacity(settings, {
     platform: state.appInfo?.platform,
     userAgent: navigator.userAgent
   });
-  const depth = clamp(settings?.glassBlur ?? 32, 0, 100) / 100;
+  const depth = (glassRenderingApi.usesNativeMaterial(nativeMaterialState) ? 32 : clamp(settings?.glassBlur ?? 32, 0, 100)) / 100;
   const systemGlassDisabled = settings?.systemGlass === false;
   const isWindows = navigator.userAgent.toLowerCase().includes('windows');
   const windowsGlass = windowsGlassApi.appearanceState(settings, { isWindows });
+  const macGlass = macBackdropApi.appearanceState(settings, {
+    liquidGlassSupported: nativeMaterialState.liquidGlassSupported
+  });
   document.documentElement.style.setProperty('--glass-alpha', opacity.toFixed(2));
+  const imageOpacity = clamp(Number(settings?.backgroundImageOpacity ?? defaultAppearance.backgroundImageOpacity), 0, 100) / 100;
+  document.documentElement.style.setProperty('--background-image-alpha', imageOpacity.toFixed(2));
   document.documentElement.style.setProperty('--line-alpha', (0.1 + depth * 0.09).toFixed(3));
   document.documentElement.style.setProperty('--line-strong-alpha', (0.18 + depth * 0.14).toFixed(3));
   document.documentElement.style.setProperty('--control-alpha', (0.03 + depth * 0.045).toFixed(3));
   document.documentElement.classList.toggle('system-glass-disabled', systemGlassDisabled);
+  const nativeMaterial = glassRenderingApi.usesNativeMaterial(nativeMaterialState);
+  for (const control of [els.glassInput, els.blurInput, els.resetGlassButton, els.resetDepthButton]) {
+    if (control) control.disabled = nativeMaterial;
+  }
+  for (const note of [els.glassInputNote, els.blurInputNote]) {
+    if (note) note.classList.toggle('hidden', !nativeMaterial);
+  }
   els.windowsBackdropRow?.classList.toggle('hidden', !windowsGlass.showBackdropControl);
   if (els.windowsBackdropInput) {
     els.windowsBackdropInput.value = windowsGlass.backdropMode;
@@ -7316,12 +6837,17 @@ function applyAppearanceSettings(settings) {
     els.windowsBackdropNote.classList.toggle('error', accentFallback);
     els.windowsBackdropNote.classList.toggle('hidden', !windowsGlass.showAccentNote);
   }
+  els.macBackdropRow?.classList.toggle('hidden', !macGlass.showBackdropControl);
+  // Same terms as the widget's own selector; material pushes land here too.
+  els.edgeDockMacBackdropRow?.classList.toggle('hidden', !macGlass.showBackdropControl);
+  if (els.macBackdropInput) els.macBackdropInput.value = macGlass.backdropMode;
   applyReduceMotionPreference(settings?.reduceMotion);
   applyFontSettings(settings);
   // Only full settings objects carry themeColors; glass/zoom preview patches
   // omit it, so we must not wipe theme overrides mid-slider-drag.
   if (settings && 'themeColors' in settings) applyThemeColors(settings.themeColors);
   els.liveDot.style.display = (settings?.showLiveDot !== false) ? '' : 'none';
+  renderLiveTokenRate();
   els.shell.classList.toggle('desktop-mode', settings?.windowBehavior === 'desktop');
   els.shell.classList.toggle('title-icon-only', settings?.titleIconOnly === true);
   const trayMode = settings && 'trayMode' in settings
@@ -7346,7 +6872,88 @@ function applyAppearanceSettings(settings) {
   
   document.documentElement.classList.toggle('is-mac-legacy', isMacLegacyRadius);
   document.body.classList.toggle('is-mac-legacy', isMacLegacyRadius);
+  syncBackgroundImageStatus();
   updateTitleFit();
+}
+
+let backgroundImageActive = false;
+let backgroundImageBusy = false;
+let backgroundImageError = false;
+let backgroundImageRequest = 0;
+let backgroundImageObjectUrl = null;
+
+function syncBackgroundImageStatus() {
+  if (els.backgroundImageStatus) {
+    els.backgroundImageStatus.textContent = t(backgroundImageError
+      ? 'settings.appearance.backgroundImageError'
+      : backgroundImageActive
+        ? (nativeMaterialState.reducedTransparency || nativeMaterialState.type === 'opaque'
+          ? 'settings.appearance.backgroundImageAccessibilityHidden'
+          : nativeMaterialState.type === 'liquid-glass'
+            ? 'settings.appearance.backgroundImageNativeOverlay'
+            : 'settings.appearance.backgroundImageActive')
+        : 'settings.appearance.backgroundImageNone');
+  }
+  els.clearBackgroundImageButton?.classList.toggle('hidden', !backgroundImageActive);
+  els.backgroundImageOpacityRow?.classList.toggle('hidden', !backgroundImageActive);
+  if (els.chooseBackgroundImageButton) els.chooseBackgroundImageButton.disabled = backgroundImageBusy;
+  if (els.clearBackgroundImageButton) els.clearBackgroundImageButton.disabled = backgroundImageBusy;
+}
+
+function applyBackgroundImage(bytes) {
+  // The PNG is carried over IPC as bytes and shown through a blob: URL. A
+  // data: URL is not an option: Blink silently truncates CSS values set via
+  // setProperty() at 2 MiB, which corrupted the url("data:...") value and made
+  // larger saved images render as nothing at all.
+  const buffer = bytes instanceof Uint8Array && bytes.byteLength > 0 ? bytes : null;
+  backgroundImageActive = buffer !== null;
+  if (backgroundImageObjectUrl) {
+    URL.revokeObjectURL(backgroundImageObjectUrl);
+    backgroundImageObjectUrl = null;
+  }
+  if (backgroundImageActive) {
+    backgroundImageObjectUrl = URL.createObjectURL(new Blob([buffer], { type: 'image/png' }));
+    els.shell.style.setProperty('--custom-background-image', `url("${backgroundImageObjectUrl}")`);
+  } else {
+    els.shell.style.removeProperty('--custom-background-image');
+  }
+  els.shell.classList.toggle('has-custom-background', backgroundImageActive);
+  backgroundImageError = false;
+  syncBackgroundImageStatus();
+}
+
+async function loadBackgroundImage() {
+  const request = ++backgroundImageRequest;
+  try {
+    const bytes = await window.tokenMonitor.getBackgroundImage();
+    if (request === backgroundImageRequest) applyBackgroundImage(bytes);
+  } catch (_) {
+    if (request !== backgroundImageRequest) return;
+    backgroundImageError = true;
+    syncBackgroundImageStatus();
+  }
+}
+
+async function changeBackgroundImage(clear = false) {
+  if (backgroundImageBusy) return;
+  backgroundImageBusy = true;
+  backgroundImageRequest += 1;
+  syncBackgroundImageStatus();
+  try {
+    if (clear) {
+      await window.tokenMonitor.clearBackgroundImage();
+      applyBackgroundImage(null);
+    } else {
+      const result = await window.tokenMonitor.chooseBackgroundImage();
+      if (!result?.canceled && result?.bytes) applyBackgroundImage(result.bytes);
+    }
+  } catch (_) {
+    backgroundImageError = true;
+    syncBackgroundImageStatus();
+  } finally {
+    backgroundImageBusy = false;
+    syncBackgroundImageStatus();
+  }
 }
 
 const themePresetsApi = window.TokenMonitorThemePresets;
@@ -7499,7 +7106,9 @@ function currentVendorOverrides() {
 function previewThemeColor(key, value) {
   if (!themePresetsApi.isValidHex(value)) return;
   const next = { ...currentThemeOverrides(), [key]: themePresetsApi.normalizeHex(value) };
+  appearancePreview = { ...appearancePreview, themeColors: next };
   applyThemeColors(next);
+  window.tokenMonitor.previewAppearance?.(appearancePreview).catch?.(() => {});
 }
 
 async function saveThemeColor(key, value) {
@@ -7653,6 +7262,11 @@ function syncWindowBehaviorControls() {
   });
   els.pinButton.title = title;
   els.pinButton.setAttribute('aria-label', title);
+  // Windows-only, and only meaningful while the widget is pinned above apps:
+  // the other modes never sit over the taskbar in the first place.
+  const taskbarOptionApplies = state.appInfo?.platform === 'win32' && mode === 'floating';
+  els.keepAboveTaskbarRow?.classList.toggle('hidden', !taskbarOptionApplies);
+  if (els.keepAboveTaskbarInput) els.keepAboveTaskbarInput.checked = state.settings?.keepAboveTaskbar === true;
 }
 
 function syncWindowShortcutStatus() {
@@ -7724,9 +7338,14 @@ function handleWindowShortcutRecordKey(event) {
   syncWindowShortcutStatus();
 }
 
-function applyFloatingBubbleState(payload = {}) {
+function applyFloatingBubbleState(payload = {}, options = {}) {
+  const wasCollapsed = state.floatingBubble.collapsed;
   const side = payload?.collapsed && ['left', 'right'].includes(payload.side) ? payload.side : null;
   state.floatingBubble = { collapsed: Boolean(side), side };
+  if (isRendererWindowHidden()) {
+    statsRenderScheduler.request();
+    return;
+  }
   document.documentElement.classList.toggle('floating-bubble-collapsed-left', side === 'left');
   document.documentElement.classList.toggle('floating-bubble-collapsed-right', side === 'right');
   document.body.classList.toggle('floating-bubble-collapsed-left', side === 'left');
@@ -7736,10 +7355,17 @@ function applyFloatingBubbleState(payload = {}) {
     els.floatingBubbleTab.title = title;
     els.floatingBubbleTab.setAttribute('aria-label', title);
   }
-  renderFloatingBubbleContent();
+  if (options.renderContent === false) return;
+  if (wasCollapsed && !state.floatingBubble.collapsed) {
+    if (isSettingsPanelOpen()) syncSettingsForm();
+    renderStatsUpdate();
+  } else {
+    renderFloatingBubbleContent();
+  }
+  ensureServiceStatusTicker();
 }
 
-const BUBBLE_CONTENT_VALUES = ['icon', 'tokens', 'cost', 'both', 'tokensAll', 'costAll', 'bothAll', 'limitsAllSessions', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions', 'custom'];
+const BUBBLE_CONTENT_VALUES = ['icon', 'tokens', 'cost', 'both', 'tokensAll', 'costAll', 'bothAll', 'limitsAllSessions', 'liveTokenRate', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions', 'custom'];
 function normalizeTrayContentValue(value) {
   return BUBBLE_CONTENT_VALUES.includes(value) ? value : 'icon';
 }
@@ -7751,6 +7377,15 @@ function normalizeWindowToggleShortcutValue(value) {
 const BUBBLE_CONTENT_MIN_W = 34;
 const BUBBLE_CONTENT_HEIGHT = 34;
 const BUBBLE_CONTENT_PAD_X = 10;
+const BUBBLE_GENERATED_IMAGE_CSS_HEIGHT = 24;
+let floatingBubbleRenderedBitmapHeight = null;
+
+function currentFloatingBubbleBitmapHeight() {
+  return window.TokenMonitorTrayComposer.floatingBubbleBitmapHeight(
+    window.devicePixelRatio,
+    BUBBLE_GENERATED_IMAGE_CSS_HEIGHT
+  );
+}
 
 function floatingBubbleGeneratedColors() {
   const text = resolvedThemeColor('text');
@@ -7763,12 +7398,17 @@ function floatingBubbleGeneratedColors() {
 }
 
 function renderFloatingBubbleContent() {
+  if (visibleStatsSurface() !== 'bubble') return;
   const el = els.floatingBubbleContent;
   if (!el || !state.floatingBubble.collapsed) return;
   const mode = state.settings?.floatingBubbleContent || 'icon';
   if (window.TokenMonitorTrayText.isGeneratedTrayIconMode(mode)) {
+    // The generated content is a raster image displayed at 24 CSS px. Match its
+    // backing height to the current display scale so Chromium never has to
+    // interpolate already-rasterized text on fractional or high-DPI displays.
+    const bitmapHeight = currentFloatingBubbleBitmapHeight();
     const dataUrl = state.stats
-      ? trayDataUrlForMode(mode, 44, floatingBubbleGeneratedColors(), {
+      ? trayDataUrlForMode(mode, bitmapHeight, floatingBubbleGeneratedColors(), {
           contentOnly: mode === 'barsAllSessions' || mode === 'limitsAllSessions',
           providerContrastHalo: true,
           showProviderBadge: false,
@@ -7783,14 +7423,18 @@ function renderFloatingBubbleContent() {
       img.addEventListener('load', reportFloatingBubbleSize, { once: true });
       img.src = dataUrl;
       el.replaceChildren(img);
+      floatingBubbleRenderedBitmapHeight = bitmapHeight;
       return;
     }
+    floatingBubbleRenderedBitmapHeight = null;
     el.classList.remove('bars');
     el.textContent = (state.stats && window.TokenMonitorTrayText.formatTrayText(state.stats, mode, currentCurrency(), compactTokenDisplayOptions())) || 'Σ';
   } else if (mode === 'icon') {
+    floatingBubbleRenderedBitmapHeight = null;
     el.classList.remove('bars');
     el.textContent = 'Σ';
   } else {
+    floatingBubbleRenderedBitmapHeight = null;
     el.classList.remove('bars');
     el.textContent = state.stats ? (window.TokenMonitorTrayText.formatTrayText(state.stats, mode, currentCurrency(), compactTokenDisplayOptions()) || '0') : '0';
   }
@@ -7809,6 +7453,24 @@ function reportFloatingBubbleSize() {
   }
   window.tokenMonitor.setFloatingBubbleCollapsedSize?.({ width, height: BUBBLE_CONTENT_HEIGHT });
 }
+
+function refreshFloatingBubbleBitmapForDeviceScale() {
+  if (!state.floatingBubble.collapsed || !state.stats) return;
+  const mode = state.settings?.floatingBubbleContent || 'icon';
+  if (!window.TokenMonitorTrayText.isGeneratedTrayIconMode(mode)) return;
+  // Moving the collapsed window between displays can change devicePixelRatio
+  // without changing its CSS dimensions. Repaint only when the backing height
+  // actually changes, which also avoids a size-report/resize loop.
+  const bitmapHeight = currentFloatingBubbleBitmapHeight();
+  if (bitmapHeight !== floatingBubbleRenderedBitmapHeight) renderFloatingBubbleContent();
+}
+
+const stopFloatingBubbleDeviceScaleWatcher = window.TokenMonitorTrayComposer.watchDeviceScaleChanges({
+  matchMedia: typeof window.matchMedia === 'function' ? (query) => window.matchMedia(query) : null,
+  getDevicePixelRatio: () => window.devicePixelRatio,
+  onChange: refreshFloatingBubbleBitmapForDeviceScale
+});
+window.addEventListener('unload', stopFloatingBubbleDeviceScaleWatcher, { once: true });
 
 const HOVER_REVEAL_DELAY_MS = 250;
 const HOVER_COLLAPSE_GRACE_MS = 200;
@@ -7934,15 +7596,19 @@ function appearancePatchFromControls() {
   return {
     systemGlass,
     windowsBackdrop: windowsGlassApi.normalizeWindowsBackdropMode(els.windowsBackdropInput?.value),
+    macBackdrop: macBackdropApi.normalizeMacBackdropMode(els.macBackdropInput?.value),
     reduceMotion: els.reduceMotionInputs?.find((input) => input.checked)?.value || 'system',
     showLiveDot: Boolean(els.liveDotInput.checked),
     showToolIcons: Boolean(els.toolIconsInput.checked),
     titleIconOnly: Boolean(els.titleIconInput.checked),
     showCompactTotalTokens: Boolean(els.showCompactTotalTokensInput.checked),
+    showLiveTokenRate: Boolean(els.showLiveTokenRateInput.checked),
+    liveTokenRateScope: els.liveTokenRateScopeInput?.value === 'device' ? 'device' : 'all',
     compactTokenUnits: els.compactTokenUnitsInput?.value === 'localized' ? 'localized' : 'western',
     settingsInTitlebar: Boolean(els.swapSettingsRefreshInput.checked),
     glassOpacity: Number(els.glassInput.value === '' ? defaultAppearance.glassOpacity : els.glassInput.value),
     glassBlur: Number(els.blurInput.value === '' ? defaultAppearance.glassBlur : els.blurInput.value),
+    backgroundImageOpacity: Number(els.backgroundImageOpacityInput?.value || defaultAppearance.backgroundImageOpacity),
     zoomFactor: Number(els.zoomInput.value === '' ? defaultAppearance.zoomFactor * 100 : els.zoomInput.value) / 100
   };
 }
@@ -8025,6 +7691,7 @@ async function resetDisplayFont() {
 }
 
 function syncFontSettingsControls() {
+  if (els.textSizeInput) els.textSizeInput.value = fontSettingsApi.normalizeTextSize(state.settings?.textSize);
   for (const [role, settingKey] of [['interface', 'interfaceFontFamily'], ['display', 'displayFontFamily']]) {
     const controls = fontControlsFor(role);
     const value = fontSettingsApi.normalizeFontFamily(state.settings?.[settingKey]);
@@ -8044,14 +7711,16 @@ function syncSliderRow(input) {
 function syncSliderRows() {
   syncSliderRow(els.glassInput);
   syncSliderRow(els.blurInput);
+  syncSliderRow(els.backgroundImageOpacityInput);
   syncSliderRow(els.zoomInput);
 }
 
 function applyAppearanceFromControls() {
   const patch = appearancePatchFromControls();
+  appearancePreview = { ...appearancePreview, ...patch };
   applyAppearanceSettings(patch);
   syncSliderRows();
-  window.tokenMonitor.previewAppearance?.(patch).catch(() => {});
+  window.tokenMonitor.previewAppearance?.(appearancePreview).catch(() => {});
 }
 
 async function saveAppearanceFromControls() {
@@ -8059,21 +7728,63 @@ async function saveAppearanceFromControls() {
 }
 
 function syncHubModeUi() {
+  syncContentForm?.syncSettings();
   const mode = state.settings.hubMode || 'local';
-  for (const input of els.hubModeOptions.querySelectorAll('input[name="hubMode"]')) {
-    input.checked = input.value === mode;
-  }
+  els.hubModeOptions.value = mode;
+  if (els.syncModeDescription) els.syncModeDescription.textContent = t(SYNC_MODE_DESCRIPTIONS[mode] || SYNC_MODE_DESCRIPTIONS.local);
+  const icloudSupported = state.appInfo?.platform === 'darwin';
+  if (els.icloudModeOption) els.icloudModeOption.disabled = !icloudSupported;
   els.hubClientFields.classList.toggle('hidden', mode !== 'client');
+  els.hubClientFields.inert = mode !== 'client';
   els.hubHostFields.classList.toggle('hidden', mode !== 'host');
+  els.hubHostFields.inert = mode !== 'host';
+  if (els.icloudFields) {
+    els.icloudFields.classList.toggle('hidden', mode !== 'icloud');
+    els.icloudFields.inert = mode !== 'icloud';
+  }
   if (mode === 'host') {
     els.hubSecretInput.value = state.settings.hubHostSecret || '';
     renderHubStatus();
+  } else {
+    renderIcloudStatus();
   }
-  renderSyncClientStatus();
+  syncModeSelect?.sync();
+  renderSyncPanel();
   renderHubBuildStatus();
+  syncHubConnectionUi();
+  syncHubSaveButton();
+}
+
+function renderIcloudStatus() {
+  if (!els.icloudStatus || !els.icloudRootStatus) return;
+  const supported = state.appInfo?.platform === 'darwin';
+  const info = state.icloudStatus || state.hubInfo?.icloud || null;
+  if (!supported) {
+    els.icloudStatus.textContent = t('settings.sync.icloudUnsupported');
+    els.icloudStatus.className = 'hub-status';
+    els.icloudRootStatus.textContent = '';
+    return;
+  }
+  const status = String(info?.state || 'waiting');
+  const labels = {
+    available: 'settings.sync.icloudAvailable',
+    initializing: 'settings.sync.icloudInitializing',
+    starting: 'settings.sync.icloudInitializing',
+    waiting: 'settings.sync.icloudWaiting',
+    unavailable: 'settings.sync.icloudUnavailable',
+    error: 'settings.sync.icloudError',
+    stopped: 'settings.sync.icloudWaiting'
+  };
+  els.icloudStatus.textContent = t(labels[status] || 'settings.sync.icloudWaiting');
+  els.icloudStatus.className = `hub-status${status === 'available' ? ' ok' : status === 'error' ? ' error' : ''}`;
+  const root = String(info?.root || '').trim();
+  els.icloudRootStatus.textContent = root
+    ? `${t('settings.sync.icloudRoot')}: ${root}`
+    : t('settings.sync.icloudRootWaiting');
 }
 
 function renderHubStatus() {
+  renderIcloudStatus();
   if (!els.hubStatusRow || !els.hubAddressList) return;
   const info = state.hubInfo;
   const port = Number(state.settings.hubHostPort || 17321);
@@ -8101,25 +7812,259 @@ function renderHubStatus() {
   renderHubAddresses(info.lanAddresses || [], info.listeningPort);
 }
 
-function renderSyncClientStatus() {
-  if (!els.syncClientStatus) return;
-  // Gate on the runtime mode, not just the hubMode setting: client mode with no
-  // URL falls back to the local collector (mode 'local'), and its statuses must
-  // not surface as a sync failure in this row. Matches liveDotTitle's gating.
-  const show = state.settings?.hubMode === 'client' && state.mode === 'sync' && !state.streamConnected;
-  const text = show ? streamFailureText(state.streamFailure) : '';
-  els.syncClientStatus.textContent = text;
-  els.syncClientStatus.className = 'hub-status error';
-  // Empty .hub-status still renders a bordered box, so hide it entirely when
-  // there is nothing to show (connected, or not in client mode).
-  els.syncClientStatus.hidden = !text;
+const SYNC_PANEL_AGE_REFRESH_MS = 30_000;
+const SYNC_UPLOAD_INTERVAL_KEYS = {
+  600000: 'settings.sync.uploadInterval.10m',
+  1200000: 'settings.sync.uploadInterval.20m',
+  1800000: 'settings.sync.uploadInterval.30m'
+};
+let syncPanelRows = [];
+let syncPanelListScope = '';
+let syncPanelAgeTimer = 0;
+const syncPanelSignalObserver = els.syncPanelSignal && typeof IntersectionObserver === 'function'
+  ? new IntersectionObserver(([entry]) => {
+    els.syncPanelSignal.dataset.visible = String(entry.isIntersecting);
+  }, { root: els.settingsPanel }) : null;
+syncPanelSignalObserver?.observe(els.syncPanelSignal);
+window.addEventListener('unload', () => syncPanelSignalObserver?.disconnect(), { once: true });
+
+// The sync settings status and device list reflect what the sync backend holds. Runs on every connection/stats push while the
+// settings panel is open; keyed rows keep their controls through updates and sorting.
+function renderSyncPanel() {
+  if (!els.syncDevicePanel) return;
+  const hubMode = state.settings?.hubMode || 'local';
+  const shared = SHARED_SYNC_MODES.has(hubMode)
+    && (hubMode !== 'icloud' || state.appInfo?.platform === 'darwin');
+  els.syncDevicePanel.hidden = !shared;
+  if (!shared) {
+    syncPanelRows = [];
+    renderSyncPanelDevices(syncPanelRows);
+    stopSyncPanelAgeTimer();
+    return;
+  }
+  // Client mode without a Hub URL runs the local collector, whose stats hold
+  // only this machine: that is not a device list from any Hub.
+  syncPanelRows = state.mode === 'sync'
+    ? syncDevicePanelApi.deviceRows(state.stats?.devices, {
+      localDeviceId: state.settings?.deviceId || ''
+    })
+    : [];
+  renderSyncPanelConnection(hubMode);
+  renderSyncPanelDevices(syncPanelRows);
+  updateSyncPanelAges();
+  if (!syncPanelAgeTimer) syncPanelAgeTimer = setInterval(tickSyncPanelAges, SYNC_PANEL_AGE_REFRESH_MS);
+}
+
+function renderSyncPanelConnection(hubMode) {
+  els.syncPanelSignal.dataset.windowHidden = String(isRendererWindowHidden());
+  const show = hubMode === 'client';
+  els.syncPanelConnection.hidden = !show;
+  if (!show) return;
+  const failure = streamFailureText(state.streamFailure);
+  const connection = syncDevicePanelApi.clientConnectionState({
+    mode: state.mode,
+    streamConnected: state.streamConnected,
+    failureReason: failure
+  });
+  els.syncPanelConnection.dataset.state = connection;
+  els.syncPanelState.textContent = t(`settings.sync.panel.${connection}`);
+  els.syncPanelDetail.textContent = connection === 'disconnected' ? failure : '';
+  els.syncPanelDetail.hidden = connection !== 'disconnected';
+  if (els.syncPanelUpload) els.syncPanelUpload.hidden = !String(state.settings?.hubUrl || '').trim();
+}
+
+function syncPanelUploadText() {
+  const local = syncPanelRows.find((row) => row.isLocal);
+  if (!local) return '';
+  const age = relativeAgeLabel(local.syncedAt);
+  const uploaded = age ? t('settings.sync.panel.lastUpload', { age }) : t('settings.sync.panel.notUploaded');
+  const intervalKey = SYNC_UPLOAD_INTERVAL_KEYS[Number(state.settings?.syncUploadIntervalMs) || 0];
+  return intervalKey ? `${uploaded} · ${t(intervalKey)}` : uploaded;
+}
+
+function syncPanelPresenceText(row) {
+  const age = relativeAgeLabel(row.syncedAt);
+  if (row.isLocal && !row.syncedAt) return t('settings.sync.panel.notUploaded');
+  if (row.stale) return age ? `${t('home.staleDevice')} · ${deviceSyncedLabel(row.syncedAt)}` : t('home.staleDevice');
+  return deviceSyncedLabel(row.syncedAt);
+}
+
+function updateSyncPanelAges() {
+  if (els.syncPanelUpload && !els.syncPanelUpload.hidden) {
+    els.syncPanelUpload.textContent = syncPanelUploadText() || t('settings.sync.panel.notUploaded');
+  }
+  const rowsByKey = new Map(syncPanelRows.map((row) => [row.key, row]));
+  for (const element of els.syncDeviceList?.querySelectorAll('.sync-device-age') || []) {
+    const row = rowsByKey.get(element.dataset.key);
+    if (!row) continue;
+    element.textContent = syncPanelPresenceText(row);
+    const date = row.syncedAt ? new Date(row.syncedAt) : null;
+    element.title = date && !Number.isNaN(date.getTime()) ? date.toLocaleString(currentLocale()) : '';
+  }
+}
+
+function tickSyncPanelAges() {
+  if (!isSettingsSurfaceVisible() || els.syncDevicePanel?.hidden) {
+    stopSyncPanelAgeTimer();
+    return;
+  }
+  updateSyncPanelAges();
+}
+
+function stopSyncPanelAgeTimer() {
+  if (!syncPanelAgeTimer) return;
+  clearInterval(syncPanelAgeTimer);
+  syncPanelAgeTimer = 0;
+}
+
+function renderSyncPanelDevices(rows) {
+  const counts = syncDevicePanelApi.deviceCounts(rows);
+  els.syncPanelCount.textContent = counts.total > 0 ? t('settings.sync.panel.onlineCount', counts) : '';
+  els.syncPanelOpenDevices.hidden = counts.total === 0 || !availableBreakdownIds().includes('device');
+  const list = els.syncDeviceList;
+  const scope = JSON.stringify([
+    state.settings?.hubMode, state.mode, state.settings?.deviceId,
+    state.settings?.hubUrl, state.settings?.secret,
+    state.settings?.hubHostPort, state.settings?.hubHostSecret
+  ]);
+  if (scope !== syncPanelListScope) {
+    for (const remove of list.querySelectorAll('.device-delete-button')) resetDeviceDeleteConfirmation(remove);
+    list.replaceChildren();
+    syncPanelListScope = scope;
+  }
+  const existing = new Map(Array.from(list.children, item => [item.dataset.key, item]));
+  const wanted = new Set(rows.map(row => row.key));
+  for (const [key, item] of existing) {
+    if (wanted.has(key)) continue;
+    const remove = item.querySelector('.device-delete-button');
+    if (remove) resetDeviceDeleteConfirmation(remove);
+    item.remove();
+  }
+  if (rows.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'sync-device-empty';
+    empty.textContent = t(state.mode === 'sync' ? 'settings.sync.panel.empty' : 'settings.sync.panel.waiting');
+    list.replaceChildren(empty);
+    return;
+  }
+  rows.forEach((row, index) => {
+    let item = existing.get(row.key);
+    if (item) updateSyncDeviceRow(item, row);
+    else item = syncDeviceRow(row);
+    const before = list.children[index] || null;
+    if (before === item) return;
+    // Moving a live row with insertBefore would blur its confirmation button.
+    if (item.parentElement === list) list.moveBefore(item, before);
+    else list.insertBefore(item, before);
+  });
+}
+
+function syncDeviceRow(row) {
+  const item = document.createElement('div');
+  item.className = `sync-device-row${row.isLocal ? ' is-local' : ''}${row.stale ? ' is-stale' : ''}`;
+  item.dataset.key = row.key;
+
+  const mark = document.createElement('span');
+  mark.className = 'sync-device-mark';
+  mark.setAttribute('aria-hidden', 'true');
+
+  const main = document.createElement('div');
+  main.className = 'sync-device-main';
+  const title = document.createElement('div');
+  title.className = 'sync-device-title';
+  const name = document.createElement('span');
+  name.className = 'sync-device-name';
+  title.append(name);
+  const meta = document.createElement('div');
+  meta.className = 'sync-device-meta';
+  const metaText = document.createElement('span');
+  metaText.className = 'sync-device-meta-text';
+  meta.append(metaText);
+  main.append(title, meta);
+
+  const side = document.createElement('div');
+  side.className = 'sync-device-side';
+  const presence = document.createElement('span');
+  presence.className = 'sync-device-presence';
+  const dot = document.createElement('span');
+  dot.className = 'sync-device-dot';
+  dot.setAttribute('aria-hidden', 'true');
+  const age = document.createElement('span');
+  age.className = 'sync-device-age';
+  age.dataset.key = row.key;
+  presence.append(dot, age);
+  side.append(presence);
+
+  item.append(mark, main, side);
+  updateSyncDeviceRow(item, row);
+  return item;
+}
+
+function updateSyncDeviceRow(item, row) {
+  const signature = JSON.stringify([
+    currentLocale(), row.name, row.hostname, row.platform, row.osName, row.osVersion,
+    row.agentVersion, row.agentRuntime, row.isLocal, row.stale, row.canRemove,
+    devicesBeingDeleted.has(row.key), Boolean(window.tokenMonitor.deleteDevice)
+  ]);
+  if (item.dataset.signature === signature) return;
+  item.dataset.signature = signature;
+  item.className = `sync-device-row${row.isLocal ? ' is-local' : ''}${row.stale ? ' is-stale' : ''}`;
+  const mark = item.querySelector('.sync-device-mark');
+  const os = osIconFor(row.platform);
+  mark.className = os ? `sync-device-mark row-icon row-icon-os-${os}` : 'sync-device-mark sync-device-mark-generic';
+  const name = item.querySelector('.sync-device-name');
+  name.textContent = row.name;
+  name.title = row.hostname && row.hostname !== row.name ? `${row.name} · ${row.hostname}` : row.name;
+  const title = item.querySelector('.sync-device-title');
+  let badge = title.querySelector('.sync-device-badge');
+  if (row.isLocal) {
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'sync-device-badge';
+      title.append(badge);
+    }
+    badge.textContent = t('settings.sync.panel.thisDevice');
+  } else badge?.remove();
+  item.querySelector('.sync-device-meta-text').textContent = [
+    deviceBreakdownApi.devicePlatformLabel(row.platform, row.osName, row.osVersion),
+    [deviceRuntimeLabel(row.agentRuntime), row.agentVersion ? `v${row.agentVersion}` : ''].filter(Boolean).join(' ')
+  ].filter(Boolean).join(' · ');
+  const side = item.querySelector('.sync-device-side');
+  let remove = side.querySelector('.device-delete-button');
+  if (row.canRemove && row.stale && !row.isLocal && window.tokenMonitor.deleteDevice) {
+    if (!remove) {
+      remove = createDeviceRemoveButton(row.key, t('devices.remove'), t('devices.removeConfirm'));
+      const action = document.createElement('span');
+      action.className = 'sync-device-action';
+      action.append(remove);
+      side.append(action);
+    }
+    remove.dataset.idleText = t('devices.remove');
+    remove.dataset.confirmText = t('devices.removeConfirm');
+    remove.querySelector('.device-delete-label').textContent = remove.dataset.confirm === 'true'
+      ? remove.dataset.confirmText : remove.dataset.idleText;
+    remove.disabled = devicesBeingDeleted.has(row.key);
+  } else if (remove) {
+    resetDeviceDeleteConfirmation(remove);
+    remove.parentElement.remove();
+  }
 }
 
 function renderHubBuildStatus() {
   if (!els.hubBuildStatus) return;
-  const visible = state.settings?.hubMode === 'client';
+  const savedUrl = String(state.settings?.hubUrl || '').trim().replace(/\/$/, '');
+  const visible = state.settings?.hubMode === 'client'
+    && (!state.hubBuildStatus?.hubUrl || state.hubBuildStatus.hubUrl === savedUrl);
   const model = visible ? hubBuildPresentationApi.presentation(state.hubBuildStatus) : null;
-  if (!model) {
+  // Label the confirmed backend, not its version status. Version notices stay
+  // near the connection fields, and a matching build needs no extra message.
+  const current = model?.tone === 'ok';
+  const knownRuntime = ['cloudflare-worker', 'node-hub'].includes(state.hubBuildStatus?.runtime);
+  if (els.syncPanelBuild) {
+    els.syncPanelBuild.hidden = !model || !knownRuntime;
+    els.syncPanelBuild.textContent = model && knownRuntime ? t(model.targetKey) : '';
+  }
+  if (!model || current) {
     els.hubBuildStatus.hidden = true;
     els.hubBuildStatus.textContent = '';
     return;
@@ -8182,6 +8127,7 @@ async function refreshHubInfo() {
   if (!window.tokenMonitor.getHubInfo) return;
   try {
     state.hubInfo = await window.tokenMonitor.getHubInfo();
+    if (state.hubInfo?.icloud) state.icloudStatus = state.hubInfo.icloud;
     renderHubStatus();
   } catch (_) { /* ignore */ }
 }
@@ -8214,7 +8160,8 @@ async function refreshHubBuildStatus() {
       || (result?.hubUrl && result.hubUrl !== currentUrl)) return;
     state.hubBuildStatus = result;
   } catch (_) {
-    if (request !== hubBuildStatusRequest) return;
+    const currentUrl = String(state.settings.hubUrl || '').trim().replace(/\/$/, '');
+    if (request !== hubBuildStatusRequest || currentUrl !== requestedUrl) return;
     state.hubBuildStatus = null;
   }
   renderHubBuildStatus();
@@ -8274,29 +8221,182 @@ const HUB_DRAFT_FIELDS = [
 ];
 const hubDraftDirty = Object.fromEntries(HUB_DRAFT_FIELDS.map(([field]) => [field, false]));
 const hubDraftRevisions = Object.fromEntries(HUB_DRAFT_FIELDS.map(([field]) => [field, 0]));
+let hubSaveBusy = false;
+let hubSaveInFlightRevisions = null;
+const CLIENT_CONNECTION_FIELDS = ['hubUrl', 'secret', 'deviceId'];
+let clientConnectionEditing = false;
+let clientConnectionEditRevision = 0;
+let hubSaveError = false;
+
+function clientConnectionHasDraft() {
+  return CLIENT_CONNECTION_FIELDS.some(field => hubDraftDirty[field]);
+}
+
+function syncHubConnectionUi() {
+  if (!els.syncConnectionEditor) return;
+  const client = state.settings?.hubMode === 'client';
+  const configured = Boolean(String(state.settings?.hubUrl || '').trim());
+  const editing = clientConnectionEditing || clientConnectionHasDraft() || !configured;
+  const focusedEditor = els.syncConnectionEditor.contains(document.activeElement)
+    || els.syncDeviceSettings.contains(document.activeElement);
+  els.syncConnectionEdit.hidden = !client || editing;
+  if (client && !editing && focusedEditor && isSettingsSurfaceVisible()) {
+    els.syncConnectionEdit.focus({ preventScroll: true });
+  }
+  els.syncConnectionEditor.hidden = !client || !editing;
+  els.syncConnectionEditor.inert = !client || !editing;
+  els.syncDeviceSettings.hidden = client && !editing;
+  els.syncDeviceSettings.inert = client && !editing;
+  els.syncConnectionCancel.hidden = !client || !editing;
+  els.syncConnectionCancel.disabled = hubSaveBusy;
+  els.syncConnectionIdentity.hidden = !client || editing;
+  setHoverMarqueeText(els.syncConnectionEndpoint, syncDevicePanelApi.connectionEndpoint(state.settings?.hubUrl)
+    || t('settings.sync.savedEndpoint'));
+  els.syncUploadIntervalRow.hidden = !client;
+  els.syncUploadIntervalRow.inert = !client;
+  els.syncConnectionSaveError.hidden = !hubSaveError;
+  els.syncConnectionSaveError.textContent = hubSaveError ? t('settings.sync.saveFailed') : '';
+}
+
+function beginClientConnectionEdit({ focus = false } = {}) {
+  if (state.settings?.hubMode !== 'client' || clientConnectionEditing) return;
+  if (focus) syncHubDraftFields();
+  clientConnectionEditing = true;
+  clientConnectionEditRevision += 1;
+  hubSaveError = false;
+  preserveSettingsPanelScroll(() => {
+    syncHubConnectionUi();
+    if (focus) els.hubUrlInput.focus({ preventScroll: true });
+  });
+}
+
+function cancelClientConnectionEdit() {
+  if (hubSaveBusy || state.settings?.hubMode !== 'client') return;
+  clientConnectionEditing = false;
+  clientConnectionEditRevision += 1;
+  hubSaveError = false;
+  for (const [field, inputId] of HUB_DRAFT_FIELDS) {
+    if (!CLIENT_CONNECTION_FIELDS.includes(field)) continue;
+    hubDraftDirty[field] = false;
+    els[inputId].value = state.settings?.[field] || '';
+  }
+  preserveSettingsPanelScroll(() => {
+    syncHubDraftFields();
+    if (!String(state.settings?.hubUrl || '').trim()) els.hubUrlInput.focus({ preventScroll: true });
+  });
+}
+
+function finishClientConnectionSave(submittedRevisions, editRevision) {
+  if (state.settings?.hubMode !== 'client' || clientConnectionEditRevision !== editRevision
+    || !String(state.settings?.hubUrl || '').trim() || clientConnectionHasDraft()
+    || CLIENT_CONNECTION_FIELDS.some(field => hubDraftRevisions[field] !== submittedRevisions[field])) return;
+  clientConnectionEditing = false;
+  preserveSettingsPanelScroll(syncHubDraftFields);
+}
+
+function hubDraftFieldIsActive(field) {
+  return field !== 'hubHostPort' || state.settings?.hubMode === 'host';
+}
+
+function syncHubDraftDirty(field) {
+  // Inactive fields stop affecting Save, but their drafts must survive mode switches.
+  if (!hubDraftFieldIsActive(field)) return;
+  const submittedRevision = hubSaveInFlightRevisions?.[field];
+  if (submittedRevision !== undefined && hubDraftRevisions[field] > submittedRevision) {
+    hubDraftDirty[field] = true;
+    return;
+  }
+  const inputId = HUB_DRAFT_FIELDS.find(([name]) => name === field)?.[1];
+  const input = inputId ? els[inputId] : null;
+  const savedValue = state.settings?.[field];
+  hubDraftDirty[field] = Boolean(input) && (
+    normalizeHubDraftValue(field, input.value, savedValue) !== normalizeHubDraftValue(field, savedValue)
+  );
+}
+
+function reconcileHubDraftDirtyState() {
+  for (const [field] of HUB_DRAFT_FIELDS) {
+    if (hubDraftDirty[field]) syncHubDraftDirty(field);
+  }
+}
 
 function markHubDraftDirty(field) {
   const inputId = HUB_DRAFT_FIELDS.find(([name]) => name === field)?.[1];
   const input = inputId ? els[inputId] : null;
   if (!input) return;
   hubDraftRevisions[field] += 1;
-  hubDraftDirty[field] = true;
+  syncHubDraftDirty(field);
+  if (CLIENT_CONNECTION_FIELDS.includes(field)) beginClientConnectionEdit();
+  hubSaveError = false;
+  syncHubConnectionUi();
+  syncHubSaveButton();
 }
 
 function syncHubDraftFields() {
+  reconcileHubDraftDirtyState();
+  if (clientConnectionEditing) {
+    for (const field of CLIENT_CONNECTION_FIELDS) syncHubDraftDirty(field);
+  }
   for (const [field, inputId] of HUB_DRAFT_FIELDS) {
     const input = els[inputId];
-    if (!input || hubDraftDirty[field]) continue;
+    if (!input || hubDraftDirty[field] || (clientConnectionEditing && CLIENT_CONNECTION_FIELDS.includes(field))) continue;
     input.value = field === 'hubHostPort'
       ? String(state.settings?.hubHostPort || 17321)
       : state.settings?.[field] || '';
   }
+  syncHubConnectionUi();
+  syncHubSaveButton();
 }
 
-function normalizeHubDraftValue(field, value) {
-  if (field === 'hubHostPort') return String(Number(value) || 17321);
+// Keep this aligned with main's normalizeHubPort: dirty state must describe
+// the value settings:update will actually persist, including its fallback.
+function normalizeHubDraftPort(value, fallback = 17321) {
+  const fallbackNumber = Math.floor(Number(fallback));
+  const normalizedFallback = Number.isFinite(fallbackNumber) && fallbackNumber >= 1 && fallbackNumber <= 65535
+    ? fallbackNumber
+    : 17321;
+  const number = Math.floor(Number(value));
+  return String(Number.isFinite(number) && number >= 1 && number <= 65535 ? number : normalizedFallback);
+}
+
+function normalizeHubDraftValue(field, value, fallback) {
+  if (field === 'hubHostPort') return normalizeHubDraftPort(value, fallback);
   if (field === 'secret') return String(value ?? '');
   return String(value ?? '').trim();
+}
+
+function hubDraftValuesFromInputs() {
+  const values = {};
+  for (const [field, inputId] of HUB_DRAFT_FIELDS) {
+    if (field === 'hubHostPort' && state.settings?.hubMode !== 'host') continue;
+    const input = els[inputId];
+    if (!input) continue;
+    values[field] = normalizeHubDraftValue(field, input.value, state.settings?.[field]);
+  }
+  return values;
+}
+
+function hubDraftValuesFromSettings() {
+  const values = {};
+  for (const [field] of HUB_DRAFT_FIELDS) {
+    if (field === 'hubHostPort' && state.settings?.hubMode !== 'host') continue;
+    values[field] = normalizeHubDraftValue(field, state.settings?.[field]);
+  }
+  return values;
+}
+
+function hubDraftHasChanges() {
+  const draft = hubDraftValuesFromInputs();
+  const saved = hubDraftValuesFromSettings();
+  return Object.keys(draft).some((field) => draft[field] !== saved[field]);
+}
+
+function syncHubSaveButton() {
+  if (!els.saveSettingsButton) return;
+  const busy = hubSaveBusy;
+  els.saveSettingsButton.disabled = busy || !hubDraftHasChanges();
+  if (busy) els.saveSettingsButton.setAttribute('aria-busy', 'true');
+  else els.saveSettingsButton.removeAttribute('aria-busy');
 }
 
 function reconcileHubDraftsAfterSave(submitted, submittedRevisions) {
@@ -8304,7 +8404,7 @@ function reconcileHubDraftsAfterSave(submitted, submittedRevisions) {
     const input = els[inputId];
     if (!input) continue;
     if (!Object.prototype.hasOwnProperty.call(submitted, field)) continue;
-    const current = normalizeHubDraftValue(field, input.value);
+    const current = normalizeHubDraftValue(field, input.value, submitted[field]);
     if (
       hubDraftRevisions[field] === submittedRevisions[field]
       && current === submitted[field]
@@ -8315,16 +8415,58 @@ function reconcileHubDraftsAfterSave(submitted, submittedRevisions) {
   syncHubDraftFields();
 }
 
+let settingsDomSyncPending = false;
+// Tray-only mode already removes the Dock/taskbar entry, so the row is hidden
+// rather than dimmed while it is on: the way back is the toggle directly above
+// it, and a dead control adds nothing. Hiding is also what keeps it legible
+// below tray-only mode — the only arrangement where this row would sit under
+// that toggle's indented note is one where it is not on screen at all. The
+// checked state is kept in settings so the preference survives the excursion.
+function syncHideAppIconControl(showTrayIcon, trayMode) {
+  if (!els.hideAppIconInput) return;
+  // Windows drops the entry through setSkipTaskbar() and macOS through the
+  // accessory activation policy. Electron exposes neither on Linux — the
+  // toggle would save and change nothing — so the row is not offered there,
+  // and starts hidden until appInfo says which platform this is.
+  const platform = state.appInfo?.platform;
+  const supported = platform === 'win32' || platform === 'darwin';
+  const applies = supported && showTrayIcon && !trayMode;
+  els.hideAppIconInput.checked = applies && state.settings.hideAppIcon === true;
+  els.hideAppIconRow?.classList.toggle('hidden', !applies);
+  els.hideAppIconOptions?.classList.toggle('hidden', !els.hideAppIconInput.checked);
+}
+
 function syncSettingsForm() {
+  if (isRendererWindowHidden()) {
+    applyInitialBreakdownPreference();
+    applyVendorColorOverrides(state.settings.vendorColors);
+    appliedThemeOverrides = themePresetsApi.normalizeOverrides(
+      state.settings.themeColors,
+      themePresetsApi.INTERFACE_COLOR_KEYS
+    );
+    settingsDomSyncPending = true;
+    return;
+  }
+  settingsDomSyncPending = false;
+  setupLimitAccountPanels();
   applySettingsTranslations();
   applyInitialBreakdownPreference();
   syncPeriodTabs();
+  applyVendorColorOverrides(state.settings.vendorColors);
+  applyAppearanceSettings(state.settings);
+  // Drives the header pin button as well as the Settings select, so it has to run
+  // whenever the window is on screen — the pin button is reachable, and changes,
+  // while the Settings panel is closed.
+  syncWindowBehaviorControls();
+  if (!isSettingsSurfaceVisible()) return;
   syncHubModeUi();
   if (els.languageInput) els.languageInput.value = currentLanguage();
   if (els.periodMonthModeInput) {
     els.periodMonthModeInput.value = fixedPeriodRangesApi.normalizeMonthMode(state.settings?.periodMonthMode);
   }
   if (els.currencyInput) els.currencyInput.value = currentCurrency();
+  const modelRankingMetric = usageAttributionRowsApi.normalizeRankingMetric(state.settings?.modelRankingMetric);
+  for (const input of els.modelRankingMetricInputs || []) input.checked = input.value === modelRankingMetric;
   syncCurrencyRateControls();
   syncHubDraftFields();
   els.limitsRefreshInput.value = state.settings.limitsRefreshMode === 'adaptive'
@@ -8357,6 +8499,7 @@ function syncSettingsForm() {
   }
   if (els.wslScanInput) els.wslScanInput.checked = state.settings.wslScanEnabled !== false;
   if (els.sessionUsageArchiveInput) els.sessionUsageArchiveInput.checked = state.settings.sessionUsageArchiveEnabled !== false;
+  allTimeSessions.ensure();
   renderSessionUsageArchiveStatus();
   const exportAutoOn = Boolean(state.settings.exportAutoEnabled);
   const exportDir = state.settings.exportDir || '';
@@ -8376,12 +8519,20 @@ function syncSettingsForm() {
   const systemGlass = state.settings.systemGlass === false ? 'off' : 'system';
   for (const input of els.systemGlassInputs || []) input.checked = input.value === systemGlass;
   if (els.windowsBackdropInput) els.windowsBackdropInput.value = windowsGlassApi.normalizeWindowsBackdropMode(state.settings.windowsBackdrop);
+  if (els.macBackdropInput) els.macBackdropInput.value = macBackdropApi.normalizeMacBackdropMode(state.settings.macBackdrop);
   const reduceMotion = motionPreferenceApi.normalize(state.settings.reduceMotion);
   for (const input of els.reduceMotionInputs || []) input.checked = input.value === reduceMotion;
   els.liveDotInput.checked = state.settings.showLiveDot !== false;
   els.toolIconsInput.checked = state.settings.showToolIcons !== false;
   els.titleIconInput.checked = state.settings.titleIconOnly === true;
   els.showCompactTotalTokensInput.checked = state.settings.showCompactTotalTokens === true;
+  els.showLiveTokenRateInput.checked = state.settings.showLiveTokenRate === true;
+  if (els.liveTokenRateScopeInput) {
+    els.liveTokenRateScopeInput.value = state.settings.liveTokenRateScope === 'device' ? 'device' : 'all';
+  }
+  const liveRateHasScope = state.settings.showLiveTokenRate === true
+    && tokenRateApi.isSharedSyncMode(state.settings.hubMode);
+  els.liveTokenRateScopeRow?.classList.toggle('hidden', !liveRateHasScope);
   if (els.compactTokenUnitsInput) {
     els.compactTokenUnitsInput.value = state.settings.compactTokenUnits === 'localized' ? 'localized' : 'western';
   }
@@ -8392,17 +8543,18 @@ function syncSettingsForm() {
   );
   els.swapSettingsRefreshInput.checked = state.settings.settingsInTitlebar === true;
   els.discordRpcInput.checked = Boolean(state.settings.discordRpcEnabled);
-  syncWindowBehaviorControls();
   els.floatingBubbleInput.checked = state.settings.floatingBubbleEnabled === true;
   const floatingBubbleTrigger = state.settings.floatingBubbleTrigger === 'hover' ? 'hover' : 'click';
   for (const input of els.floatingBubbleTriggerInputs || []) input.checked = input.value === floatingBubbleTrigger;
   if (els.floatingBubbleContentInput) els.floatingBubbleContentInput.value = normalizeTrayContentValue(state.settings.floatingBubbleContent);
   els.floatingBubbleOptions?.classList.toggle('hidden', state.settings.floatingBubbleEnabled !== true);
+  syncEdgeDockControls();
   const showTrayIcon = state.settings.showTrayIcon !== false;
   if (els.showTrayIconInput) els.showTrayIconInput.checked = showTrayIcon;
   els.trayModeInput.disabled = !showTrayIcon;
   els.trayModeInput.checked = showTrayIcon && Boolean(state.settings.trayMode);
-  els.trayContentInput.value = ['tokens', 'cost', 'both', 'tokensAll', 'costAll', 'bothAll', 'limitsAllSessions', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions', 'icon', 'custom'].includes(state.settings.trayContent) ? state.settings.trayContent : 'tokens';
+  syncHideAppIconControl(showTrayIcon, els.trayModeInput.checked);
+  els.trayContentInput.value = ['tokens', 'cost', 'both', 'tokensAll', 'costAll', 'bothAll', 'limitsAllSessions', 'liveTokenRate', 'bars', 'barsSession', 'barsWeekly', 'barsAllSessions', 'icon', 'custom'].includes(state.settings.trayContent) ? state.settings.trayContent : 'tokens';
   els.trayContentInput.disabled = !showTrayIcon;
   els.showTrayProviderBadgeInput.checked = state.settings.showTrayProviderBadge === true;
   els.showTrayProviderBadgeInput.disabled = !showTrayIcon;
@@ -8423,19 +8575,15 @@ function syncSettingsForm() {
   }
   els.glassInput.value = String(state.settings.glassOpacity ?? 68);
   els.blurInput.value = String(state.settings.glassBlur ?? 32);
+  if (els.backgroundImageOpacityInput) els.backgroundImageOpacityInput.value = String(state.settings.backgroundImageOpacity ?? defaultAppearance.backgroundImageOpacity);
   els.zoomInput.value = String(Math.round((Number(state.settings.zoomFactor) || 1) * 100));
   syncSliderRows();
-  renderDeepseekStatus();
-  renderMinimaxStatus();
-  renderExternalProviderStatus('claude');
-  renderExternalProviderStatus('zai');
-  renderExternalProviderStatus('zaiteam');
   renderExternalProviderStatus('volcengine');
-  renderExternalProviderStatus('qoder');
-  renderExternalProviderStatus('trae');
-  renderExternalProviderStatus('commandcode');
   renderExternalProviderStatus('kimi');
-  renderExternalProviderStatus('ollama');
+  for (const form of state.settings?.limitAccountForms || []) {
+    if (limitProviderAccountGroup(form.id)) renderExternalProviderStatus(form.id);
+  }
+  renderAntigravityStatus();
   renderMimoStatus();
   renderCopilotStatus();
   renderViewPreferences();
@@ -8445,16 +8593,16 @@ function syncSettingsForm() {
   renderOpenCodeProfiles();
   renderOpenRouterProfiles();
   renderThirdPartyProfiles();
-  applyVendorColorOverrides(state.settings.vendorColors);
-  applyAppearanceSettings(state.settings);
   buildAppearanceColorControls();
   renderTokscaleStatus();
   renderCodexAccounts();
   renderCustomPricing();
+  const modelAliasGrouping = state.settings?.modelAliasGrouping || 'off';
+  for (const input of document.querySelectorAll('input[name="modelAliasGrouping"]')) {
+    input.checked = input.value === modelAliasGrouping;
+  }
+  modelAliasForm?.syncSettings();
   renderCursorStatus();
-  applyFloatingBubbleState(state.floatingBubble);
-  if (state.breakdown === 'limits') renderLimits();
-  else render();
 }
 
 function enabledClientSet() {
@@ -8563,19 +8711,6 @@ function preferenceRows(kind) {
   return Array.from(list?.querySelectorAll(selector) || []);
 }
 
-function preferenceOrder(kind) {
-  const attr = preferenceItemAttribute(kind);
-  return preferenceRows(kind).map((row) => row.dataset[attr]).filter(Boolean);
-}
-
-function preferenceRowRects(kind) {
-  const attr = preferenceItemAttribute(kind);
-  return preferenceRows(kind).map((row) => {
-    const rect = row.getBoundingClientRect();
-    return { id: row.dataset[attr], top: rect.top, bottom: rect.bottom };
-  });
-}
-
 function applyPreferenceOrder(kind, order) {
   const list = preferenceListForKind(kind);
   if (!list) return;
@@ -8583,75 +8718,16 @@ function applyPreferenceOrder(kind, order) {
   const rowsById = new Map(preferenceRows(kind).map((row) => [row.dataset[attr], row]));
   for (const id of order || []) {
     const row = rowsById.get(id);
-    if (row) list.appendChild(row);
+    if (!row) continue;
+    list.appendChild(row);
+    const companionId = kind === 'view'
+      ? ({ home: 'homeSettingsContainer', trends: 'trendSettingsContainer', project: 'projectSettingsContainer', session: 'sessionSettingsContainer', status: 'serviceProvidersContainer' })[id]
+      : kind === 'homeModule'
+        ? ({ limits: 'homeLimitProviderContainer', trends: 'homeActivitySettingsContainer' })[id]
+        : '';
+    const companion = companionId ? document.getElementById(companionId) : null;
+    if (companion) list.appendChild(companion);
   }
-}
-
-function finishPreferenceDrag() {
-  setPreferencePointerListeners(false);
-  document.querySelectorAll('.is-dragging').forEach((row) => row.classList.remove('is-dragging'));
-  preferenceDrag = null;
-}
-
-function applyPreferenceLiveOrder(kind, clientY) {
-  if (!preferenceDrag) return -1;
-  const currentOrder = preferenceOrder(kind);
-  const nextOrder = preferenceDragSortApi.reorderItemsFromClientY(currentOrder, preferenceRowRects(kind), preferenceDrag.id, clientY);
-  if (nextOrder.join(',') !== currentOrder.join(',')) {
-    applyPreferenceOrder(kind, nextOrder);
-    preferenceDrag.changed = true;
-  }
-  preferenceDrag.order = nextOrder;
-  return nextOrder;
-}
-
-function startPreferenceDrag(event, kind, id) {
-  if (event.currentTarget.disabled) return;
-  event.preventDefault();
-  const order = preferenceOrder(kind);
-  preferenceDrag = { kind, id, pointerId: event.pointerId, originalOrder: order, order, changed: false, handle: event.currentTarget };
-  event.currentTarget.setPointerCapture?.(event.pointerId);
-  event.currentTarget.closest('[data-client], [data-provider], [data-view], [data-status-provider], [data-home-module], [data-home-limit-provider]')?.classList.add('is-dragging');
-  setPreferencePointerListeners(true);
-  applyPreferenceLiveOrder(kind, event.clientY);
-}
-
-function setPreferencePointerListeners(active) {
-  const method = active ? 'addEventListener' : 'removeEventListener';
-  window[method]('pointermove', onPreferencePointerMove, true);
-  window[method]('pointerup', onPreferencePointerUp, true);
-  window[method]('pointercancel', onPreferencePointerCancel, true);
-}
-
-function releasePreferencePointer(pointerId) {
-  const handle = preferenceDrag?.handle;
-  if (handle?.hasPointerCapture?.(pointerId)) {
-    handle.releasePointerCapture(pointerId);
-  }
-}
-
-function onPreferencePointerMove(event) {
-  if (!preferenceDrag || preferenceDrag.pointerId !== event.pointerId) return;
-  event.preventDefault();
-  applyPreferenceLiveOrder(preferenceDrag.kind, event.clientY);
-}
-
-function onPreferencePointerUp(event) {
-  if (!preferenceDrag || preferenceDrag.pointerId !== event.pointerId) return;
-  event.preventDefault();
-  const { kind } = preferenceDrag;
-  const order = applyPreferenceLiveOrder(kind, event.clientY) || preferenceDrag.order;
-  const changed = preferenceDrag.changed;
-  releasePreferencePointer(event.pointerId);
-  finishPreferenceDrag();
-  if (changed) void onPreferenceOrderCommit(kind, order);
-}
-
-function onPreferencePointerCancel(event) {
-  if (!preferenceDrag || preferenceDrag.pointerId !== event.pointerId) return;
-  applyPreferenceOrder(preferenceDrag.kind, preferenceDrag.originalOrder);
-  releasePreferencePointer(event.pointerId);
-  finishPreferenceDrag();
 }
 
 function createPreferenceOrderHandle({ kind, id, label, count }) {
@@ -8670,9 +8746,125 @@ function createPreferenceOrderHandle({ kind, id, label, count }) {
   handle.setAttribute('aria-label', handle.title);
   handle.setAttribute('aria-keyshortcuts', 'ArrowUp ArrowDown Home End');
   handle.disabled = count <= 1;
-  handle.addEventListener('pointerdown', (event) => startPreferenceDrag(event, kind, id));
+  // Main-screen lists keep the handle as both the visible reorder affordance
+  // and the only pointer/keyboard entry point. The row listener below still
+  // delegates the gesture to the shared controller.
   handle.addEventListener('keydown', (event) => onPreferenceOrderKeydown(event, kind, id));
   return handle;
+}
+
+const VIEW_PREFERENCE_SUBGROUPS = {
+  home: ['homeSettingsExpanded', 'homeSettingsContainer'],
+  trends: ['trendSettingsExpanded', 'trendSettingsContainer'],
+  project: ['projectSettingsExpanded', 'projectSettingsContainer'],
+  session: ['sessionSettingsExpanded', 'sessionSettingsContainer'],
+  status: ['serviceProvidersExpanded', 'serviceProvidersContainer']
+};
+
+const HOME_MODULE_SUBGROUPS = {
+  limits: ['homeLimitSettingsExpanded', 'homeLimitProviderContainer'],
+  trends: ['homeActivitySettingsExpanded', 'homeActivitySettingsContainer']
+};
+
+function expandedPreferenceSubgroups(definitions) {
+  return Object.entries(definitions)
+    .filter(([, [stateKey]]) => Boolean(state[stateKey]))
+    .map(([id]) => id)
+    .join(',');
+}
+
+function setPreferenceSubgroupsExpanded(definitions, rowSelector, value) {
+  const expanded = new Set(String(value || '').split(',').filter(Boolean));
+  const dataKey = rowSelector === '.view-preference-row' ? 'view' : 'homeModule';
+  for (const [id, [stateKey, containerId]] of Object.entries(definitions)) {
+    const open = expanded.has(id);
+    state[stateKey] = open;
+    const row = Array.from(document.querySelectorAll(rowSelector)).find((candidate) => candidate.dataset[dataKey] === id);
+    const toggle = row?.querySelector('.view-subgroup-toggle');
+    toggle?.classList.toggle('is-expanded', open);
+    toggle?.setAttribute('aria-expanded', String(open));
+    document.getElementById(containerId)?.classList.toggle('hidden', !open);
+  }
+}
+
+function togglePreferenceSubgroup(definitions, rowSelector, id) {
+  const expanded = new Set(expandedPreferenceSubgroups(definitions).split(',').filter(Boolean));
+  if (expanded.has(id)) expanded.delete(id);
+  else expanded.add(id);
+  setPreferenceSubgroupsExpanded(definitions, rowSelector, Array.from(expanded).join(','));
+}
+
+function setViewPreferenceExpanded(value) {
+  setPreferenceSubgroupsExpanded(VIEW_PREFERENCE_SUBGROUPS, '.view-preference-row', value);
+}
+
+function setHomeModulePreferenceExpanded(value) {
+  setPreferenceSubgroupsExpanded(HOME_MODULE_SUBGROUPS, '.home-module-preference-row', value);
+}
+
+// Main-screen rows retain their six-dot handle as the only drag surface while
+// using the same thresholded controller as Collection and AI Tool Limits.
+// Visibility/configuration controls and nested panels keep their own gestures.
+const MAIN_PREFERENCE_DRAG_EXCLUDED = 'button:not(.preference-order-handle), input, select, textarea, a, label, .accordion-animated-container';
+
+function createMainPreferenceRowDrag({ kind, rowSelector, idKey, settingKey, getExpanded, setExpanded }) {
+  return rowDragControllerApi.createRowDragController({
+    dragSort: verticalDragSortApi,
+    getList: () => preferenceListForKind(kind),
+    getScrollPanel: () => els.settingsPanel,
+    rowSelector,
+    idKey,
+    dragExcluded: MAIN_PREFERENCE_DRAG_EXCLUDED,
+    dragStartSelector: '.preference-order-handle',
+    getExpanded,
+    setExpanded,
+    applyOrder: (order) => applyPreferenceOrder(kind, order),
+    preserveScroll: preserveSettingsPanelScroll,
+    mirrorOrder: (order) => {
+      const value = order.join(',');
+      state.settings = { ...state.settings, [settingKey]: value };
+      return value;
+    },
+    persistOrder: (_order, _id, value) => void saveSettings({ [settingKey]: value }),
+    requestRender: () => renderViewPreferences()
+  });
+}
+
+const viewPreferenceRowDrag = createMainPreferenceRowDrag({
+  kind: 'view',
+  rowSelector: '.view-preference-row[data-view]',
+  idKey: 'view',
+  settingKey: 'viewDisplayOrder',
+  getExpanded: () => expandedPreferenceSubgroups(VIEW_PREFERENCE_SUBGROUPS),
+  setExpanded: setViewPreferenceExpanded
+});
+
+const homeModulePreferenceRowDrag = createMainPreferenceRowDrag({
+  kind: 'homeModule',
+  rowSelector: '.home-module-preference-row[data-home-module]',
+  idKey: 'homeModule',
+  settingKey: 'homeModuleOrder',
+  getExpanded: () => expandedPreferenceSubgroups(HOME_MODULE_SUBGROUPS),
+  setExpanded: setHomeModulePreferenceExpanded
+});
+
+const homeLimitProviderRowDrag = createMainPreferenceRowDrag({
+  kind: 'homeLimitProvider',
+  rowSelector: '.home-limit-provider-row[data-home-limit-provider]',
+  idKey: 'homeLimitProvider',
+  settingKey: 'homeLimitProviderOrder'
+});
+
+const statusProviderRowDrag = createMainPreferenceRowDrag({
+  kind: 'statusProvider',
+  rowSelector: '.status-provider-row[data-status-provider]',
+  idKey: 'statusProvider',
+  settingKey: 'serviceProviderDisplayOrder'
+});
+
+function deferMainPreferenceRender() {
+  return [viewPreferenceRowDrag, homeModulePreferenceRowDrag, homeLimitProviderRowDrag, statusProviderRowDrag]
+    .some((controller) => controller.deferRender());
 }
 
 // The limit provider list drags from the whole row instead of a handle. The
@@ -8696,14 +8888,17 @@ const limitProviderRowDrag = rowDragControllerApi.createRowDragController({
   applyOrder: (order) => applyPreferenceOrder('provider', order),
   preserveScroll: preserveSettingsPanelScroll,
   mirrorOrder: (order) => { state.settings = { ...state.settings, limitProviderOrder: order.join(',') }; },
-  // Saved directly rather than through `onPreferenceOrderCommit`, whose no-op
-  // guard compares against the value `mirrorOrder` just wrote and would drop it.
+  // Saved directly because the controller has already mirrored the order into
+  // local state before a deferred repaint can run.
   persistOrder: (order) => void saveSettings({ limitProviderOrder: order.join(',') }),
   requestRender: () => renderLimitProviderCheckboxes()
 });
 
 function renderViewPreferences() {
   if (!els.viewDisplayList) return;
+  // Every list under Main Screen shares this render path. A settings or stats
+  // repaint during a drag is held until the controller lands or aborts.
+  if (deferMainPreferenceRender()) return;
   const hidden = hiddenViewSet();
   const orderValue = effectiveViewDisplayOrderValue();
   const views = viewDisplayPreferencesApi.orderedViews(VIEW_DISPLAY_OPTIONS, orderValue);
@@ -8751,6 +8946,7 @@ function renderViewPreferences() {
     actions.className = 'tool-preference-actions';
     actions.append(visibility, handle);
     row.append(name, actions);
+    row.addEventListener('pointerdown', (event) => viewPreferenceRowDrag.startRowDrag(event, id));
     els.viewDisplayList.appendChild(row);
     if (id === 'home') {
       row.classList.add('has-subgroup');
@@ -8764,13 +8960,7 @@ function renderViewPreferences() {
       toggleIcon.className = 'view-subgroup-icon';
       toggleIcon.setAttribute('aria-hidden', 'true');
       toggle.append(toggleIcon);
-      toggle.addEventListener('click', () => {
-        state.homeSettingsExpanded = !state.homeSettingsExpanded;
-        toggle.classList.toggle('is-expanded', state.homeSettingsExpanded);
-        toggle.setAttribute('aria-expanded', String(Boolean(state.homeSettingsExpanded)));
-        const container = document.getElementById('homeSettingsContainer');
-        if (container) container.classList.toggle('hidden', !state.homeSettingsExpanded);
-      });
+      toggle.addEventListener('click', () => togglePreferenceSubgroup(VIEW_PREFERENCE_SUBGROUPS, '.view-preference-row', id));
       actions.insertBefore(toggle, visibility);
 
       const listContainer = document.createElement('div');
@@ -8794,13 +8984,7 @@ function renderViewPreferences() {
       toggleIcon.className = 'view-subgroup-icon';
       toggleIcon.setAttribute('aria-hidden', 'true');
       toggle.append(toggleIcon);
-      toggle.addEventListener('click', () => {
-        state.trendSettingsExpanded = !state.trendSettingsExpanded;
-        toggle.classList.toggle('is-expanded', state.trendSettingsExpanded);
-        toggle.setAttribute('aria-expanded', String(Boolean(state.trendSettingsExpanded)));
-        const container = document.getElementById('trendSettingsContainer');
-        if (container) container.classList.toggle('hidden', !state.trendSettingsExpanded);
-      });
+      toggle.addEventListener('click', () => togglePreferenceSubgroup(VIEW_PREFERENCE_SUBGROUPS, '.view-preference-row', id));
       actions.insertBefore(toggle, visibility);
       
       const listContainer = document.createElement('div');
@@ -8824,13 +9008,7 @@ function renderViewPreferences() {
       toggleIcon.className = 'view-subgroup-icon';
       toggleIcon.setAttribute('aria-hidden', 'true');
       toggle.append(toggleIcon);
-      toggle.addEventListener('click', () => {
-        state.projectSettingsExpanded = !state.projectSettingsExpanded;
-        toggle.classList.toggle('is-expanded', state.projectSettingsExpanded);
-        toggle.setAttribute('aria-expanded', String(Boolean(state.projectSettingsExpanded)));
-        const container = document.getElementById('projectSettingsContainer');
-        if (container) container.classList.toggle('hidden', !state.projectSettingsExpanded);
-      });
+      toggle.addEventListener('click', () => togglePreferenceSubgroup(VIEW_PREFERENCE_SUBGROUPS, '.view-preference-row', id));
       actions.insertBefore(toggle, visibility);
 
       const listContainer = document.createElement('div');
@@ -8839,6 +9017,30 @@ function renderViewPreferences() {
       const inner = document.createElement('div');
       inner.className = 'accordion-animation-inner';
       inner.appendChild(renderProjectSettingsList());
+      listContainer.appendChild(inner);
+      els.viewDisplayList.appendChild(listContainer);
+    }
+    if (id === 'session') {
+      row.classList.add('has-subgroup');
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = `view-subgroup-toggle${state.sessionSettingsExpanded ? ' is-expanded' : ''}`;
+      toggle.title = t('settings.views.configureSession', { name: label });
+      toggle.setAttribute('aria-label', toggle.title);
+      toggle.setAttribute('aria-expanded', String(Boolean(state.sessionSettingsExpanded)));
+      const toggleIcon = document.createElement('span');
+      toggleIcon.className = 'view-subgroup-icon';
+      toggleIcon.setAttribute('aria-hidden', 'true');
+      toggle.append(toggleIcon);
+      toggle.addEventListener('click', () => togglePreferenceSubgroup(VIEW_PREFERENCE_SUBGROUPS, '.view-preference-row', id));
+      actions.insertBefore(toggle, visibility);
+
+      const listContainer = document.createElement('div');
+      listContainer.id = 'sessionSettingsContainer';
+      listContainer.className = `accordion-animated-container${state.sessionSettingsExpanded ? '' : ' hidden'}`;
+      const inner = document.createElement('div');
+      inner.className = 'accordion-animation-inner';
+      inner.appendChild(renderSessionSettingsList());
       listContainer.appendChild(inner);
       els.viewDisplayList.appendChild(listContainer);
     }
@@ -8854,13 +9056,7 @@ function renderViewPreferences() {
       toggleIcon.className = 'view-subgroup-icon';
       toggleIcon.setAttribute('aria-hidden', 'true');
       toggle.append(toggleIcon);
-      toggle.addEventListener('click', () => {
-        state.serviceProvidersExpanded = !state.serviceProvidersExpanded;
-        toggle.classList.toggle('is-expanded', state.serviceProvidersExpanded);
-        toggle.setAttribute('aria-expanded', String(Boolean(state.serviceProvidersExpanded)));
-        const container = document.getElementById('serviceProvidersContainer');
-        if (container) container.classList.toggle('hidden', !state.serviceProvidersExpanded);
-      });
+      toggle.addEventListener('click', () => togglePreferenceSubgroup(VIEW_PREFERENCE_SUBGROUPS, '.view-preference-row', id));
       actions.insertBefore(toggle, actions.firstChild);
       
       const listContainer = document.createElement('div');
@@ -8885,6 +9081,24 @@ function renderHomeLimitProviderList() {
     .orderedLimitProviders(LIMIT_PROVIDERS, homeLimitProviderOrderValue())
     .filter(({ id }) => enabled.has(id));
   const hasCustomOrder = Boolean(state.settings?.homeLimitProviderOrder);
+  const displayLabel = document.createElement('label');
+  displayLabel.className = 'settings-item';
+  const displayText = document.createElement('span');
+  displayText.className = 'settings-item-text';
+  const displayTitle = document.createElement('span');
+  displayTitle.className = 'settings-item-title';
+  displayTitle.textContent = t('settings.home.limitDisplayMode');
+  const displayInput = document.createElement('select');
+  for (const mode of ['text', 'bars']) {
+    const option = document.createElement('option');
+    option.value = mode;
+    option.textContent = t(`settings.home.limitDisplayMode.${mode}`);
+    displayInput.append(option);
+  }
+  displayInput.value = homeModulePreferencesApi.normalizeHomeLimitDisplayMode(state.settings?.homeLimitDisplayMode);
+  displayInput.addEventListener('change', () => void saveSettings({ homeLimitDisplayMode: displayInput.value }));
+  displayText.append(displayTitle);
+  displayLabel.append(displayText, displayInput);
   const statusLabel = document.createElement('label');
   statusLabel.className = 'checkbox-label home-limit-status-setting';
   const statusInput = document.createElement('input');
@@ -8969,7 +9183,7 @@ function renderHomeLimitProviderList() {
   showAll.addEventListener('click', () => void showAllHomeLimitProviders());
   headerActions.append(reset, showAll);
   header.append(note, headerActions);
-  wrap.append(statusLabel, providerNamesLabel, countLabel, header);
+  wrap.append(displayLabel, statusLabel, providerNamesLabel, countLabel, header);
   for (const { id, label, settingsLabel } of providers) {
     const isHidden = hidden.has(id);
     const row = document.createElement('div');
@@ -8995,6 +9209,7 @@ function renderHomeLimitProviderList() {
     actions.className = 'tool-preference-actions';
     actions.append(visibility, handle);
     row.append(labelGroup, actions);
+    row.addEventListener('pointerdown', (event) => homeLimitProviderRowDrag.startRowDrag(event, id));
     wrap.append(row);
   }
   return wrap;
@@ -9061,21 +9276,7 @@ function renderHomeSettingsList() {
       toggleIcon.className = 'view-subgroup-icon';
       toggleIcon.setAttribute('aria-hidden', 'true');
       configure.append(toggleIcon);
-      configure.addEventListener('click', () => {
-        if (id === 'limits') {
-          state.homeLimitSettingsExpanded = !state.homeLimitSettingsExpanded;
-          configure.classList.toggle('is-expanded', state.homeLimitSettingsExpanded);
-          configure.setAttribute('aria-expanded', String(Boolean(state.homeLimitSettingsExpanded)));
-          const container = document.getElementById('homeLimitProviderContainer');
-          if (container) container.classList.toggle('hidden', !state.homeLimitSettingsExpanded);
-          return;
-        }
-        state.homeActivitySettingsExpanded = !state.homeActivitySettingsExpanded;
-        configure.classList.toggle('is-expanded', state.homeActivitySettingsExpanded);
-        configure.setAttribute('aria-expanded', String(Boolean(state.homeActivitySettingsExpanded)));
-        const container = document.getElementById('homeActivitySettingsContainer');
-        if (container) container.classList.toggle('hidden', !state.homeActivitySettingsExpanded);
-      });
+      configure.addEventListener('click', () => togglePreferenceSubgroup(HOME_MODULE_SUBGROUPS, '.home-module-preference-row', id));
       actions.append(configure);
     }
     const visibility = document.createElement('button');
@@ -9089,6 +9290,7 @@ function renderHomeSettingsList() {
     const handle = createPreferenceOrderHandle({ kind: 'homeModule', id, label, count: modules.length });
     actions.append(visibility, handle);
     row.append(name, actions);
+    row.addEventListener('pointerdown', (event) => homeModulePreferenceRowDrag.startRowDrag(event, id));
     wrap.append(row);
     if (id === 'limits') {
       const listContainer = document.createElement('div');
@@ -9262,6 +9464,74 @@ async function setProjectsEnabled(enabled) {
   await saveSettings({ projectsEnabled: true, hiddenViews: Array.from(hidden).join(',') });
 }
 
+// Sessions has its own settings subgroup rather than borrowing AI Tool
+// Limits': the context gauge reads a session's working budget, while the
+// limits meters read a provider quota, and the two genuinely disagree about
+// which end of the scale is the good news.
+function renderSessionSettingsList() {
+  const wrap = document.createElement('div');
+  wrap.id = 'sessionSettingsList';
+  wrap.className = 'settings-nested-list trend-settings-list';
+  const titleLabel = document.createElement('label');
+  titleLabel.className = 'checkbox-label trend-settings-row';
+  const titleInput = document.createElement('input');
+  titleInput.type = 'checkbox';
+  titleInput.name = 'sessionTitlesEnabled';
+  titleInput.checked = state.settings?.sessionTitlesEnabled !== false;
+  titleInput.setAttribute('aria-describedby', 'sessionTitlesNote');
+  const titleText = document.createElement('span');
+  titleText.textContent = t('settings.session.showTitles');
+  titleLabel.append(titleInput, titleText);
+  const titleNote = document.createElement('p');
+  titleNote.id = 'sessionTitlesNote';
+  titleNote.className = 'settings-note';
+  titleNote.textContent = t('settings.session.showTitlesNote');
+  titleInput.addEventListener('change', async () => {
+    await saveSettings({ sessionTitlesEnabled: titleInput.checked });
+  });
+  wrap.append(titleLabel, titleNote);
+  // A plain `.settings-item` row, matching the Model ranking control in Main —
+  // the same title-left/control-right shape. It deliberately does NOT reuse
+  // `.home-activity-settings`: that carries its own indent rule for the Home
+  // modules list, and this row already sits inside `.settings-nested-list`,
+  // which draws that rule, so borrowing it painted a second line.
+  const row = document.createElement('div');
+  row.className = 'settings-item';
+  const label = document.createElement('span');
+  label.id = 'sessionContextMetricLabel';
+  label.className = 'settings-item-text';
+  const title = document.createElement('span');
+  title.className = 'settings-item-title';
+  title.textContent = t('settings.session.contextMetric');
+  label.append(title);
+  const options = document.createElement('div');
+  options.className = 'inline-options';
+  options.setAttribute('role', 'radiogroup');
+  options.setAttribute('aria-labelledby', label.id);
+  const current = state.settings?.sessionContextMetric === 'remaining' ? 'remaining' : 'used';
+  for (const metric of ['used', 'remaining']) {
+    const option = document.createElement('label');
+    option.className = 'inline-option';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'sessionContextMetric';
+    input.value = metric;
+    input.checked = current === metric;
+    input.addEventListener('change', () => {
+      // saveSettings repaints through the same path the limits meters use; the
+      // preference rides in renderContext, so the session rows re-fingerprint.
+      if (input.checked) void saveSettings({ sessionContextMetric: metric });
+    });
+    const text = document.createElement('span');
+    text.textContent = t(`settings.session.contextMetric.${metric}`);
+    option.append(input, text);
+    options.append(option);
+  }
+  row.append(label, options);
+  wrap.append(row);
+  return wrap;
+}
+
 function renderServiceProviderList() {
   const wrap = document.createElement('div');
   wrap.id = 'serviceProviderList';
@@ -9339,6 +9609,7 @@ function renderServiceProviderList() {
     actions.className = 'tool-preference-actions';
     actions.append(visibility, handle);
     row.append(name, actions);
+    row.addEventListener('pointerdown', (event) => statusProviderRowDrag.startRowDrag(event, id));
     wrap.append(row);
   }
   return wrap;
@@ -9510,6 +9781,9 @@ function patchRenderedNode(current, next) {
     const value = next.getAttribute(name);
     if (current.getAttribute(name) !== value) current.setAttribute(name, value);
   }
+  if (current instanceof HTMLInputElement && current.id.startsWith('codexDots') && current.type === 'checkbox') {
+    current.checked = next.checked;
+  }
   const currentChildren = Array.from(current.childNodes);
   const nextChildren = Array.from(next.childNodes);
   for (let index = 0; index < nextChildren.length; index += 1) {
@@ -9543,9 +9817,113 @@ function friendlyPath(dir) {
   return clientHealthPresentationApi.friendlyPath(dir, state.appInfo?.homeDir, state.appInfo?.platform);
 }
 
+let customScanPathMutationQueue = Promise.resolve();
+
+function customScanPathsForClient(clientId) {
+  const paths = state.settings?.customScanPaths?.[clientId];
+  return Array.isArray(paths) ? paths : [];
+}
+
+function queueCustomScanPathMutation(operation) {
+  const queued = customScanPathMutationQueue.then(operation, operation);
+  // A rejected mutation must not poison the queue. The caller still receives
+  // the original result while the retained tail always permits the next edit.
+  customScanPathMutationQueue = queued.catch(() => {});
+  return queued;
+}
+
+function customScanPathErrorKey(error) {
+  const message = String(error?.message || error || '');
+  if (message.includes('custom-scan-path-limit-per-client')) {
+    return 'settings.tools.health.customSourcePerClientLimit';
+  }
+  if (message.includes('custom-scan-path-limit-global')) {
+    return 'settings.tools.health.customSourceGlobalLimit';
+  }
+  return 'settings.tools.health.customSourceError';
+}
+
+function mutateCustomScanPaths(clientId, mutation, options = {}) {
+  return queueCustomScanPathMutation(async () => {
+    try {
+      // Read inside the queue so every operation starts from the settings
+      // returned by the preceding save, including edits for another client.
+      const current = customScanPathsForClient(clientId);
+      const next = mutation(current);
+      if (!Array.isArray(next)) return;
+      const customScanPaths = { ...(state.settings?.customScanPaths || {}) };
+      if (next.length > 0) customScanPaths[clientId] = next;
+      else delete customScanPaths[clientId];
+      const patch = { customScanPaths };
+      if (options.enableClient === true) {
+        const tracked = enabledClientSet();
+        if (!tracked.has(clientId)) patch.clients = [...tracked, clientId].join(',');
+      }
+      await saveSettings(patch);
+      state.customScanPathErrors.delete(clientId);
+      resetClientSourceProbe(clientId);
+      loadClientSources(clientId, { force: true });
+      refillOpenClientHealthPanel();
+    } catch (error) {
+      state.customScanPathErrors.set(clientId, customScanPathErrorKey(error));
+      refillOpenClientHealthPanel();
+    }
+  });
+}
+
+function customSourceIcon(kind) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const first = document.createElementNS(svg.namespaceURI, 'path');
+  first.setAttribute('d', kind === 'add' ? 'M8 3v10' : 'M4 4l8 8');
+  const second = document.createElementNS(svg.namespaceURI, 'path');
+  second.setAttribute('d', kind === 'add' ? 'M3 8h10' : 'M12 4l-8 8');
+  svg.append(first, second);
+  return svg;
+}
+
+function resetClientSourceProbe(clientId) {
+  state.clientSources?.entries?.delete(clientId);
+  state.clientSourcesKey = '';
+  state.clientSourcesRequest += 1;
+}
+
+async function addCustomScanPath(clientId) {
+  try {
+    const result = await window.tokenMonitor?.pickCustomScanPath?.(clientId);
+    if (result?.canceled) return;
+    if (!result?.ok || !result.dir) throw new Error(result?.error || 'pick-failed');
+    await mutateCustomScanPaths(clientId, (current) => (
+      current.includes(result.dir) ? null : [...current, result.dir]
+    ), { enableClient: true });
+  } catch (error) {
+    state.customScanPathErrors.set(clientId, customScanPathErrorKey(error));
+    refillOpenClientHealthPanel();
+  }
+}
+
+async function removeCustomScanPath(clientId, dir) {
+  await mutateCustomScanPaths(clientId, (current) => {
+    const remaining = current.filter((entry) => entry !== dir);
+    return remaining.length === current.length ? null : remaining;
+  });
+}
+
 // Values are formatted here and nowhere else — the presentation helper returns
 // three semantic groups containing only raw numbers, timestamps and i18n keys.
-function clientHealthGroup(group, notes) {
+function codexDotsSettingState(key) {
+  let checked = key === 'codexDotsEnabled' ? state.settings?.[key] === true : state.settings?.[key] !== false;
+  let pending = false;
+  for (const patch of pendingSettingsPatches) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    checked = patch[key] === true;
+    pending = true;
+  }
+  return { checked, pending };
+}
+
+function clientHealthGroup(group, notes, clientId) {
   const section = document.createElement('section');
   section.className = `tool-health-group tool-health-group-${group.id}`;
   const heading = document.createElement('h4');
@@ -9555,24 +9933,62 @@ function clientHealthGroup(group, notes) {
   body.className = 'tool-health-group-body';
 
   if (group.id === 'source') {
+    section.append(heading);
+    const summaryRow = document.createElement('div');
+    summaryRow.className = 'tool-health-source-summary-row';
     const summary = document.createElement('div');
     summary.className = 'tool-health-group-summary';
     summary.textContent = t(`settings.tools.health.source.${group.state}`, {
       detected: group.detectedCount,
       checked: group.checkedCount
     });
-    body.append(summary);
+    summaryRow.append(summary);
+    if (state.appInfo?.customScanClientIds?.includes(clientId)) {
+      const addSource = document.createElement('button');
+      addSource.type = 'button';
+      addSource.className = 'tool-health-source-control tool-health-source-add';
+      addSource.title = t('settings.tools.health.addCustomSource');
+      addSource.setAttribute('aria-label', addSource.title);
+      addSource.append(customSourceIcon('add'));
+      const label = document.createElement('span');
+      label.textContent = addSource.title;
+      addSource.append(label);
+      addSource.addEventListener('click', () => { void addCustomScanPath(clientId); });
+      summaryRow.append(addSource);
+    }
+    body.append(summaryRow);
+    const customSourceError = state.customScanPathErrors.get(clientId);
+    if (customSourceError) {
+      const error = document.createElement('div');
+      error.className = 'tool-health-group-meta tool-health-source-error';
+      error.setAttribute('role', 'status');
+      error.textContent = t(customSourceError);
+      body.append(error);
+    }
     if (group.checks.length > 0) {
       const list = document.createElement('div');
       list.className = 'tool-health-checks';
       for (const check of group.checks) {
         const paths = check.paths?.length ? check.paths : [{ dir: '', exists: check.exists }];
         for (const pathInfo of paths) {
+          const row = document.createElement('div');
+          row.className = 'tool-health-check-row';
           const chip = document.createElement('code');
           chip.className = `tool-health-check${pathInfo.exists ? ' found' : pathInfo.pending ? ' pending' : ''}`;
           chip.textContent = pathInfo.dir ? friendlyPath(pathInfo.dir) : check.id;
           if (pathInfo.dir) chip.title = pathInfo.dir;
-          list.append(chip);
+          row.append(chip);
+          if (pathInfo.custom) {
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'tool-health-source-control tool-health-source-remove';
+            remove.title = t('settings.tools.health.removeCustomSource');
+            remove.setAttribute('aria-label', `${remove.title}: ${friendlyPath(pathInfo.dir)}`);
+            remove.append(customSourceIcon('remove'));
+            remove.addEventListener('click', () => { void removeCustomScanPath(clientId, pathInfo.dir); });
+            row.append(remove);
+          }
+          list.append(row);
         }
       }
       body.append(list);
@@ -9582,6 +9998,64 @@ function clientHealthGroup(group, notes) {
     summary.className = 'tool-health-group-summary';
     summary.textContent = t(`settings.tools.health.sync.${group.state}`);
     body.append(summary);
+    if (clientId === 'codex') {
+      const row = document.createElement('label');
+      row.className = 'checkbox-label codex-dots-setting';
+      const label = document.createElement('span');
+      label.textContent = t('settings.tools.codexDots');
+      const input = document.createElement('input');
+      input.id = 'codexDotsInput';
+      input.type = 'checkbox';
+      const collectionState = codexDotsSettingState('codexDotsEnabled');
+      input.checked = collectionState.checked;
+      input.disabled = collectionState.pending;
+      input.setAttribute('aria-describedby', 'codexDotsNote');
+      input.addEventListener('change', async () => {
+        if (codexDotsSettingState('codexDotsEnabled').pending) return;
+        input.disabled = true;
+        try {
+          await saveSettings({ codexDotsEnabled: input.checked });
+        } catch (_) {
+          input.checked = state.settings?.codexDotsEnabled === true;
+        } finally {
+          input.disabled = false;
+          refillOpenClientHealthPanel();
+        }
+      });
+      const note = document.createElement('div');
+      note.id = 'codexDotsNote';
+      note.className = 'tool-health-group-meta';
+      note.textContent = t('settings.tools.codexDotsNote');
+      row.append(label, input);
+      const visibility = document.createElement('label');
+      visibility.className = 'checkbox-label codex-dots-setting';
+      const visibilityLabel = document.createElement('span');
+      visibilityLabel.textContent = t('settings.tools.codexDotsVisible');
+      const visibilityInput = document.createElement('input');
+      visibilityInput.id = 'codexDotsVisibleInput';
+      visibilityInput.type = 'checkbox';
+      const visibilityState = codexDotsSettingState('codexDotsVisible');
+      visibilityInput.checked = visibilityState.checked;
+      visibilityInput.disabled = visibilityState.pending;
+      visibilityInput.setAttribute('aria-describedby', 'codexDotsNote');
+      visibilityInput.addEventListener('change', async () => {
+        if (codexDotsSettingState('codexDotsVisible').pending) return;
+        visibilityInput.disabled = true;
+        try {
+          await saveSettings({ codexDotsVisible: visibilityInput.checked });
+        } catch (_) {
+          visibilityInput.checked = state.settings?.codexDotsVisible !== false;
+        } finally {
+          visibilityInput.disabled = false;
+          refillOpenClientHealthPanel();
+        }
+      });
+      visibility.append(visibilityLabel, visibilityInput);
+      const dots = document.createElement('div');
+      dots.className = 'codex-dots-settings';
+      dots.append(row, visibility, note);
+      body.append(dots);
+    }
     const stamps = [
       ['lastAttemptAt', 'settings.tools.health.lastAttempt'],
       ['lastSuccessAt', 'settings.tools.health.lastSuccess']
@@ -9641,7 +10115,8 @@ function clientHealthGroup(group, notes) {
     line.textContent = t(`settings.tools.health.code.${note.code}`);
     body.append(line);
   }
-  section.append(heading, body);
+  if (group.id !== 'source') section.append(heading);
+  section.append(body);
   return section;
 }
 
@@ -9663,7 +10138,7 @@ function relativeDayLabel(day) {
   return day;
 }
 
-function clientHealthActions(clientId) {
+function clientHealthActions(clientId, detail) {
   const actions = document.createElement('div');
   actions.className = 'tool-health-actions';
   const button = (labelKey, onClick) => {
@@ -9675,6 +10150,8 @@ function clientHealthActions(clientId) {
     actions.append(control);
     return control;
   };
+  const syncLockBlocked = clientId === 'antigravity'
+    && detail?.notes?.some((note) => note.code === 'sync-lock-present');
   // The detail is already bound to the exact local device. Renderer mode is a
   // transport state (`local`/`sync`), not topology, so host and client collectors
   // expose the same targeted capability through preload.
@@ -9687,27 +10164,61 @@ function clientHealthActions(clientId) {
     feedback.dataset.healthAction = 'rescan-feedback';
     feedback.setAttribute('role', 'status');
     feedback.setAttribute('aria-live', 'polite');
-    feedback.textContent = rescanState.failed ? t('settings.tools.health.rescanFailed') : '';
-    const rescan = button('settings.tools.health.rescan', async () => {
-      const requestId = state.clientRescans.begin(clientId);
-      let succeeded = false;
-      try {
-        succeeded = await window.tokenMonitor.rescanClient(clientId) === true;
-        if (succeeded) loadClientSources(clientId, { force: true });
-      } catch (_) {
-        succeeded = false;
-      } finally {
-        state.clientRescans.finish(clientId, requestId, succeeded);
-      }
-    });
-    rescan.dataset.healthAction = 'rescan';
-    rescan.id = `toolHealthRescan-${clientId}`;
-    rescan.disabled = rescanState.pending;
+    const feedbackCode = rescanState.feedbackCode;
+    feedback.textContent = feedbackCode
+      ? t(feedbackCode === 'rescan-failed'
+        ? 'settings.tools.health.rescanFailed'
+        : `settings.tools.health.repairFeedback.${feedbackCode}`)
+      : '';
+    if (syncLockBlocked && typeof window.tokenMonitor?.repairClientSyncLock === 'function') {
+      const repair = button(
+        rescanState.pending ? 'settings.tools.health.repairing' : 'settings.tools.health.repairAndRescan',
+        async () => {
+          if (!window.confirm(t('settings.tools.health.repairConfirm'))) return;
+          const requestId = state.clientRescans.begin(clientId);
+          let result = { ok: false, code: 'repair-failed' };
+          try {
+            result = await window.tokenMonitor.repairClientSyncLock(clientId);
+            if (result?.ok === true) loadClientSources(clientId, { force: true });
+          } catch (_) {
+            result = { ok: false, code: 'repair-failed' };
+          } finally {
+            state.clientRescans.finish(clientId, requestId, result?.ok === true, result?.code || 'repair-failed');
+          }
+        }
+      );
+      repair.classList.add('is-repair');
+      repair.dataset.healthAction = 'repair-sync-lock';
+      repair.id = `toolHealthRepair-${clientId}`;
+      repair.disabled = rescanState.pending;
+    } else {
+      const rescan = button('settings.tools.health.rescan', async () => {
+        const requestId = state.clientRescans.begin(clientId);
+        let succeeded = false;
+        try {
+          succeeded = await window.tokenMonitor.rescanClient(clientId) === true;
+          if (succeeded) loadClientSources(clientId, { force: true });
+        } catch (_) {
+          succeeded = false;
+        } finally {
+          state.clientRescans.finish(clientId, requestId, succeeded, succeeded ? '' : 'rescan-failed');
+        }
+      });
+      rescan.dataset.healthAction = 'rescan';
+      rescan.id = `toolHealthRescan-${clientId}`;
+      rescan.disabled = rescanState.pending;
+    }
     actions.append(feedback);
   }
   // Only where something was actually found: the button opens the first existing
   // root, and offering it for a tool with none would open nothing.
-  if ((exactLocalClientSources(clientId) || []).some((source) => source.dir && source.exists)) {
+  if (syncLockBlocked && typeof window.tokenMonitor?.revealClientSyncLock === 'function') {
+    const revealLock = button('settings.tools.health.revealSyncLock', () => {
+      void window.tokenMonitor.revealClientSyncLock(clientId);
+    });
+    revealLock.dataset.healthAction = 'reveal-sync-lock';
+    revealLock.id = `toolHealthRevealLock-${clientId}`;
+  } else if ((exactLocalClientSources(clientId) || []).some((source) => source.dir && source.exists)) {
     const reveal = button('settings.tools.health.reveal', () => { void window.tokenMonitor?.revealClientSource?.(clientId); });
     reveal.dataset.healthAction = 'reveal';
     reveal.id = `toolHealthReveal-${clientId}`;
@@ -9730,10 +10241,11 @@ function clientHealthPanel(detail, clientId) {
   for (const group of detail.groups) {
     groups.append(clientHealthGroup(
       group,
-      detail.notes.filter((note) => note.group === group.id)
+      detail.notes.filter((note) => note.group === group.id),
+      clientId
     ));
   }
-  box.append(groups, clientHealthActions(clientId));
+  box.append(groups, clientHealthActions(clientId, detail));
   return inner;
 }
 
@@ -9838,6 +10350,33 @@ function renderToolPreferences() {
   return preserveSettingsPanelScroll(renderToolPreferencesNow);
 }
 
+// The filter query is transient UI state, not a setting: it lives in `state`
+// and the field itself is static markup outside the list, so a stats tick can
+// rebuild every row underneath it without touching what is being typed.
+function toolPreferenceQuery() {
+  return settingsListFilterApi.normalizeListQuery(state.toolSearchQuery);
+}
+
+// Every row is rendered on every pass and the non-matching ones are hidden,
+// rather than the list rendering only what matches. That is not cosmetic: the
+// limits rows adopt singleton live nodes (account panels, status pills) out of
+// index.html by reparenting them, so a row that is simply not rendered leaves
+// its adopted children inside the outgoing row and `previousRows` removal then
+// detaches them from the document for good. Both lists follow the same rule so
+// the invariant is one rule, not a per-list exception.
+function toolPreferenceRows() {
+  const clients = clientDisplayPreferencesApi.orderedClients(KNOWN_CLIENTS, state.settings?.clientDisplayOrder, state.settings?.pinnedClients);
+  const matches = settingsListFilterApi.filterListItems(clients, state.toolSearchQuery, ({ id, label }) => `${label} ${id}`);
+  return { clients, matched: new Set(matches.map(({ id }) => id)) };
+}
+
+function renderSettingsListEmptyState(list) {
+  const empty = document.createElement('p');
+  empty.className = 'settings-note settings-list-empty';
+  empty.textContent = t('settings.search.noMatches');
+  list.append(empty);
+}
+
 function toolPreferenceRenderSignature() {
   const clientStatus = localClientStatus();
   const health = localClientHealth();
@@ -9850,8 +10389,12 @@ function toolPreferenceRenderSignature() {
       state.settings?.clientDisplayOrder || '',
       state.settings?.locale || state.settings?.language || '',
       state.settings?.currency || '',
-      state.settings?.compactTokenUnits || ''
+      state.settings?.compactTokenUnits || '',
+      state.settings?.codexDotsEnabled === true,
+      state.settings?.codexDotsVisible !== false,
+      JSON.stringify(state.settings?.customScanPaths || {})
     ],
+    query: toolPreferenceQuery(),
     deviceId: device?.deviceId || '',
     clientStatus,
     healthRows: KNOWN_CLIENTS.map(({ id }) => [
@@ -9872,10 +10415,15 @@ function renderToolPreferencesNow() {
   const sourceSignature = clientSourceCacheApi.clientSourceRequestKey(
     clientSourcesIdentity(state.clientHealthExpanded)
   );
+  const { clients, matched } = toolPreferenceRows();
+  // Every client keeps a row; a query with no match adds the no-matches note on
+  // top of them, so the short-circuit compares against what this query is
+  // expected to have produced.
+  const expectedRowCount = clients.length + (matched.size ? 0 : 1);
   if (
     state.toolPreferenceRenderSignature
     && state.toolPreferenceRenderSignature === renderSignature
-    && els.clientDisplayList.children.length === KNOWN_CLIENTS.length
+    && els.clientDisplayList.children.length === expectedRowCount
   ) {
     if (state.toolPreferenceDetailSignature !== detailSignature) {
       state.toolPreferenceDetailSignature = detailSignature;
@@ -9899,7 +10447,7 @@ function renderToolPreferencesNow() {
   const pinned = pinnedClientSet();
   const clientStatus = localClientStatus();
   const health = localClientHealth();
-  const clients = clientDisplayPreferencesApi.orderedClients(KNOWN_CLIENTS, state.settings?.clientDisplayOrder, state.settings?.pinnedClients);
+  const filtering = Boolean(toolPreferenceQuery());
   const hasCustomOrder = clientDisplayPreferencesApi.hasCustomDisplayOrder(state.settings?.clientDisplayOrder);
   const hasPinnedClients = pinned.size > 0;
   const hasHiddenClients = hidden.size > 0;
@@ -9913,6 +10461,7 @@ function renderToolPreferencesNow() {
     const isPinned = pinned.has(id);
     row.classList.toggle('is-hidden', isHidden);
     row.classList.toggle('is-pinned', isPinned);
+    row.classList.toggle('is-filtered-out', !matched.has(id));
     const labelGroup = document.createElement('div');
     labelGroup.className = 'tool-preference-label';
     const name = document.createElement('div');
@@ -9952,7 +10501,11 @@ function renderToolPreferencesNow() {
     // shortcuts. A checkbox has no native arrow-key behaviour, so the existing
     // key bindings transfer unchanged.
     trackInput.setAttribute('aria-keyshortcuts', 'ArrowUp ArrowDown Home End');
-    trackInput.addEventListener('keydown', (event) => onPreferenceOrderKeydown(event, 'client', id));
+    // Arrow/Home/End reordering derives the next order from settings rather than
+    // from the DOM, so a filter cannot corrupt it — but it would move the row
+    // through positions the query has hidden, with nothing on screen to show
+    // for it. Off while filtering, like the drag.
+    if (!filtering) trackInput.addEventListener('keydown', (event) => onPreferenceOrderKeydown(event, 'client', id));
     track.append(trackInput);
     const visibility = document.createElement('button');
     visibility.type = 'button';
@@ -10014,9 +10567,12 @@ function renderToolPreferencesNow() {
     } else {
       row.append(track, labelGroup, actions);
     }
-    row.addEventListener('pointerdown', (event) => clientPreferenceRowDrag.startRowDrag(event, id));
+    // Reordering is suppressed while a filter is on: the drop commits the order
+    // it reads off the list, and a filtered list is only part of it.
+    if (!filtering) row.addEventListener('pointerdown', (event) => clientPreferenceRowDrag.startRowDrag(event, id));
     els.clientDisplayList.appendChild(row);
   }
+  if (!matched.size) renderSettingsListEmptyState(els.clientDisplayList);
   // Appended first and only then swapped out: replacing the list wholesale
   // would destroy the row under the pointer on every stats tick.
   for (const row of previousRows) row.remove();
@@ -10036,6 +10592,22 @@ function moveLimitProviderLiveNode(parent, node, before = null) {
   parent.moveBefore(node, before);
 }
 
+function limitProviderQuery() {
+  return settingsListFilterApi.normalizeListQuery(state.limitProviderSearchQuery);
+}
+
+function limitProviderRows() {
+  const providers = limitProviderOrderApi.orderedLimitProviders(LIMIT_PROVIDERS, state.settings?.limitProviderOrder);
+  // `settingsLabel` first because that is what the row actually shows: without
+  // it, searching a provider by the name printed in front of you hides it.
+  const matches = settingsListFilterApi.filterListItems(
+    providers,
+    state.limitProviderSearchQuery,
+    ({ id, label, settingsLabel }) => `${settingsLabel || label} ${label} ${id}`
+  );
+  return { providers, matched: new Set(matches.map(({ id }) => id)) };
+}
+
 function renderLimitProviderCheckboxes() {
   if (!els.limitProviderCheckboxes) return;
   // A stats update mid-drag would replace the rows under the pointer and kill
@@ -10046,9 +10618,13 @@ function renderLimitProviderCheckboxes() {
 
 function renderLimitProviderCheckboxesNow() {
   const renderSignature = limitProviderSettingsRenderSignature();
+  const { providers, matched } = limitProviderRows();
+  // Same reasoning as the tracked-tools list: every provider keeps a row, and no
+  // matches leaves the no-matches note on top of them.
+  const expectedRowCount = providers.length + (matched.size ? 0 : 1);
   if (
     state.limitProviderRenderSignature === renderSignature
-    && els.limitProviderCheckboxes.children.length === LIMIT_PROVIDERS.length
+    && els.limitProviderCheckboxes.children.length === expectedRowCount
   ) {
     return;
   }
@@ -10065,17 +10641,20 @@ function renderLimitProviderCheckboxesNow() {
       const input = inputs[index];
       if (input) reusableSettingInputs.set(`${providerId}:${setting.key}`, input);
     });
+    for (const input of row.querySelectorAll?.('.limit-provider-usage-items-list input[data-item-id]') || []) {
+      reusableSettingInputs.set(`${providerId}:item:${input.dataset.itemId}`, input);
+    }
   }
   const enabled = enabledLimitProviderSet();
-  const collected = new Map((state.stats?.limits?.providers || []).map((provider) => [provider.provider, provider]));
-  const providers = limitProviderOrderApi.orderedLimitProviders(LIMIT_PROVIDERS, state.settings?.limitProviderOrder);
+  const filtering = Boolean(limitProviderQuery());
   for (const { id, label, settingsLabel } of providers) {
     const isEnabled = enabled.has(id);
     const provider = isEnabled
-      ? (collected.get(id) || { provider: id, ...(state.stats ? { status: missingLimitProviderStatus() } : {}), windows: [] })
+      ? (limitProviderPresentationApi.limitProviderSettingsRecord(state.stats?.limits?.providers, id)
+        || { provider: id, ...(state.stats ? { status: missingLimitProviderStatus() } : {}), windows: [] })
       : { provider: id, status: 'disabled', windows: [] };
     const row = document.createElement('div');
-    row.className = `limit-provider-row${isEnabled ? '' : ' is-disabled'}`;
+    row.className = `limit-provider-row${isEnabled ? '' : ' is-disabled'}${matched.has(id) ? '' : ' is-filtered-out'}`;
     row.dataset.provider = id;
     const wrap = document.createElement('label');
     wrap.className = 'client-checkbox limit-provider-toggle';
@@ -10089,7 +10668,8 @@ function renderLimitProviderCheckboxesNow() {
     // shortcuts. A checkbox has no native arrow-key behaviour, so the existing
     // key bindings transfer unchanged.
     cb.setAttribute('aria-keyshortcuts', 'ArrowUp ArrowDown Home End');
-    cb.addEventListener('keydown', (event) => onPreferenceOrderKeydown(event, 'provider', id));
+    // Off while filtering, for the reason given on the tracked-tools list.
+    if (!filtering) cb.addEventListener('keydown', (event) => onPreferenceOrderKeydown(event, 'provider', id));
     const copy = document.createElement('span');
     copy.className = 'limit-provider-copy';
     const nameLine = document.createElement('span');
@@ -10117,8 +10697,11 @@ function renderLimitProviderCheckboxesNow() {
     }
     for (const tagInfo of tagInfos) {
       if ((detected || !isEnabled) && tagInfo.kind === 'status') continue;
+      // Account groups own their configuration summary on the right. Avoid
+      // repeating "Not set up" beside the same account state, as with Codex.
+      if (accountGroup && provider.status === 'notConfigured' && tagInfo.kind === 'status') continue;
       const duplicatesInlineSetup = tagInfo.kind === 'capability'
-        && ((connectionDetailKey && tagInfo.label === 'Auto')
+        && ((connectionDetailKey && !accountGroup && tagInfo.label === 'Auto')
           || (accountGroup && tagInfo.label === 'Manual login'));
       if (duplicatesInlineSetup) continue;
       const tag = document.createElement('span');
@@ -10132,14 +10715,17 @@ function renderLimitProviderCheckboxesNow() {
     const actions = document.createElement('span');
     actions.className = 'limit-provider-actions';
     const accountStatus = limitProviderAccountStatus(id);
-    if (connectionDetailKey) {
+    // Multi-account providers use this space for their account summary. Their
+    // automatic collection support stays with the capability tags on the left.
+    if (connectionDetailKey && !accountGroup) {
       const mode = document.createElement('span');
       mode.className = 'cursor-status-pill limit-provider-mode-pill';
       mode.textContent = t('settings.limits.connection.autoDetect');
       actions.append(mode);
     }
     const settings = LIMIT_PROVIDER_SETTINGS[id];
-    const hasOptions = Boolean(accountGroup || settings || connectionDetailKey);
+    const usageItems = isEnabled ? limitProviderUsageItemRows(id) : [];
+    const hasOptions = Boolean(accountGroup || settings || connectionDetailKey || usageItems.length);
     let optionsContainer = null;
     let optionsInner = null;
     let main = null;
@@ -10169,6 +10755,7 @@ function renderLimitProviderCheckboxesNow() {
       }
       if (connectionDetailKey) optionsInner.append(limitProviderConnectionDetail(connectionDetailKey));
       if (settings) optionsInner.append(limitProviderSettingsList(id, settings, reusableSettingInputs));
+      if (usageItems.length) optionsInner.append(limitProviderUsageItemsList(id, usageItems, reusableSettingInputs));
       optionsContainer.append(optionsInner);
       const toggleOptions = () => {
         const opening = state.limitProviderSettingsExpanded !== id;
@@ -10185,7 +10772,9 @@ function renderLimitProviderCheckboxesNow() {
     } else {
       row.append(wrap, copy, actions);
     }
-    row.addEventListener('pointerdown', (event) => limitProviderRowDrag.startRowDrag(event, id));
+    // Reordering is suppressed while a filter is on: the drop commits the order
+    // it reads off the list, and a filtered list is only part of it.
+    if (!filtering) row.addEventListener('pointerdown', (event) => limitProviderRowDrag.startRowDrag(event, id));
     // Kept inside the row rather than as a sibling: reordering moves only
     // `.limit-provider-row` nodes, so a sibling panel would be stranded when the
     // list is dragged.
@@ -10202,6 +10791,7 @@ function renderLimitProviderCheckboxesNow() {
     // change tracking and re-render signature.
     if (id === 'opencode') moveOpenCodeLocalFallbackSetting();
   }
+  if (!matched.size) renderSettingsListEmptyState(els.limitProviderCheckboxes);
   for (const row of previousRows) row.remove();
   if (focusedId && document.activeElement === document.body) {
     document.getElementById(focusedId)?.focus({ preventScroll: true });
@@ -10249,14 +10839,226 @@ function moveOpenCodeLocalFallbackSetting() {
   }
 }
 
+// Every account form saves through limits:saveCredential, which checks the
+// draft, probes it in main and stores it unless the provider rejected it. The
+// panel only turns the answer into its message line and the pending pill;
+// generated and hand-built panels share this, including which messages they
+// may override (`messages.required` / `rejected` / `invalidFormat`).
+let claudeOrganizationChoicesRevision = 0;
+async function saveAccountCredential(id, values, { messages = {}, failedKey, clearInput = () => {} } = {}) {
+  if (id === 'claude') claudeOrganizationChoicesRevision += 1;
+  const provider = LIMIT_PROVIDERS.find((entry) => entry.id === id);
+  const name = provider?.settingsLabel || provider?.label || id;
+  setAccountPanelMessage(id, null);
+  renderExternalProviderStatus(id);
+  let result;
+  try {
+    result = await commitAccountCredential(() => window.tokenMonitor.limits.saveCredential(id, values));
+  } catch (error) {
+    setAccountPanelMessage(id, { key: failedKey, params: { message: error.message } });
+    renderExternalProviderStatus(id);
+    return result;
+  }
+  if (result?.verdict === 'superseded') return result;
+  if (id === 'claude') claudeOrganizationChoicesRevision += 1;
+  if (id === 'claude' && result?.choices) renderClaudeOrganizationChoices(result.choices, result.settings?.claudeWebOrganizationId || values.claudeWebOrganizationId);
+  if (id === 'claude' && result?.verdict === 'selectionRequired') {
+    setAccountPanelMessage(id, { key: 'settings.claude.organizationRequired', tone: 'notice' });
+    renderExternalProviderStatus(id);
+    return result;
+  }
+  if (!result?.saved) {
+    const rejection = {
+      required: { key: messages.required || 'settings.common.credentialRequired' },
+      invalidFormat: { key: messages.invalidFormat || 'settings.common.credentialInvalidFormat' }
+    }[result?.status] || { key: messages.rejected || 'settings.common.credentialRejected', params: { provider: name } };
+    setAccountPanelMessage(id, rejection);
+    renderExternalProviderStatus(id);
+    return result;
+  }
+  clearInput();
+  // Marked only once the credential is stored: marking drops the provider's
+  // current record, and a rejected key must leave the linked status on screen.
+  markExternalProviderCheckPending(id);
+  if (result.verdict === 'indeterminate') {
+    const throttled = result.status === 'rateLimited' || result.status === 'sourceRateLimited';
+    setAccountPanelMessage(id, {
+      key: throttled ? 'settings.common.credentialSavedRateLimited' : 'settings.common.credentialSavedUnconfirmed',
+      params: { provider: name },
+      tone: 'notice',
+      untilChecked: true
+    });
+  }
+  renderExternalProviderStatus(id);
+  await refreshStats({ force: true });
+  setExternalAccountExpanded(id, !externalProviderAccountLinked(id));
+  renderExternalProviderStatus(id);
+  return result;
+}
+
+// The busy guard generated panels get from their factory, for a hand-built
+// panel's own submit button.
+async function submitAccountCredential(button, id, values, options) {
+  if (button.disabled) return undefined;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = t('settings.common.checking');
+  try {
+    return await saveAccountCredential(id, values, options);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+async function clearAccountCredential(id) {
+  if (id === 'claude') claudeOrganizationChoicesRevision += 1;
+  setAccountPanelMessage(id, null);
+  await commitAccountCredential(() => window.tokenMonitor.limits.clearCredential(id));
+  if (id === 'claude') {
+    claudeOrganizationChoicesRevision += 1;
+    renderClaudeOrganizationChoices([]);
+  }
+  clearExternalProviderCheckPending(id);
+  clearExternalProviderPendingStatus(id);
+  renderExternalProviderStatus(id);
+  await refreshStats({ force: true });
+}
+
+async function commitAccountCredential(request) {
+  const settingsPushRevision = state.settingsPushRevision;
+  const result = await request();
+  if (result?.settings) applyPersistedSettings(result.settings, settingsPushRevision);
+  return result;
+}
+
+function limitAccountForm(providerId) {
+  return state.settings?.limitAccountForms?.find((form) => form.id === providerId);
+}
+
+function renderClaudeOrganizationChoices(choices, selectedId = state.settings?.claudeWebOrganizationId || '') {
+  const select = document.getElementById('claudeWebOrganizationIdInput');
+  if (!select) return false;
+  document.getElementById('claudeWebOrganizationRow')?.classList.toggle('hidden', choices.length === 0);
+  select.options.length = 0;
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = t('settings.claude.organizationChoose');
+  select.append(placeholder);
+  for (const choice of choices) {
+    const option = document.createElement('option');
+    option.value = choice.id;
+    option.textContent = [choice.name || choice.id, choice.plan ? choice.plan[0].toUpperCase() + choice.plan.slice(1) : ''].filter(Boolean).join(' · ');
+    select.append(option);
+  }
+  const selectedAvailable = choices.some((choice) => choice.id === selectedId);
+  select.value = selectedAvailable ? selectedId : !selectedId && choices.length === 1 ? choices[0].id : '';
+  select.disabled = choices.length === 0;
+  return selectedAvailable;
+}
+
+// The organization picker belongs to the form's own cookie. Once the first
+// added account has moved that cookie into the list of additional logins, each
+// of which keeps its own organization, the form has no session to list them for.
+function claudeFormOrganizationsAvailable() {
+  if (!state.settings?.claudeWebCookieConfigured) return false;
+  return state.settings?.claudeWebCookie === 'set' || (state.settings?.claudeWebAccounts || []).length === 0;
+}
+
+async function loadClaudeOrganizationChoices() {
+  const revision = ++claudeOrganizationChoicesRevision;
+  try {
+    const result = await window.tokenMonitor.limits.listOrganizationChoices('claude');
+    if (revision !== claudeOrganizationChoicesRevision) return;
+    if (result.status === 'ok') {
+      const selectedAvailable = renderClaudeOrganizationChoices(result.choices);
+      if (!selectedAvailable && (state.settings?.claudeWebOrganizationId || result.choices.length > 1)) {
+        setAccountPanelMessage('claude', { key: state.settings?.claudeWebOrganizationId
+          ? 'settings.claude.organizationUnavailable'
+          : 'settings.claude.organizationSelect', tone: 'notice' });
+      }
+    } else setAccountPanelMessage('claude', { key: 'settings.claude.organizationLoadFailed', tone: 'notice' });
+  } catch (_) {
+    if (revision !== claudeOrganizationChoicesRevision) return;
+    setAccountPanelMessage('claude', { key: 'settings.claude.organizationLoadFailed', tone: 'notice' });
+  }
+}
+
+// A select beside a credential (region, site, console) saves as soon as it
+// changes. `clears` names what the change invalidates: an Alibaba cookie
+// belongs to the console it was copied from and cannot authenticate the other
+// one, so switching drops it instead of leaving a key that can only fail.
+async function saveAccountFormSetting({ id }, field, value) {
+  if (id === 'claude' && field.key === 'claudeWebOrganizationId') {
+    if (!value || !state.settings?.claudeWebCookieConfigured || document.getElementById('claudeWebCookieInput')?.value) return;
+    claudeOrganizationChoicesRevision += 1;
+    await saveSettings({ claudeWebOrganizationId: value });
+    setAccountPanelMessage('claude', null);
+    await refreshStats({ force: true });
+    return;
+  }
+  if (!field.saveOnChange) return;
+  const cleared = Object.fromEntries((field.clears || []).map((key) => [key, '']));
+  await saveSettings({ [field.key]: value, ...cleared });
+  if (!field.clears?.length) return;
+  clearExternalProviderCheckPending(id);
+  clearExternalProviderPendingStatus(id);
+  renderExternalProviderStatus(id);
+  await refreshStats({ force: true });
+}
+
+function setupLimitAccountPanels() {
+  const container = document.getElementById('accountsSettingsDetails');
+  let added = false;
+  for (const form of state.settings?.limitAccountForms || []) {
+    if (form.kind !== 'credential' || document.getElementById(`${form.id}AccountGroup`)) continue;
+    const panel = limitAccountPanelsApi.createCredentialPanel(form, {
+      document,
+      translate: t,
+      onToggle: ({ id }) => setExternalAccountExpanded(id, !state[`${id}AccountExpanded`]),
+      onOpen: (form) => window.tokenMonitor.openExternal(limitAccountPanelsApi.resolveOpenUrl(form, {
+        document,
+        provider: externalProviderForAccount(form.id)
+      })),
+      onRefresh: async () => {
+        if (form.id === 'claude' && claudeFormOrganizationsAvailable()) await loadClaudeOrganizationChoices();
+        await refreshStats({ force: true });
+      },
+      onClear: ({ id }) => clearAccountCredential(id),
+      onSave: ({ id, messages, failedKey }, values, clearInput) => saveAccountCredential(id, values, { messages, failedKey, clearInput }),
+      onFieldChange: (form, field, value) => saveAccountFormSetting(form, field, value),
+      onFieldError: ({ id, failedKey }, error) => {
+        setAccountPanelMessage(id, { key: failedKey, params: { message: error.message } });
+        renderExternalProviderStatus(id);
+      }
+    });
+    const catalogIndex = LIMIT_PROVIDERS.findIndex((provider) => provider.id === form.id);
+    const nextGroup = LIMIT_PROVIDERS.slice(catalogIndex + 1)
+      .map((provider) => limitProviderAccountGroup(provider.id))
+      .find((group) => group?.parentElement === container);
+    container.insertBefore(panel, nextGroup || null);
+    added = true;
+    setExternalAccountExpanded(form.id, false);
+    limitAccountPanelsApi.syncCredentialFields(form, { document, settings: state.settings });
+    if (form.id === 'claude') attachClaudeWebAccounts();
+    if (form.id === 'claude' && claudeFormOrganizationsAvailable()) void loadClaudeOrganizationChoices();
+    renderExternalProviderStatus(form.id);
+  }
+  if (added) initSettingsAnimationWrappers();
+}
+
 function limitProviderAccountGroup(providerId) {
-  const groupId = LIMIT_PROVIDER_ACCOUNT_GROUP_IDS[providerId];
-  return groupId ? document.getElementById(groupId) : null;
+  const groupId = LIMIT_PROVIDER_ACCOUNT_NODES[providerId]?.group;
+  return (groupId || limitAccountForm(providerId))
+    ? document.getElementById(groupId || `${providerId}AccountGroup`)
+    : null;
 }
 
 function limitProviderAccountStatus(providerId) {
-  const statusId = LIMIT_PROVIDER_ACCOUNT_STATUS_IDS[providerId];
-  return statusId ? document.getElementById(statusId) : null;
+  const statusId = LIMIT_PROVIDER_ACCOUNT_NODES[providerId]?.status;
+  return (statusId || limitAccountForm(providerId))
+    ? document.getElementById(statusId || `${providerId}AccountStatus`)
+    : null;
 }
 
 function limitProviderConnectionDetail(bodyKey) {
@@ -10298,6 +11100,12 @@ const LIMIT_PROVIDER_SETTINGS = {
     descKey: 'settings.limits.prepaidBalanceDesc',
     requiresConfiguredKey: 'claudeWebCookieConfigured',
     defaultValue: true
+  }],
+  codex: [{
+    key: 'codexResetForecastEnabled',
+    titleKey: 'settings.limits.codexResetForecast',
+    descKey: 'settings.limits.codexResetForecastDesc',
+    defaultValue: false
   }],
   opencode: [{
     key: 'opencodeLocalLimitsEnabled',
@@ -10346,6 +11154,8 @@ function limitProviderSettingsRenderSignature() {
       settingValues,
       state.limitProviderSettingsExpanded
     ],
+    usageItems: [...enabledLimitProviderSet()].sort().map((id) => [id, limitProviderUsageItemRows(id)]),
+    query: limitProviderQuery(),
     providers: (state.stats?.limits?.providers || []).map(providerSignature),
     devices: (state.stats?.devices || []).map(deviceSignature)
   });
@@ -10380,6 +11190,12 @@ function limitProviderSettingsList(providerId, settings, reusableInputs = null) 
     if (!existingInput) {
       input.addEventListener('change', async () => {
         await saveSettings({ [setting.key]: input.checked });
+        if (setting.key === 'codexResetForecastEnabled') {
+          clearCodexResetForecastRetryTimer();
+          state.codexResetForecast = null;
+          state.codexResetForecastRequestedAt = 0;
+          if (input.checked) await refreshCodexResetForecast({ force: true });
+        }
       });
     }
     const desc = document.createElement('span');
@@ -10391,10 +11207,105 @@ function limitProviderSettingsList(providerId, settings, reusableInputs = null) 
   return list;
 }
 
+// The checklist of what a provider's card draws, read off an unfiltered render
+// of its records so it can only name rows the card really has (see
+// shared/limits/usageItems). A hidden item the records no longer draw stays
+// listed, marked unavailable, so it can still be shown again. The renders are
+// kept until the records, the settings or the locale change: the list's render
+// signature asks for them on every pass.
+let limitUsageItemsCache = null;
+function limitProviderUsageItemRows(providerId) {
+  const records = state.stats?.limits?.providers || [];
+  const locale = currentLocale();
+  const cache = limitUsageItemsCache;
+  if (!cache || cache.records !== records || cache.settings !== state.settings || cache.locale !== locale) {
+    limitUsageItemsCache = { records, settings: state.settings, locale, byProvider: new Map() };
+  }
+  const cached = limitUsageItemsCache.byProvider.get(providerId);
+  if (cached) return cached;
+  const fallbackLabel = (itemId) => limitUsageItemsApi.usageItemFallbackLabel(providerId, itemId);
+  const hidden = limitUsageItemsApi.hiddenUsageItemSet(state.settings?.limitProviderHiddenItems, providerId);
+  const drawn = limitWindowsView.limitProviderUsageItems(records.filter((record) => record?.provider === providerId));
+  const rows = drawn.map(({ id, label }) => ({ id, label: label || fallbackLabel(id), hidden: hidden.has(id), available: true }));
+  const drawnIds = new Set(drawn.map(({ id }) => id));
+  for (const id of hidden) {
+    if (drawnIds.has(id)) continue;
+    const label = fallbackLabel(id) || id;
+    rows.push({ id, label, hidden: true, available: false });
+  }
+  limitUsageItemsCache.byProvider.set(providerId, rows);
+  return rows;
+}
+
+function limitProviderUsageItemsList(providerId, items, reusableInputs = null) {
+  const section = document.createElement('div');
+  section.className = 'limit-provider-usage-items';
+  const head = document.createElement('div');
+  head.className = 'limit-provider-usage-items-head';
+  const title = document.createElement('span');
+  title.className = 'limit-provider-usage-items-title';
+  title.textContent = t('settings.limits.usageItems');
+  head.append(title);
+  if (items.some((item) => item.hidden)) {
+    const restore = document.createElement('button');
+    restore.type = 'button';
+    restore.className = 'reset-appearance-button reset-inline';
+    restore.textContent = '↺';
+    restore.title = t('settings.limits.usageItemsRestore');
+    restore.setAttribute('aria-label', restore.title);
+    restore.addEventListener('click', () => commitLimitProviderHiddenItems(
+      limitUsageItemsApi.restoreUsageItemDefaults(state.settings?.limitProviderHiddenItems, providerId)
+    ));
+    head.append(restore);
+  }
+  const list = document.createElement('div');
+  list.className = 'limit-provider-usage-items-list';
+  for (const entry of items) {
+    const item = document.createElement('label');
+    item.className = 'client-checkbox';
+    const inputKey = `${providerId}:item:${entry.id}`;
+    const existingInput = reusableInputs?.get(inputKey);
+    const input = existingInput || document.createElement('input');
+    input.type = 'checkbox';
+    input.dataset.itemId = entry.id;
+    input.checked = !entry.hidden;
+    if (!existingInput) {
+      input.addEventListener('change', () => commitLimitProviderHiddenItems(
+        limitUsageItemsApi.setUsageItemHidden(state.settings?.limitProviderHiddenItems, providerId, entry.id, !input.checked)
+      ));
+    }
+    const text = document.createElement('span');
+    text.textContent = entry.available ? entry.label : t('settings.limits.usageItemUnavailable', { item: entry.label });
+    item.title = text.textContent;
+    item.append(input, text);
+    list.append(item);
+  }
+  section.append(head, list);
+  return section;
+}
+
+// Applied locally before the write, so a second click made while the first is
+// still in flight builds on it instead of on the value the first replaces.
+function commitLimitProviderHiddenItems(next) {
+  state.settings = { ...state.settings, limitProviderHiddenItems: next };
+  saveSettings({ limitProviderHiddenItems: next }).catch(() => {});
+}
+
 async function onToolTrackingToggle() {
-  const checked = Array.from(els.clientDisplayList.querySelectorAll('input[data-preference="track"]'))
-    .filter((cb) => cb.checked)
-    .map((cb) => cb.dataset.client);
+  // The rendered rows are the *visible* ones, so a search filter would make a
+  // pure read of the DOM silently untrack every tracked client the query hides.
+  // The saved value is the stored selection with the rendered checkboxes
+  // applied over it, ordered by the full display order so an unfiltered toggle
+  // still writes exactly the CSV it wrote before.
+  const rendered = [...els.clientDisplayList.querySelectorAll('input[data-preference="track"]')]
+    .map((cb) => [cb.dataset.client, cb.checked]);
+  const checked = settingsListFilterApi.mergeRenderedSelection(
+    enabledClientSet(),
+    rendered,
+    clientDisplayPreferencesApi
+      .orderedClients(KNOWN_CLIENTS, state.settings?.clientDisplayOrder, state.settings?.pinnedClients)
+      .map(({ id }) => id)
+  );
   await saveSettings({ clients: checked.join(',') });
   // `clients` is usage-structural, so settings:update schedules a latest-wins
   // usage reconciliation and the eventual collector runs its own full tick.
@@ -10442,19 +11353,43 @@ async function onProjectVisibilityToggle() {
 }
 
 async function onLimitProviderToggle() {
-  const checked = Array.from(els.limitProviderCheckboxes.querySelectorAll('input[type=checkbox]'))
-    .filter((cb) => cb.checked)
-    .map((cb) => cb.dataset.provider);
+  // Merged rather than read straight off the DOM, for the same reason as
+  // `onToolTrackingToggle`: a search filter hides rows, and a hidden row's
+  // provider must not be dropped from the saved selection.
+  const rendered = [...els.limitProviderCheckboxes.querySelectorAll('input[type=checkbox]')]
+    .filter((cb) => cb.dataset.provider)
+    .map((cb) => [cb.dataset.provider, cb.checked]);
+  const checked = settingsListFilterApi.mergeRenderedSelection(
+    enabledLimitProviderSet(),
+    rendered,
+    limitProviderOrderApi
+      .orderedLimitProviders(LIMIT_PROVIDERS, state.settings?.limitProviderOrder)
+      .map(({ id }) => id)
+  );
   if (checked.length === 0 && state.breakdown === 'limits') {
     setBreakdown('tool');
   }
-  await saveSettings({ limitProviders: checked.join(','), limitsEnabled: checked.length > 0 });
-  clearDisabledLimitProviderPendingChecks(new Set(checked));
-  // settings:update reconfigures LimitsRuntime immediately. Its existing
-  // snapshot and the newly enabled provider's eventual result arrive through
-  // the normal stats push, so a forced usage + all-provider refresh here only
-  // replaces stable account summaries with an interim snapshot and duplicates
-  // collection work.
+  const patch = { limitProviders: checked.join(','), limitsEnabled: checked.length > 0 };
+  // LimitsRuntime publishes its reconfigured snapshot synchronously before the
+  // main process can send settings:push. Keep the renderer on the user's new
+  // selection so that intervening stats frames cannot rebuild this checkbox
+  // from the previous settings and visibly re-check it.
+  const revision = ++state.limitProviderSelectionRevision;
+  state.pendingLimitProviderSelection = { revision, ...patch };
+  try {
+    await saveSettings(patch);
+    clearDisabledLimitProviderPendingChecks(new Set(checked));
+    // settings:update reconfigures LimitsRuntime immediately. Its existing
+    // snapshot and the newly enabled provider's eventual result arrive through
+    // the normal stats push, so a forced usage + all-provider refresh here only
+    // replaces stable account summaries with an interim snapshot and duplicates
+    // collection work.
+  } finally {
+    if (state.pendingLimitProviderSelection?.revision === revision) {
+      state.pendingLimitProviderSelection = null;
+      renderLimitProviderCheckboxes();
+    }
+  }
 }
 
 async function onLimitProviderMove(providerId, direction) {
@@ -10613,32 +11548,6 @@ async function onPreferenceReorder(kind, id, targetIndex) {
   else await onLimitProviderReorder(id, targetIndex);
 }
 
-// Only the handle-based lists commit through here; the two whole-row lists save
-// from their own drag wiring, because this compares against the value they have
-// already mirrored into `state.settings` and would read the write as a no-op.
-async function onPreferenceOrderCommit(kind, order) {
-  const value = (order || []).join(',');
-  if (kind === 'view') {
-    const current = viewDisplayPreferencesApi.normalizeViewDisplayOrder(effectiveViewDisplayOrderValue(), VIEW_DISPLAY_OPTIONS).join(',');
-    if (value !== current) await saveSettings({ viewDisplayOrder: value });
-    return;
-  }
-  if (kind === 'homeModule') {
-    const current = homeModulePreferencesApi.normalizeHomeModuleOrder(state.settings?.homeModuleOrder, HOME_MODULE_OPTIONS).join(',');
-    if (value !== current) await saveSettings({ homeModuleOrder: value });
-    return;
-  }
-  if (kind === 'homeLimitProvider') {
-    const current = limitProviderOrderApi.normalizeLimitProviderOrder(homeLimitProviderOrderValue(), LIMIT_PROVIDERS).join(',');
-    if (value !== current) await saveSettings({ homeLimitProviderOrder: value });
-    return;
-  }
-  if (kind === 'statusProvider') {
-    const current = serviceStatusProviderPreferencesApi.normalizeOrder(state.settings?.serviceProviderDisplayOrder, SERVICE_PROVIDER_OPTIONS).join(',');
-    if (value !== current) await saveSettings({ serviceProviderDisplayOrder: value });
-  }
-}
-
 function onPreferenceOrderKeydown(event, kind, id) {
   const moves = { ArrowUp: 'up', ArrowDown: 'down' };
   if (moves[event.key]) {
@@ -10675,6 +11584,7 @@ async function showAllViews() {
 }
 
 function preserveSettingsPanelScroll(callback) {
+  if (isRendererWindowHidden()) return callback();
   const panel = els.settingsPanel;
   if (!panel || panel.classList.contains('hidden')) return callback();
   const scrollTop = panel.scrollTop;
@@ -10694,19 +11604,53 @@ function preserveSettingsPanelScroll(callback) {
   return result;
 }
 
-async function saveSettings(patch) {
+function setSyncContentEditError(patch, error) {
+  const conflict = window.TokenMonitorSyncContentForm.isConflictError(error);
+  for (const [changed, id] of [
+    [patch.modelAliases !== undefined || patch.modelAliasGrouping !== undefined, 'modelAliasesError'],
+    [patch.customModelPricing !== undefined, 'customPricingSyncError']
+  ]) {
+    if (!changed) continue;
+    const node = document.getElementById(id);
+    if (!node) continue;
+    node.textContent = conflict ? t('settings.sync.content.conflict') : '';
+    node.classList.toggle('hidden', !conflict);
+  }
+}
+
+async function saveSettings(patch, syncContentBase) {
+  setSyncContentEditError(patch, null);
+  for (const key of Object.keys(patch)) delete appearancePreview[key];
   const settingsPushRevision = state.settingsPushRevision;
+  let next;
+  pendingSettingsPatches.add(patch);
   try {
-    state.settings = await window.tokenMonitor.updateSettings(patch);
+    next = await window.tokenMonitor.updateSettings(syncContentForm?.decoratePatch(patch, syncContentBase) || patch);
   } catch (error) {
+    pendingSettingsPatches.delete(patch);
+    syncContentForm?.reportSettingsError(error);
+    setSyncContentEditError(patch, error);
     console.error('Could not persist settings:', error);
     try { state.settings = await window.tokenMonitor.getSettings(); } catch (_) {}
     applyEffectiveCurrencyRates();
     preserveSettingsPanelScroll(syncSettingsForm);
+    if (isSettingsSurfaceVisible()) render(); else statsRenderScheduler.request();
     restartTimer();
     maybeUpdateBarsIcon();
     throw error;
   }
+  pendingSettingsPatches.delete(patch);
+  applyPersistedSettings(next, settingsPushRevision);
+  if (patch.showTrayProviderBadge !== undefined) {
+    await deliverTrayProviderIcons(patch.showTrayProviderBadge === true);
+  }
+  return true;
+}
+
+// The resolved settings of a write that went through settings:update in main,
+// whether the renderer sent it as a patch or as an account credential command.
+function applyPersistedSettings(next, settingsPushRevision) {
+  setRendererSettings(next);
   applyEffectiveCurrencyRates();
   // settings:update broadcasts the normalized settings before resolving the
   // IPC request. The push already ran the full sync; repeating it when the
@@ -10714,13 +11658,10 @@ async function saveSettings(patch) {
   // their accordion/switch layout transition.
   if (state.settingsPushRevision === settingsPushRevision) {
     preserveSettingsPanelScroll(syncSettingsForm);
+    if (isSettingsSurfaceVisible()) render(); else statsRenderScheduler.request();
   }
   restartTimer();
   maybeUpdateBarsIcon();
-  if (patch.showTrayProviderBadge !== undefined) {
-    await deliverTrayProviderIcons(patch.showTrayProviderBadge === true);
-  }
-  return true;
 }
 
 function renderHomeIfVisible() {
@@ -10765,6 +11706,25 @@ window.addEventListener('blur', () => {
 });
 
 async function init() {
+  // Subscribe before querying: a native appearance/accessibility change can
+  // arrive while the initial state round trip is in flight.
+  const materialPush = window.tokenMonitor.onNativeMaterialState;
+  if (typeof materialPush === 'function') {
+    materialPush((next) => {
+      nativeMaterialRevision += 1;
+      nativeMaterialState = glassRenderingApi.normalizeNativeMaterialState(next);
+      glassRenderingApi.applyNativeMaterialClasses(nativeMaterialState);
+      applyAppearanceSettings(Object.assign({}, state.settings, ...pendingSettingsPatches, appearancePreview));
+    });
+  }
+  const materialQueryRevision = nativeMaterialRevision;
+  try {
+    const initialMaterial = await window.tokenMonitor.getNativeMaterialState?.();
+    if (materialQueryRevision === nativeMaterialRevision && initialMaterial) {
+      nativeMaterialState = glassRenderingApi.normalizeNativeMaterialState(initialMaterial);
+      glassRenderingApi.applyNativeMaterialClasses(nativeMaterialState);
+    }
+  } catch (_) {}
   // Subscribed before the app-info round trip, not after: a theme flipped while
   // that call is in flight would otherwise be missed until the next flip. The
   // seeded value then only fills in when no push has already answered.
@@ -10787,6 +11747,8 @@ async function init() {
   if (!systemUiThemeSeeded) state.systemDarkUi = state.appInfo?.systemDarkUi === true;
   if (els.aboutVersion) els.aboutVersion.textContent = state.appInfo?.version ? `v${state.appInfo.version}` : '—';
   state.settings = await window.tokenMonitor.getSettings();
+  syncContentForm?.syncSettings();
+  await syncContentForm?.refresh(false);
   applyEffectiveCurrencyRates();
   deliverTrayProviderIcons();
 
@@ -10807,7 +11769,7 @@ async function init() {
       state.mode = status.mode || state.mode;
       state.streamFailure = status.connected ? null : (status.reason ? { reason: status.reason, detail: status.detail ?? null } : null);
       setLiveDot(state.streamConnected);
-      renderSyncClientStatus();
+      renderSyncPanel();
     }
   } catch (_) {}
   await refreshStats();
@@ -10832,7 +11794,17 @@ for (const tab of document.querySelectorAll('.tab')) {
     if (!setPeriod(targetPeriod)) return;
     syncPeriodTabs();
     if (state.openSession && fixedPeriodRangesApi.supportsBreakdown(state.period, 'session')) {
-      openSessionDetail(state.openSession);
+      if (state.openSession.kind === 'session-group') {
+        const period = state.stats?.periods?.[state.period];
+        const summary = sessionRowsForPeriod(period).find((row) => row.key === state.openSession.summary.key);
+        if (summary) {
+          state.openSession = { kind: 'session-group', period: state.period, summary };
+        } else {
+          state.openSession = null;
+        }
+      } else {
+        openSessionDetail({ ...state.openSession, returnTo: null });
+      }
     } else if (state.openSession) {
       state.openSession = null;
     }
@@ -10909,9 +11881,19 @@ els.breakdown.addEventListener('click', (event) => {
   if (state.breakdown !== 'session') return;
   const rowEl = event.target.closest('.row');
   if (!rowEl) return;
+  if (rowEl.dataset.sessionGroup) {
+    const period = state.stats?.periods?.[state.period];
+    const summary = sessionRowsForPeriod(period).find((row) => row.key === rowEl.dataset.key);
+    if (summary) {
+      const request = { kind: 'session-group', period: state.period, summary };
+      state.openSession = request;
+      renderSessionGroupDetail(request);
+    }
+    return;
+  }
   const key = rowEl.dataset.key || '';            // "session:<client>:<sessionId>"
   const client = rowEl.dataset.client || '';
-  if (client !== 'claude' && client !== 'codex' && client !== 'opencode' && client !== 'reasonix' && client !== 'dsh') return;
+  if (client !== 'claude' && client !== 'codex' && client !== 'opencode' && client !== 'reasonix' && client !== 'dsh' && client !== 'codebuddy' && client !== 'workbuddy') return;
   if (client === 'reasonix' && rowEl.dataset.detailUnavailable === 'true') return;
   const match = key.match(/^session:([^:]+):(.+)$/);
   if (!match) return;
@@ -10928,44 +11910,86 @@ els.breakdown.addEventListener('click', (event) => {
   });
 });
 
-els.pinButton.addEventListener('click', () => {
+els.breakdown.addEventListener('keydown', (event) => {
+  sessionRowsApi.handleBreakdownRowKeydown(event);
+});
+
+els.pinButton.addEventListener('click', (event) => {
+  // Pointer focus would keep .window-actions:focus-within true after the cursor
+  // leaves, pinning the hover-only controls open. Keyboard activation keeps
+  // focus so the controls remain reachable without a pointer.
+  if (event.detail > 0) els.pinButton.blur();
   saveSettings({ windowBehavior: nextWindowBehavior(currentWindowBehavior()) });
 });
 els.settingsButton.addEventListener('click', (event) => {
   if (state.viewSwitcherOpen) setViewSwitcherOpen(false);
   els.settingsPanel.classList.toggle('hidden');
-  const settingsOpen = !els.settingsPanel.classList.contains('hidden');
-  if (!settingsOpen) stopWindowShortcutRecording();
+  const settingsOpen = isSettingsPanelOpen();
+  // Settings is an overlay over a surface that keeps rendering behind it, so
+  // closing it needs no catch-up repaint. Only the panel's own DOM has to be
+  // caught up when it opens, because its renderers idle while it is closed.
+  if (settingsOpen) {
+    syncSettingsForm();
+  } else {
+    syncModeSelect?.close();
+    syncContentForm?.closeHelp();
+    resetSettingsListSearch();
+    stopWindowShortcutRecording();
+  }
   els.shell.classList.toggle('settings-open', settingsOpen);
   if (!settingsOpen && event.detail > 0) els.settingsButton.blur();
   els.shell.style.transform = 'translateZ(0)';
   requestAnimationFrame(() => { els.shell.style.transform = ''; });
+  ensureServiceStatusTicker();
 });
 els.saveSettingsButton.addEventListener('click', async () => {
-  const submittedHubFields = {
-    hubUrl: els.hubUrlInput.value.trim(),
-    secret: els.secretInput.value,
-    deviceId: els.deviceIdInput.value.trim()
-  };
-  const patch = { ...submittedHubFields };
-  if (state.settings.hubMode === 'host') {
-    const hubHostPort = Number(els.hubPortInput.value) || 17321;
-    submittedHubFields.hubHostPort = String(hubHostPort);
-    patch.hubHostPort = hubHostPort;
+  if (hubSaveBusy || !hubDraftHasChanges()) return;
+  hubSaveBusy = true;
+  hubSaveError = false;
+  syncHubConnectionUi();
+  syncHubSaveButton();
+  try {
+    const submittedEditRevision = clientConnectionEditRevision;
+    const submittedHubFields = hubDraftValuesFromInputs();
+    const patch = { ...submittedHubFields };
+    if (Object.prototype.hasOwnProperty.call(submittedHubFields, 'hubHostPort')) {
+      patch.hubHostPort = Number(submittedHubFields.hubHostPort) || 17321;
+    }
+    const submittedHubRevisions = Object.fromEntries(
+      Object.keys(submittedHubFields).map((field) => [field, hubDraftRevisions[field]])
+    );
+    hubSaveInFlightRevisions = submittedHubRevisions;
+    try {
+      await saveSettings(patch);
+    } catch (_) {
+      hubSaveError = true;
+      return;
+    }
+    reconcileHubDraftsAfterSave(submittedHubFields, submittedHubRevisions);
+    finishClientConnectionSave(submittedHubRevisions, submittedEditRevision);
+    await refreshHubInfo();
+    void refreshHubBuildStatus();
+    await refreshStats();
+  } finally {
+    hubSaveInFlightRevisions = null;
+    hubSaveBusy = false;
+    syncHubDraftFields();
+    syncHubSaveButton();
   }
-  const submittedHubRevisions = Object.fromEntries(
-    Object.keys(submittedHubFields).map((field) => [field, hubDraftRevisions[field]])
-  );
-  await saveSettings(patch);
-  reconcileHubDraftsAfterSave(submittedHubFields, submittedHubRevisions);
-  await refreshHubInfo();
-  void refreshHubBuildStatus();
-  await refreshStats();
 });
+
+els.syncConnectionEdit?.addEventListener('click', () => beginClientConnectionEdit({ focus: true }));
+els.syncConnectionCancel?.addEventListener('click', cancelClientConnectionEdit);
+
+els.syncPanelOpenDevices?.addEventListener('click', () => openViewFromTray('device'));
 
 els.hubModeOptions.addEventListener('change', async (event) => {
   const target = event.target;
-  if (!(target instanceof HTMLInputElement) || target.name !== 'hubMode') return;
+  if (target !== els.hubModeOptions) return;
+  if (target.value === 'icloud' && state.appInfo?.platform !== 'darwin') {
+    syncHubModeUi();
+    return;
+  }
   await saveSettings({ hubMode: target.value });
   await refreshHubInfo();
   void refreshHubBuildStatus();
@@ -10991,6 +12015,7 @@ els.appTitleMark?.addEventListener('click', suppressTokenRateClickAfterHold);
 els.liveDot?.addEventListener('click', suppressTokenRateClickAfterHold);
 els.appTitleMark?.addEventListener('click', toggleTokenRateMode);
 els.liveDot?.addEventListener('click', toggleTokenRateMode);
+els.liveTokenRate?.addEventListener('click', toggleTokenRateMode);
 
 els.languageInput?.addEventListener('change', async () => {
   await saveSettings({ language: els.languageInput.value });
@@ -10999,6 +12024,14 @@ els.languageInput?.addEventListener('change', async () => {
 els.currencyInput?.addEventListener('change', async () => {
   await saveSettings({ currency: els.currencyInput.value });
 });
+
+for (const input of els.modelRankingMetricInputs || []) {
+  input.addEventListener('change', async () => {
+    if (!input.checked) return;
+    await saveSettings({ modelRankingMetric: usageAttributionRowsApi.normalizeRankingMetric(input.value) });
+    render();
+  });
+}
 
 els.currencyRateModeAuto?.addEventListener('change', async () => {
   if (!els.currencyRateModeAuto.checked) return;
@@ -11125,6 +12158,9 @@ for (const input of els.showLimitUsedInputs || []) {
 }
 for (const [field, inputId] of HUB_DRAFT_FIELDS) {
   els[inputId]?.addEventListener('input', () => markHubDraftDirty(field));
+  if (CLIENT_CONNECTION_FIELDS.includes(field)) {
+    els[inputId]?.addEventListener('focus', () => beginClientConnectionEdit());
+  }
 }
 els.syncUploadIntervalInput?.addEventListener('change', async () => {
   await saveSettings({ syncUploadIntervalMs: Number(els.syncUploadIntervalInput.value) });
@@ -11189,6 +12225,35 @@ els.exportNowButton?.addEventListener('click', async () => {
 });
 els.resetClientDisplayOrderButton?.addEventListener('click', resetClientDisplayOrder);
 els.showAllClientsButton?.addEventListener('click', showAllClients);
+
+// Escape clears the field rather than closing the settings panel: while a
+// filter is on, that is what the key is expected to undo.
+function bindSettingsListSearch(input, apply) {
+  if (!input) return;
+  input.addEventListener('input', () => apply(input.value));
+  input.addEventListener('search', () => apply(input.value));
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !input.value) return;
+    event.preventDefault();
+    event.stopPropagation();
+    input.value = '';
+    apply('');
+  });
+}
+
+bindSettingsListSearch(els.clientDisplaySearchInput, (value) => {
+  state.toolSearchQuery = value;
+  renderToolPreferences();
+  // The Cursor row's checkbox is disabled from the account status, which is
+  // re-applied by the status render rather than by the list render. Filtering
+  // re-creates that row outside a stats tick, so re-apply it here too.
+  renderCursorStatus();
+});
+
+bindSettingsListSearch(els.limitProviderSearchInput, (value) => {
+  state.limitProviderSearchQuery = value;
+  renderLimitProviderCheckboxes();
+});
 els.resetViewDisplayOrderButton?.addEventListener('click', resetViewDisplayOrder);
 els.showAllViewsButton?.addEventListener('click', showAllViews);
 els.resetGlassButton.addEventListener('click', async () => {
@@ -11201,11 +12266,23 @@ els.resetDepthButton.addEventListener('click', async () => {
   applyAppearanceFromControls();
   await saveSettings({ glassBlur: defaultAppearance.glassBlur });
 });
+els.resetBackgroundImageOpacityButton?.addEventListener('click', async () => {
+  els.backgroundImageOpacityInput.value = String(defaultAppearance.backgroundImageOpacity);
+  applyAppearanceFromControls();
+  await saveSettings({ backgroundImageOpacity: defaultAppearance.backgroundImageOpacity });
+});
 els.glassInput.addEventListener('input', applyAppearanceFromControls);
 els.blurInput.addEventListener('input', applyAppearanceFromControls);
+els.backgroundImageOpacityInput?.addEventListener('input', applyAppearanceFromControls);
 els.zoomInput.addEventListener('input', applyAppearanceFromControls);
+els.chooseBackgroundImageButton?.addEventListener('click', () => { void changeBackgroundImage(); });
+els.clearBackgroundImageButton?.addEventListener('click', () => { void changeBackgroundImage(true); });
+void loadBackgroundImage();
 els.resetThemeColorsButton?.addEventListener('click', () => commitThemeColors({}));
 els.resetVendorColorsButton?.addEventListener('click', () => commitVendorColors({}));
+els.textSizeInput?.addEventListener('change', async () => {
+  await saveSettings({ textSize: fontSettingsApi.normalizeTextSize(els.textSizeInput.value) });
+});
 els.interfaceFontPreset?.addEventListener('change', () => handleFontPresetChange('interface'));
 els.displayFontPreset?.addEventListener('change', () => handleFontPresetChange('display'));
 els.interfaceFontInput?.addEventListener('input', previewFontSettings);
@@ -11230,10 +12307,11 @@ function setSettingsAccordionExpanded(group, toggle, details, expanded) {
   details.inert = !open;
   group.classList.toggle('expanded', open);
 }
-function setupSettingsAccordion(group, toggle, details) {
+function setupSettingsAccordion(group, toggle, details, onExpandedChange) {
   if (!group || !toggle || !details) return;
   toggle.addEventListener('click', () => {
     setSettingsAccordionExpanded(group, toggle, details, details.classList.contains('hidden'));
+    onExpandedChange?.(!details.classList.contains('hidden'));
   });
   setSettingsAccordionExpanded(group, toggle, details, false);
 }
@@ -11241,12 +12319,14 @@ function setupSettingsAccordion(group, toggle, details) {
 setupSettingsAccordion(els.advancedSettingsGroup, els.advancedSettingsToggle, els.advancedSettingsDetails);
 setupSettingsAccordion(els.themeAdvancedGroup, els.themeAdvancedToggle, els.themeAdvancedDetails);
 setupSettingsAccordion(els.themeVendorGroup, els.themeVendorToggle, els.themeVendorDetails);
+setupSettingsAccordion(els.edgeDockMoreOptionsGroup, els.edgeDockMoreOptionsToggle, els.edgeDockMoreOptionsDetails);
 for (const input of els.systemGlassInputs || []) {
   input.addEventListener('change', () => {
     if (input.checked) saveAppearanceFromControls();
   });
 }
 els.windowsBackdropInput?.addEventListener('change', saveAppearanceFromControls);
+els.macBackdropInput?.addEventListener('change', saveAppearanceFromControls);
 for (const input of els.reduceMotionInputs || []) {
   input.addEventListener('change', async () => {
     if (!input.checked) return;
@@ -11264,22 +12344,166 @@ els.titleIconInput.addEventListener('change', saveAppearanceFromControls);
 els.showCompactTotalTokensInput.addEventListener('change', async () => {
   await saveAppearanceFromControls();
 });
+els.showLiveTokenRateInput.addEventListener('change', async () => {
+  state.settings.showLiveTokenRate = els.showLiveTokenRateInput.checked;
+  const liveRateHasScope = state.settings.showLiveTokenRate
+    && tokenRateApi.isSharedSyncMode(state.settings.hubMode);
+  els.liveTokenRateScopeRow?.classList.toggle('hidden', !liveRateHasScope);
+  if (state.settings.showLiveTokenRate) observeLiveTokenRate(state.stats);
+  renderLiveTokenRate();
+  await saveAppearanceFromControls();
+  if (state.settings.showLiveTokenRate) observeLiveTokenRate(state.stats);
+  renderLiveTokenRate();
+});
+els.liveTokenRateScopeInput?.addEventListener('change', async () => {
+  state.settings.liveTokenRateScope = els.liveTokenRateScopeInput.value === 'device' ? 'device' : 'all';
+  resetLiveTokenRateTracking();
+  observeLiveTokenRate(state.stats);
+  renderLiveTokenRate();
+  await saveAppearanceFromControls();
+});
 els.compactTokenUnitsInput?.addEventListener('change', async () => {
   await saveAppearanceFromControls();
 });
-window.addEventListener('resize', () => { if (!numberAnimHandle) fitTotalNumber(); });
+window.addEventListener('resize', () => {
+  if (!numberAnimHandle) fitTotalNumber();
+  refreshFloatingBubbleBitmapForDeviceScale();
+});
 els.swapSettingsRefreshInput.addEventListener('change', () => {
   applyControlLayout(els.swapSettingsRefreshInput.checked);
   void saveAppearanceFromControls();
 });
 els.discordRpcInput.addEventListener('change', saveAppearanceFromControls);
 els.windowBehaviorInput.addEventListener('change', () => saveSettings({ windowBehavior: els.windowBehaviorInput.value }));
+els.keepAboveTaskbarInput?.addEventListener('change', () => saveSettings({ keepAboveTaskbar: els.keepAboveTaskbarInput.checked }));
 els.floatingBubbleInput.addEventListener('change', () => {
   state.settings.floatingBubbleEnabled = els.floatingBubbleInput.checked;
   els.floatingBubbleOptions?.classList.toggle('hidden', !els.floatingBubbleInput.checked);
   refreshTrayComposers();
   saveSettings({ floatingBubbleEnabled: els.floatingBubbleInput.checked });
 });
+// The dock needs positionable, non-activating windows and a global cursor
+// read; Linux (Wayland in particular) offers neither reliably, so the option is
+// only offered on macOS and Windows.
+function edgeDockAvailable() {
+  const platform = state.appInfo?.platform;
+  return platform === 'darwin' || platform === 'win32';
+}
+
+function syncEdgeDockControls() {
+  if (!els.edgeDockInput) return;
+  const available = edgeDockAvailable();
+  els.edgeDockFeature?.classList.toggle('hidden', !available);
+  const enabled = available && state.settings?.edgeDockEnabled === true;
+  els.edgeDockInput.checked = enabled;
+  els.edgeDockOptions?.classList.toggle('hidden', !enabled);
+  const side = state.settings?.edgeDockSide === 'left' ? 'left' : 'right';
+  for (const input of els.edgeDockSideInputs || []) input.checked = input.value === side;
+  const modes = (els.edgeDockModeInputs || []).map((input) => input.value);
+  const mode = modes.includes(state.settings?.edgeDockMode) ? state.settings.edgeDockMode : 'autoHide';
+  for (const input of els.edgeDockModeInputs || []) input.checked = input.value === mode;
+  const sizes = (els.edgeDockSizeInputs || []).map((input) => input.value);
+  const size = sizes.includes(state.settings?.edgeDockSize) ? state.settings.edgeDockSize : 'medium';
+  for (const input of els.edgeDockSizeInputs || []) input.checked = input.value === size;
+  els.edgeDockCustomScaleRow?.classList.toggle('hidden', size !== 'custom');
+  if (els.edgeDockCustomScaleInput && document.activeElement !== els.edgeDockCustomScaleInput) {
+    els.edgeDockCustomScaleInput.value = String(Math.round((Number(state.settings?.edgeDockCustomScale) || 1) * 100));
+    syncSliderRow(els.edgeDockCustomScaleInput);
+  }
+  els.edgeDockHapticRow?.classList.toggle('hidden', state.appInfo?.platform !== 'darwin');
+  if (els.edgeDockHapticInput) els.edgeDockHapticInput.checked = state.settings?.edgeDockHaptic !== false;
+  if (els.edgeDockWarnColorsInput) els.edgeDockWarnColorsInput.checked = state.settings?.edgeDockWarnColors === true;
+  if (els.edgeDockRunningIndicatorInput) els.edgeDockRunningIndicatorInput.checked = state.settings?.edgeDockRunningIndicatorEnabled !== false;
+  if (els.edgeDockMacBackdropInput) {
+    els.edgeDockMacBackdropInput.value = macBackdropApi.normalizeEdgeDockBackdropMode(state.settings?.edgeDockMacBackdrop);
+  }
+  if (enabled) edgeDockComposer?.render();
+}
+
+const edgeDockComposer = els.edgeDockComposer && window.TokenMonitorEdgeDockComposer
+  ? window.TokenMonitorEdgeDockComposer.createEdgeDockComposer({
+    root: els.edgeDockComposer,
+    t,
+    itemsApi: window.TokenMonitorEdgeDockItems,
+    presentationApi: window.TokenMonitorEdgeDockPresentation,
+    getSettings: () => state.settings,
+    getStats: () => state.stats,
+    save: (patch) => saveSettings(patch),
+    providerLabel: (id) => window.TokenMonitorLimitProviders.LIMIT_PROVIDER_LABELS[id] || id,
+    providerColor: (id) => limitProviderColor(id),
+    windowLabel: (record, quotaWindow) => record?.provider === 'codex' && quotaWindow.additional === true
+      ? limitWindowsView.codexAdditionalWindowLabel(
+        quotaWindow,
+        (record.windows || []).filter((entry) => entry?.additional === true)
+      )
+      : limitWindowsView.providerWindowLabel(record, quotaWindow, 'Quota'),
+    hasProviderMark: (id) => limitMarksWithIcon.has(id),
+    // Offer every enabled provider in the user's limits order, including those
+    // without quota data. Keep the ordering rule here rather than in the composer.
+    enabledLimitProviders: () => limitProviderOrderApi
+      .orderedLimitProviders(LIMIT_PROVIDERS, state.settings?.limitProviderOrder)
+      .filter(({ id }) => enabledLimitProviderSet().has(id))
+      .map(({ id }) => id),
+    isWindowHidden: (providerId, quotaWindow) => limitUsageItemsApi.isLimitWindowHidden(
+      state.settings?.limitProviderHiddenItems, providerId, quotaWindow
+    ),
+    maskEmail: (email) => (state.settings?.maskLimitAccountEmails === true
+      ? accountIdentityApi.maskEmailAddress(email)
+      : String(email || '')),
+    mimoProductLabel,
+    createRowDrag: (config) => rowDragControllerApi.createRowDragController({
+      dragSort: verticalDragSortApi,
+      getScrollPanel: () => els.settingsPanel,
+      preserveScroll: preserveSettingsPanelScroll,
+      ...config
+    })
+  })
+  : null;
+
+els.edgeDockInput?.addEventListener('change', () => {
+  state.settings.edgeDockEnabled = els.edgeDockInput.checked;
+  els.edgeDockOptions?.classList.toggle('hidden', !els.edgeDockInput.checked);
+  void saveSettings({ edgeDockEnabled: els.edgeDockInput.checked });
+});
+for (const input of els.edgeDockSideInputs || []) {
+  input.addEventListener('change', () => {
+    if (input.checked) void saveSettings({ edgeDockSide: input.value });
+  });
+}
+els.edgeDockWarnColorsInput?.addEventListener('change', () => {
+  void saveSettings({ edgeDockWarnColors: els.edgeDockWarnColorsInput.checked });
+});
+els.edgeDockRunningIndicatorInput?.addEventListener('change', () => {
+  void saveSettings({ edgeDockRunningIndicatorEnabled: els.edgeDockRunningIndicatorInput.checked });
+});
+els.edgeDockMacBackdropInput?.addEventListener('change', () => {
+  void saveSettings({ edgeDockMacBackdrop: macBackdropApi.normalizeEdgeDockBackdropMode(els.edgeDockMacBackdropInput.value) });
+});
+els.edgeDockHapticInput?.addEventListener('change', () => {
+  void saveSettings({ edgeDockHaptic: els.edgeDockHapticInput.checked });
+});
+for (const input of els.edgeDockModeInputs || []) {
+  input.addEventListener('change', () => {
+    if (input.checked) void saveSettings({ edgeDockMode: input.value });
+  });
+}
+for (const input of els.edgeDockSizeInputs || []) {
+  input.addEventListener('change', () => {
+    if (!input.checked) return;
+    els.edgeDockCustomScaleRow?.classList.toggle('hidden', input.value !== 'custom');
+    void saveSettings({ edgeDockSize: input.value });
+  });
+}
+// Like the Zoom slider: the dock previews each step while the slider is dragged
+// and the size is saved on release, since a save redraws the settings form.
+els.edgeDockCustomScaleInput?.addEventListener('input', () => {
+  syncSliderRow(els.edgeDockCustomScaleInput);
+  window.tokenMonitor.previewAppearance?.({ edgeDockCustomScale: Number(els.edgeDockCustomScaleInput.value) / 100 }).catch(() => {});
+});
+els.edgeDockCustomScaleInput?.addEventListener('change', () => {
+  void saveSettings({ edgeDockCustomScale: Number(els.edgeDockCustomScaleInput.value) / 100 });
+});
+
 for (const input of els.floatingBubbleTriggerInputs || []) {
   input.addEventListener('change', () => {
     if (input.checked) void saveSettings({ floatingBubbleTrigger: input.value });
@@ -11300,12 +12524,24 @@ els.showTrayIconInput?.addEventListener('change', () => {
   els.showTrayProviderBadgeInput.disabled = !showTrayIcon;
   els.trayIconOptions?.classList.toggle('hidden', !showTrayIcon);
   els.trayOptions?.classList.toggle('hidden', !showTrayIcon || !els.trayModeInput.checked);
+  if (!showTrayIcon) state.settings.hideAppIcon = false;
+  syncHideAppIconControl(showTrayIcon, els.trayModeInput.checked);
   refreshTrayComposers();
-  saveSettings({ showTrayIcon, trayMode: showTrayIcon ? els.trayModeInput.checked : false });
+  saveSettings({
+    showTrayIcon,
+    trayMode: showTrayIcon ? els.trayModeInput.checked : false,
+    hideAppIcon: showTrayIcon ? Boolean(state.settings.hideAppIcon) : false
+  });
 });
 els.trayModeInput.addEventListener('change', () => {
   els.trayOptions?.classList.toggle('hidden', !els.showTrayIconInput?.checked || !els.trayModeInput.checked);
+  syncHideAppIconControl(els.showTrayIconInput?.checked !== false, els.trayModeInput.checked);
   saveSettings({ trayMode: els.trayModeInput.checked });
+});
+els.hideAppIconInput?.addEventListener('change', () => {
+  state.settings.hideAppIcon = els.hideAppIconInput.checked;
+  els.hideAppIconOptions?.classList.toggle('hidden', !els.hideAppIconInput.checked);
+  saveSettings({ hideAppIcon: els.hideAppIconInput.checked });
 });
 els.trayContentInput.addEventListener('change', () => {
   state.settings.trayContent = els.trayContentInput.value;
@@ -11322,6 +12558,7 @@ els.windowToggleShortcutClearButton?.addEventListener('click', () => setWindowTo
 els.startAtLoginInput?.addEventListener('change', () => saveSettings({ startAtLogin: els.startAtLoginInput.checked }));
 els.glassInput.addEventListener('change', saveAppearanceFromControls);
 els.blurInput.addEventListener('change', saveAppearanceFromControls);
+els.backgroundImageOpacityInput?.addEventListener('change', saveAppearanceFromControls);
 els.zoomInput.addEventListener('change', saveAppearanceFromControls);
 els.resetZoomButton.addEventListener('click', async () => {
   els.zoomInput.value = String(Math.round(defaultAppearance.zoomFactor * 100));
@@ -11329,9 +12566,6 @@ els.resetZoomButton.addEventListener('click', async () => {
   await saveSettings({ zoomFactor: defaultAppearance.zoomFactor });
 });
 els.openConfigButton.addEventListener('click', () => window.tokenMonitor.openUserData());
-els.checkTokscaleButton?.addEventListener('click', checkTokscaleNpm);
-els.downloadTokscaleButton?.addEventListener('click', downloadTokscaleFromNpm);
-els.resetTokscaleButton?.addEventListener('click', resetTokscaleToBundled);
 els.openTokscaleLinkButton?.addEventListener('click', () => window.tokenMonitor.openExternal?.('https://github.com/junhoyeo/tokscale'));
 els.openRepositoryButton?.addEventListener('click', () => window.tokenMonitor.openExternal?.(TOKEN_MONITOR_REPOSITORY_URL));
 els.openWebsiteButton?.addEventListener('click', () => window.tokenMonitor.openExternal?.(TOKEN_MONITOR_WEBSITE_URL));
@@ -11344,8 +12578,14 @@ els.refreshButton.addEventListener('click', () => {
   // on every one of them.
   else refreshStats({ force: true, forceHistory: true, forceSelfSync: true, feedback: true });
 });
-els.minButton.addEventListener('click', () => window.tokenMonitor.minimize());
-els.closeButton.addEventListener('click', () => window.tokenMonitor.close());
+els.minButton.addEventListener('click', (event) => {
+  if (event.detail > 0) els.minButton.blur();
+  window.tokenMonitor.minimize();
+});
+els.closeButton.addEventListener('click', (event) => {
+  if (event.detail > 0) els.closeButton.blur();
+  window.tokenMonitor.close();
+});
 els.trendsPanel.addEventListener('click', (event) => {
   if (event.target.closest('.trends-spark, .trends-open-hint')) window.tokenMonitor.openDashboard();
 });
@@ -11372,24 +12612,24 @@ els.floatingBubbleTab.addEventListener('keydown', (event) => {
 window.tokenMonitor.onSettingsPush?.((next) => {
   if (!next) return;
   state.settingsPushRevision += 1;
-  const prevMetric = state.settings?.heatmapMetric;
-  const prevLanguage = state.settings?.language;
-  const prevCompactTokenUnits = state.settings?.compactTokenUnits;
-  const prevShowCompactTotalTokens = state.settings?.showCompactTotalTokens;
-  state.settings = next;
-  applyEffectiveCurrencyRates();
-  preserveSettingsPanelScroll(syncSettingsForm);
-  maybeUpdateBarsIcon();
-  if ((prevMetric || 'cost') !== (next.heatmapMetric || 'cost')) {
-    render();
-  } else if (
-    prevLanguage !== next.language
-    || prevCompactTokenUnits !== next.compactTokenUnits
-  ) {
-    render();
-  } else if (prevShowCompactTotalTokens !== next.showCompactTotalTokens) {
-    updateTotalCompact(state.currentTotal);
+  for (const key of Object.keys(appearancePreview)) {
+    if (JSON.stringify(next[key]) !== JSON.stringify(state.settings?.[key])) delete appearancePreview[key];
   }
+  setRendererSettings(next);
+  applyEffectiveCurrencyRates();
+  observeDisplayLiveTokenRates(state.stats);
+  preserveSettingsPanelScroll(syncSettingsForm);
+  if (isSettingsSurfaceVisible()) render(); else statsRenderScheduler.request();
+  maybeUpdateBarsIcon();
+});
+
+window.tokenMonitor.codex.onActiveAccount?.((account) => {
+  if (!account) return;
+  applyCodexOptimisticActiveAccount(account);
+  renderLimits();
+  renderCodexAccounts();
+  renderSettingsSummaries();
+  maybeUpdateBarsIcon();
 });
 
 reducedMotionMedia?.addEventListener?.('change', () => {
@@ -11407,76 +12647,133 @@ window.tokenMonitor.onFloatingBubbleState?.((payload) => {
 window.tokenMonitor.onHubPush?.((payload) => {
   if (!payload?.info) return;
   state.hubInfo = payload.info;
+  if (payload.info.icloud) state.icloudStatus = payload.info.icloud;
+  const settingsVisible = isSettingsSurfaceVisible();
   // The first switch to Host mode generates the shared secret asynchronously
   // after settings:update has already returned, so mirror the freshly minted
   // value back into state + input — otherwise the Shared Secret field stays
   // blank and other devices can't pair until the user clicks Regenerate.
   if (payload.info.secret && payload.info.secret !== state.settings?.hubHostSecret) {
     state.settings = { ...state.settings, hubHostSecret: payload.info.secret };
-    if (els.hubSecretInput && state.settings.hubMode === 'host') {
+    if (settingsVisible && els.hubSecretInput && state.settings.hubMode === 'host') {
       els.hubSecretInput.value = payload.info.secret;
     }
   }
-  renderHubStatus();
+  if (settingsVisible) renderHubStatus();
 });
 
-window.tokenMonitor.onTokscalePush?.((payload) => {
-  mergeTokscalePayload(payload);
-  renderTokscaleStatus();
-});
+function renderConnectionStatus(surface = visibleStatsSurface()) {
+  if (surface !== 'main') return;
+  setLiveDot(state.streamConnected);
+  setStatus(statusTextFor(state.mode, state.streamConnected));
+  if (isSettingsSurfaceVisible()) renderSyncPanel();
+}
 
 function renderStatsUpdate() {
+  const surface = visibleStatsSurface();
+  renderConnectionStatus(surface);
+  if (surface === 'bubble') {
+    renderFloatingBubbleContent();
+    signalContentReady();
+    return;
+  }
+  if (surface !== 'main') return;
   render();
+  if (!isSettingsSurfaceVisible()) return;
   renderCodexAccounts();
+  renderMimoStatus();
   renderSettingsSummaries();
   renderLimitProviderCheckboxes();
   renderToolPreferences();
   renderWslPanel();
   updateOpenRouterProfilesStatus();
   updateThirdPartyProfilesStatus();
-  renderDeepseekStatus();
-  renderMinimaxStatus();
-  renderExternalProviderStatus('claude');
-  renderExternalProviderStatus('zai');
-  renderExternalProviderStatus('zaiteam');
   renderExternalProviderStatus('volcengine');
-  renderExternalProviderStatus('qoder');
-  renderExternalProviderStatus('trae');
-  renderExternalProviderStatus('commandcode');
   renderExternalProviderStatus('kimi');
-  renderExternalProviderStatus('ollama');
+  for (const form of state.settings?.limitAccountForms || []) {
+    if (limitProviderAccountGroup(form.id)) renderExternalProviderStatus(form.id);
+  }
   renderCopilotStatus();
+  signalContentReady();
 }
 
 const statsRenderScheduler = statsRenderSchedulerApi.createStatsRenderScheduler({
-  isHidden: () => document.hidden,
+  isHidden: isRendererWindowHidden,
   render: renderStatsUpdate
 });
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) cancelTokenRateBoost();
-  if (!document.hidden && state.settings?.hubMode === 'client' && hubBuildStatusRefreshDue()) {
+// Pulled once up front, then only while something on screen reads it: the
+// archived count in Settings, or TOTAL sessions/projects. Bot identity arrives
+// in a compact snapshot projection and does not need a full history pull.
+function allTimeSessionsNeeded() {
+  if (!allTimeSessions.loaded() || isSettingsPanelOpen()) return true;
+  return state.period === 'allTime' && (state.breakdown === 'session' || state.breakdown === 'project');
+}
+const allTimeSessions = allTimeSessionsApi.createAllTimeSessionsLoader({
+  fetchSessions: (snapshotId) => window.tokenMonitor.getAllTimeSessions(snapshotId),
+  currentSnapshot: () => state.stats?.snapshot,
+  needed: allTimeSessionsNeeded,
+  projectSessions: (sessions) => state.settings?.sessionTitlesEnabled === false
+    ? window.TokenMonitorSessionTitleDisplay.withoutSessionTitles(sessions) : sessions,
+  projectionKey: () => state.settings?.sessionTitlesEnabled !== false,
+  onLoaded: () => {
+    if (state.stats) state.stats = sessionStatsForDisplay(allTimeSessions.attach(state.stats));
+    statsRenderScheduler.request();
+  },
+  onError: (error) => console.log(`[stats] all-time sessions failed: ${error?.message || error}`)
+});
+function handleWindowVisibilityChange() {
+  if (els.syncPanelSignal) els.syncPanelSignal.dataset.windowHidden = String(isRendererWindowHidden());
+  if (!statsRenderScheduler.visibilityChanged()) return;
+  if (isRendererWindowHidden()) cancelTokenRateBoost();
+  else applyFloatingBubbleState(state.floatingBubble, { renderContent: false });
+  if (!isRendererWindowHidden() && state.settings?.hubMode === 'client' && hubBuildStatusRefreshDue()) {
     void refreshHubBuildStatus();
   }
+  const settingsVisible = isSettingsSurfaceVisible();
+  if (settingsVisible || settingsDomSyncPending) syncSettingsForm();
   statsRenderScheduler.flush();
+  if (settingsVisible) {
+    renderConnectionStatus();
+    // syncSettingsForm() is not a stats render, so a window revealed straight
+    // into Settings still needs to report that its visible content has painted.
+    signalContentReady();
+  }
+  ensureServiceStatusTicker();
+}
+document.addEventListener('visibilitychange', handleWindowVisibilityChange);
+window.tokenMonitor.onWindowVisibilityPush?.((visible) => {
+  state.windowVisible = visible;
+  handleWindowVisibilityChange();
 });
 
 window.tokenMonitor.onStatsPush?.((payload) => {
   if (!payload) return;
+  if (payload.event === 'session-activity') {
+    localSessionActivity = payload.data;
+    state.stats = applyLocalSessionActivity(state.stats);
+    statsRenderScheduler.request();
+    return;
+  }
   const wasStreamConnected = state.streamConnected;
   if (payload.event === 'status') {
     state.streamConnected = Boolean(payload.data?.connected);
     if (payload.data?.mode) state.mode = payload.data.mode;
+    if (payload.data?.icloud) state.icloudStatus = payload.data.icloud;
     state.streamFailure = state.streamConnected ? null : (payload.data?.reason ? { reason: payload.data.reason, detail: payload.data.detail ?? null } : state.streamFailure);
   } else if (payload.data?.stats) {
-    // Local collector overlays update client-mode data independently of the
+    // Local overlays and adopted reads update data independently of the
     // Hub SSE transport. Preserve its current Offline/error state until a
     // real stream status or remote stats event proves the connection changed.
-    if (payload.data?.reason !== 'local' && payload.data?.reason !== 'presentation') {
+    if (!['local', 'presentation', 'read'].includes(payload.data?.reason)) {
       state.streamConnected = true;
       state.streamFailure = null;
     }
     if (payload.data?.mode) state.mode = payload.data.mode;
-    state.stats = overlayAllTimeSessions(payload.data.stats);
+    if (payload.data?.icloud) state.icloudStatus = payload.data.icloud;
+    allTimeSessions.invalidate();
+    state.stats = sessionStatsForDisplay(allTimeSessions.attach(payload.data.stats));
+    observeLiveTokenRate(state.stats);
+    observeDisplayLiveTokenRates(state.stats);
     applyCodexActiveAccountFromStats();
     // Progressive mid-tick pushes never carry a fresh history scan (see
     // AGENTS.md collector notes), so only the final push can retire the
@@ -11485,11 +12782,13 @@ window.tokenMonitor.onStatsPush?.((payload) => {
   } else {
     return;
   }
-  setLiveDot(state.streamConnected);
-  setStatus(statusTextFor(state.mode, state.streamConnected));
-  renderSyncClientStatus();
+  if (payload.event === 'status') {
+    if (isRendererWindowHidden()) statsRenderScheduler.request();
+    else renderConnectionStatus();
+  }
   if (!wasStreamConnected && state.streamConnected && state.settings?.hubMode === 'client') {
     void refreshHubBuildStatus();
+    void syncContentForm?.refresh();
   }
   if (payload.data?.stats) {
     if (fixedPeriodRangesApi.isDerived(state.period)) {
@@ -12198,24 +13497,25 @@ function renderCustomTrayItemCanvas(item, height = 44, colors = {}, options = {}
 }
 
 function renderCustomTrayLayout(stats, layout, height = 44, colors = {}, options = {}) {
-  const activeCodex = localLiveCodexProvider();
-  const activeCodexKey = activeCodex?.accountKey
-    && (stats?.limits?.providers || []).some((provider) => (
-      provider?.provider === 'codex' && provider?.accountKey === activeCodex.accountKey
-    ))
-    ? activeCodex.accountKey
-    : '';
+  const codexProviders = (stats?.limits?.providers || []).filter((provider) => provider?.provider === 'codex');
+  const selectedCodexKey = String(state.codexActiveAccount?.accountKey || '').trim();
+  const detectedCodexKey = String(localLiveCodexProvider()?.accountKey || '').trim();
+  const activeCodexKey = [selectedCodexKey, detectedCodexKey].find((accountKey) => (
+    accountKey && codexProviders.some((provider) => provider.accountKey === accountKey)
+  )) || '';
   const resolved = trayLayoutApi.resolveTrayLayout(layout, stats, {
     currency: currentCurrency(),
     ...compactTokenDisplayOptions(),
     nowMs: Date.now(),
     activeAccountKeys: activeCodexKey ? { codex: activeCodexKey } : {},
-    availableProviderIds: Object.keys(trayProviderImages)
+    availableProviderIds: Object.keys(trayProviderImages),
+    liveTokenRates: options.liveTokenRates || displayLiveTokenRateSamples(),
+    liveTokenRateFormatter: options.liveTokenRateFormatter || ((value) => formatLiveTokenRate(value))
   });
   const items = resolved.items.map((item) => (
     item.type === 'text'
       && item.metric === 'account'
-      && limitAccountEmailsMasked()
+      && state.settings?.maskLimitAccountEmails === true
       ? { ...item, text: accountIdentityApi.maskEmailAddress(item.text) }
       : item
   ));
@@ -12241,7 +13541,26 @@ function barsDataUrlForMode(mode, size = 44, colors, options = {}) {
   return renderBarsIcon(stats, size, pickers[mode] || pickWorstProvider, colors, options);
 }
 
+function liveTokenRateTrayLayout() {
+  return {
+    version: trayLayoutApi.VERSION,
+    items: [
+      trayLayoutApi.createTrayLayoutItem('appIcon', { idFactory: () => 'live-rate-app-icon' }),
+      trayLayoutApi.createTrayLayoutItem('liveTokenRate', { idFactory: () => 'live-rate-value' })
+    ]
+  };
+}
+
 function trayDataUrlForMode(mode, size = 44, colors, options = {}) {
+  if (mode === 'liveTokenRate') {
+    return renderCustomTrayLayout(
+      options.stats || state.stats || statsForTrayComposer(),
+      liveTokenRateTrayLayout(),
+      size,
+      colors,
+      options
+    );
+  }
   if (mode === 'custom') {
     return renderCustomTrayLayout(
       options.stats || state.stats || statsForTrayComposer(),
@@ -12261,7 +13580,12 @@ function trayDataUrlForMode(mode, size = 44, colors, options = {}) {
 }
 
 async function maybeUpdateBarsIcon(options = {}) {
-  if (options.refreshComposers !== false) refreshTrayComposers();
+  if (options.refreshComposers !== false && isSettingsSurfaceVisible()) {
+    refreshTrayComposers();
+    if (edgeDockAvailable() && state.settings?.edgeDockEnabled === true) edgeDockComposer?.render();
+  } else {
+    syncCustomTrayClockTimer();
+  }
   const mode = state.settings?.trayContent;
   if (!window.TokenMonitorTrayText.isGeneratedTrayIconMode(mode)) return;
   if (!window.tokenMonitor.setTrayIcons) return;
@@ -12369,7 +13693,7 @@ function trayComposerWindowLabel(entry) {
   const kindLabel = translatedKind === kindKey ? t('trayComposer.window.primary') : translatedKind;
   const rawLabel = String(entry.label || '').trim();
   const normalizedLabel = rawLabel.toLowerCase();
-  const redundantLabels = new Set([kind, 'session', 'weekly', 'billing', 'total']);
+  const redundantLabels = new Set([kind, 'session', 'daily', 'weekly', 'billing', 'total']);
   if (!rawLabel || redundantLabels.has(normalizedLabel)) return kindLabel;
   return `${kindLabel} · ${rawLabel}`;
 }
@@ -12476,7 +13800,7 @@ function trayComposerPreview(surface) {
     // icons in colour, so no templateIconColor here — that is a menu-bar-only
     // requirement and would preview the bubble as monochrome.
     return {
-      src: trayDataUrlForMode(mode, 44, floatingBubbleGeneratedColors(), {
+      src: trayDataUrlForMode(mode, currentFloatingBubbleBitmapHeight(), floatingBubbleGeneratedColors(), {
         stats,
         layout: state.settings?.[layoutKey],
         contentOnly: mode === 'barsAllSessions' || mode === 'limitsAllSessions',
@@ -12540,6 +13864,7 @@ function createTrayComposer(surface) {
     label: t,
     onLayoutChange: (nextLayout, { commit }) => {
       state.settings[layoutKey] = trayLayoutApi.normalizeTrayLayout(nextLayout);
+      observeDisplayLiveTokenRates(state.stats);
       if (isTray) void maybeUpdateBarsIcon({ refreshComposers: commit });
       else {
         renderFloatingBubbleContent();
@@ -12548,6 +13873,26 @@ function createTrayComposer(surface) {
       if (commit) void saveSettings({ [layoutKey]: state.settings[layoutKey] });
     }
   });
+}
+
+function syncCustomTrayClockTimer() {
+  const clockNeeded = (
+    state.settings?.trayContent === 'custom'
+      && trayLayoutApi.trayLayoutNeedsClock(state.settings?.trayCustomLayout)
+  ) || (
+    state.settings?.floatingBubbleContent === 'custom'
+      && trayLayoutApi.trayLayoutNeedsClock(state.settings?.floatingBubbleCustomLayout)
+  );
+  if (clockNeeded && !customTrayClockTimer) {
+    customTrayClockTimer = setInterval(() => {
+      void maybeUpdateBarsIcon({ refreshComposers: false });
+      if (isRendererWindowHidden()) statsRenderScheduler.request();
+      else renderFloatingBubbleContent();
+    }, 30 * 1000);
+  } else if (!clockNeeded && customTrayClockTimer) {
+    clearInterval(customTrayClockTimer);
+    customTrayClockTimer = null;
+  }
 }
 
 function refreshTrayComposers() {
@@ -12561,22 +13906,7 @@ function refreshTrayComposers() {
     createTrayComposer
   );
   Object.values(trayComposers).forEach((composer) => composer?.refresh());
-  const clockNeeded = (
-    state.settings?.trayContent === 'custom'
-      && trayLayoutApi.trayLayoutNeedsClock(state.settings?.trayCustomLayout)
-  ) || (
-    state.settings?.floatingBubbleContent === 'custom'
-      && trayLayoutApi.trayLayoutNeedsClock(state.settings?.floatingBubbleCustomLayout)
-  );
-  if (clockNeeded && !customTrayClockTimer) {
-    customTrayClockTimer = setInterval(() => {
-      void maybeUpdateBarsIcon({ refreshComposers: false });
-      renderFloatingBubbleContent();
-    }, 30 * 1000);
-  } else if (!clockNeeded && customTrayClockTimer) {
-    clearInterval(customTrayClockTimer);
-    customTrayClockTimer = null;
-  }
+  syncCustomTrayClockTimer();
 }
 
 function loadImage(src) {
@@ -12677,14 +14007,14 @@ function setAccountGroupExpanded(prefix, expanded, stateKey) {
   if (!toggle || !details) return;
   const next = Boolean(expanded);
   if (stateKey) state[stateKey] = next;
-  toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
-  details.classList.toggle('hidden', !next);
-  if (group) group.classList.toggle('expanded', next);
-  syncLimitProviderAccountExpansion(prefix, next);
+  accountShellApi.setExpanded({
+    toggle, details, group, expanded: next,
+    onChange: (open) => syncLimitProviderAccountExpansion(prefix, open)
+  });
 }
 
 function syncLimitProviderAccountExpansion(providerId, expanded) {
-  if (!LIMIT_PROVIDER_ACCOUNT_GROUP_IDS[providerId]) return;
+  if (!LIMIT_PROVIDER_ACCOUNT_NODES[providerId] && !limitAccountForm(providerId)) return;
   if (expanded) {
     setLimitProviderSettingsExpanded(providerId);
   } else if (state.limitProviderSettingsExpanded === providerId) {
@@ -12698,6 +14028,10 @@ function setCodexAccountExpanded(expanded) {
 
 function setCursorAccountExpanded(expanded) {
   setAccountGroupExpanded('cursor', expanded, 'cursorAccountExpanded');
+}
+
+function setAntigravityAccountExpanded(expanded) {
+  setAccountGroupExpanded('antigravity', expanded, 'antigravityAccountExpanded');
 }
 
 function setOpencodeCookieExpanded(expanded) {
@@ -12795,12 +14129,16 @@ function setThirdPartyAdapterFields() {
   }
 }
 
-function setDeepseekAccountExpanded(expanded) {
-  setAccountGroupExpanded('deepseek', expanded, 'deepseekAccountExpanded');
-}
 
 function setMimoAccountExpanded(expanded) {
   setAccountGroupExpanded('mimo', expanded, 'mimoAccountExpanded');
+}
+
+async function refreshMimoAccounts() {
+  try {
+    state.settings.mimoManagedAccounts = await window.tokenMonitor.mimo.accounts() || [];
+    renderMimoStatus();
+  } catch (_) {}
 }
 
 function setCopilotAccountExpanded(expanded) {
@@ -12837,8 +14175,7 @@ function renderCodexLoginStatus() {
   addButton.classList.toggle('hidden', state.codexSignInBusy);
   cancelButton.classList.toggle('hidden', !state.codexSignInBusy);
   refreshButton.classList.toggle('hidden', state.codexSignInBusy);
-  statusEl.textContent = state.codexLoginStatus;
-  statusEl.classList.toggle('hidden', !state.codexLoginStatus);
+  accountShellApi.render({ progress: statusEl, progressText: state.codexLoginStatus });
   workspaceSelection.classList.toggle('hidden', state.codexWorkspaceChoices.length === 0);
   workspaceSelect.replaceChildren(...state.codexWorkspaceChoices.map((workspace) => {
     const option = document.createElement('option');
@@ -12857,6 +14194,7 @@ function renderCodexLoginStatus() {
 }
 
 function renderCodexAccounts() {
+  if (!isSettingsSurfaceVisible()) return;
   const statusEl = document.getElementById('codexAccountStatus');
   const listEl = document.getElementById('codexAccountList');
   const errorEl = document.getElementById('codexAccountErrorMessage');
@@ -12867,9 +14205,7 @@ function renderCodexAccounts() {
   const statusText = accounts.length === 0
     ? t('settings.codex.notConfigured')
     : t('settings.opencode.connected', { linked: enabledCount, total: accounts.length });
-  setCursorStatusText(statusEl, statusText);
-  errorEl.textContent = state.codexAccountError || '';
-  errorEl.classList.toggle('hidden', !state.codexAccountError);
+  accountShellApi.render({ status: statusEl, statusText, error: errorEl, errorText: state.codexAccountError });
   listEl.replaceChildren();
   if (accounts.length === 0) {
     const empty = document.createElement('p');
@@ -13005,40 +14341,138 @@ function localProviderStatuses(name) {
   return providers.filter((provider) => provider.provider === name);
 }
 
-function deepseekAccountLinked() {
-  const provider = deepseekProviderForAccount();
-  return Boolean(state.settings?.deepseekApiKeyConfigured) && provider?.status === 'ok';
+function renderAntigravityStatus() {
+  if (!isSettingsSurfaceVisible()) return;
+  const statusEl = document.getElementById('antigravityAccountStatus');
+  const listEl = document.getElementById('antigravityAccountList');
+  const errorEl = document.getElementById('antigravityAccountErrorMessage');
+  const statusMessage = document.getElementById('antigravityLoginStatus');
+  const addButton = document.getElementById('antigravityAddAccountButton');
+  const cancelButton = document.getElementById('antigravityCancelLoginButton');
+  if (!statusEl || !listEl || !errorEl || !addButton || !cancelButton) return;
+  const accounts = state.settings?.antigravityManagedAccounts || [];
+  const enabledCount = accounts.filter((account) => account.enabled !== false).length;
+  accountShellApi.render({
+    status: statusEl,
+    statusText: accounts.length === 0
+      ? t('settings.antigravity.notConfigured')
+      : t('settings.antigravity.connected', { linked: enabledCount, total: accounts.length }),
+    error: errorEl,
+    errorText: state.antigravityAccountError,
+    progress: statusMessage,
+    progressText: state.antigravitySignInBusy ? t('settings.antigravity.loginStatus') : ''
+  });
+  addButton.disabled = state.antigravitySignInBusy;
+  addButton.textContent = t(state.antigravitySignInBusy
+    ? 'settings.antigravity.waitingForGoogle'
+    : 'settings.antigravity.addAccount');
+  cancelButton.classList.toggle('hidden', !state.antigravitySignInBusy);
+
+  listEl.replaceChildren();
+  if (accounts.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'settings-note';
+    empty.textContent = t('settings.antigravity.empty');
+    listEl.append(empty);
+  }
+  const antigravityProviders = localProviderStatuses('antigravity');
+  accounts.forEach((account, index) => {
+    const enabled = account.enabled !== false;
+    const accountName = String(account.accountEmail || account.accountLabel || '').trim()
+      || t('settings.antigravity.accountFallback', { number: index + 1 });
+    const row = document.createElement('div');
+    row.className = 'managed-account-row';
+    row.classList.toggle('disabled', !enabled);
+
+    const input = document.createElement('input');
+    input.className = 'managed-account-checkbox';
+    input.type = 'checkbox';
+    input.checked = enabled;
+    input.disabled = state.antigravitySignInBusy;
+    input.setAttribute('aria-label', t('settings.antigravity.toggleAccount', { account: accountName }));
+    input.addEventListener('change', async () => {
+      input.disabled = true;
+      const result = await window.tokenMonitor.antigravity.setAccountEnabled(account.id, input.checked);
+      if (!result?.ok) state.antigravityAccountError = result?.error || t('settings.antigravity.toggleFailed');
+      else {
+        state.antigravityAccountError = '';
+        state.settings.antigravityManagedAccounts = result.accounts || [];
+      }
+      renderAntigravityStatus();
+      renderSettingsSummaries();
+    });
+
+    const main = document.createElement('div');
+    main.className = 'managed-account-main';
+    const email = document.createElement('div');
+    email.className = 'managed-account-email';
+    email.textContent = accountName;
+    main.append(email);
+
+    const right = document.createElement('span');
+    right.className = 'managed-account-right';
+    const info = document.createElement('span');
+    info.className = 'managed-account-info';
+    const accountKey = String(account.accountKey || '').trim();
+    const accountEmail = String(account.accountEmail || '').trim().toLowerCase();
+    const provider = antigravityProviders.find((candidate) => {
+      const providerKey = String(candidate?.accountKey || '').trim();
+      const providerEmail = String(candidate?.accountEmail || '').trim().toLowerCase();
+      if (accountKey && providerKey) return accountKey === providerKey;
+      return Boolean(accountEmail && providerEmail && accountEmail === providerEmail);
+    });
+    const planLabel = limitProviderPresentationApi.limitProviderDisplayLabel(provider?.accountLabel);
+    const statusLabel = provider && provider.status !== 'ok'
+      ? translatedLimitProviderTag(limitProviderPresentationApi.limitProviderStatusLabel(provider))
+      : '';
+    info.textContent = enabled ? (planLabel || statusLabel) : t('settings.antigravity.disabled');
+    info.title = provider?.actionRequired === 'accountVerification'
+      ? t('settings.antigravity.verificationRequiredDetail')
+      : info.textContent;
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'managed-account-remove';
+    remove.textContent = '✕';
+    remove.title = t('settings.antigravity.remove');
+    remove.setAttribute('aria-label', t('settings.antigravity.remove'));
+    remove.disabled = state.antigravitySignInBusy;
+    let confirmingRemove = false;
+    remove.addEventListener('click', async () => {
+      if (!confirmingRemove) {
+        confirmingRemove = true;
+        remove.classList.add('confirming');
+        remove.textContent = '✓';
+        remove.title = t('settings.antigravity.removeConfirm', { account: accountName });
+        remove.setAttribute('aria-label', remove.title);
+        return;
+      }
+      remove.disabled = true;
+      const result = await window.tokenMonitor.antigravity.removeAccount(account.id);
+      if (!result?.ok) state.antigravityAccountError = result?.error || t('settings.antigravity.removeFailed');
+      else {
+        state.antigravityAccountError = '';
+        state.settings.antigravityManagedAccounts = result.accounts || [];
+        refreshStats({ force: true }).catch(() => {});
+      }
+      renderAntigravityStatus();
+      renderSettingsSummaries();
+    });
+    right.append(info, remove);
+    row.append(input, main, right);
+    listEl.append(row);
+  });
+  renderSettingsSummaries();
 }
 
-function deepseekProviderStatus() {
-  return localProviderStatus('deepseek');
-}
-
-function deepseekProviderForAccount() {
-  const provider = deepseekProviderStatus();
-  const pendingSince = Number(state.deepseekPendingCheckSince || 0);
-  if (!provider || !pendingSince) return provider;
-  const updatedAt = Date.parse(provider.updatedAt || '');
-  if (!Number.isFinite(updatedAt) || updatedAt < pendingSince) return null;
-  state.deepseekPendingCheckSince = 0;
-  return provider;
-}
-
-function markDeepseekKeyCheckPending() {
-  state.deepseekPendingCheckSince = Date.now();
-  clearDeepseekProviderStatus();
-}
-
-function clearDeepseekPendingCheck() {
-  state.deepseekPendingCheckSince = 0;
-}
-
-function clearDeepseekProviderStatus() {
-  if (!Array.isArray(state.stats?.limits?.providers)) return;
-  state.stats.limits.providers = state.stats.limits.providers.filter((provider) => provider.provider !== 'deepseek');
+function mimoSettingsAccountTitle(account, index) {
+  // The discovered session has no address to name it by — nothing was pasted for
+  // it — so it is named after the app it comes from.
+  if (account?.removable === false) return t('settings.mimo.desktopAccount');
+  return String(account?.accountEmail || '').trim() || `Account ${index + 1}`;
 }
 
 function renderMimoStatus() {
+  if (!isSettingsSurfaceVisible()) return;
   const statusEl = document.getElementById('mimoAccountStatus');
   const listEl = document.getElementById('mimoAccountList');
   const emptyEl = document.getElementById('mimoAccountEmpty');
@@ -13049,11 +14483,10 @@ function renderMimoStatus() {
   const statusText = accounts.length === 0
     ? t('settings.mimo.notConfigured')
     : t('settings.mimo.connected', { linked: enabledCount, total: accounts.length });
-  setCursorStatusText(statusEl, statusText);
-  errorEl.textContent = state.mimoAccountError || '';
-  errorEl.classList.toggle('hidden', !state.mimoAccountError);
+  accountShellApi.render({ status: statusEl, statusText, error: errorEl, errorText: state.mimoAccountError });
   emptyEl.classList.toggle('hidden', accounts.length > 0);
 
+  const providers = localProviderStatuses('mimo');
   listEl.replaceChildren();
   if (accounts.length > 0) {
     for (const [index, account] of accounts.entries()) {
@@ -13062,26 +14495,33 @@ function renderMimoStatus() {
       const row = document.createElement('div');
       row.className = 'managed-account-row';
       row.classList.toggle('disabled', !enabled);
+      // A credential Token Monitor never stored has no stored preference to
+      // toggle and nothing here to remove: this row is the session the machine's
+      // own MiMo Desktop is signed into, listed so the count above it is honest
+      // about what the provider answers for.
+      const detected = account.removable === false;
 
-      const input = document.createElement('input');
-      input.className = 'managed-account-checkbox';
-      input.type = 'checkbox';
-      input.checked = enabled;
-      input.setAttribute('aria-label', t('settings.mimo.toggleAccount', {
-        account: accountName
-      }));
-      input.addEventListener('change', async () => {
-        input.disabled = true;
-        const result = await window.tokenMonitor.mimo.setAccountEnabled(account.id, input.checked);
-        if (!result?.ok) {
-          state.mimoAccountError = result?.error || t('settings.mimo.toggleFailed');
-        } else {
-          state.mimoAccountError = '';
-          state.settings.mimoManagedAccounts = result.accounts || [];
-        }
-        renderMimoStatus();
-        renderSettingsSummaries();
-      });
+      const input = detected ? null : document.createElement('input');
+      if (input) {
+        input.className = 'managed-account-checkbox';
+        input.type = 'checkbox';
+        input.checked = enabled;
+        input.setAttribute('aria-label', t('settings.mimo.toggleAccount', {
+          account: accountName
+        }));
+        input.addEventListener('change', async () => {
+          input.disabled = true;
+          const result = await window.tokenMonitor.mimo.setAccountEnabled(account.id, input.checked);
+          if (!result?.ok) {
+            state.mimoAccountError = result?.error || t('settings.mimo.toggleFailed');
+          } else {
+            state.mimoAccountError = '';
+            state.settings.mimoManagedAccounts = result.accounts || [];
+          }
+          renderMimoStatus();
+          renderSettingsSummaries();
+        });
+      }
 
       const main = document.createElement('div');
       main.className = 'managed-account-main';
@@ -13094,77 +14534,57 @@ function renderMimoStatus() {
       right.className = 'managed-account-right';
       const info = document.createElement('span');
       info.className = 'managed-account-info';
-      info.textContent = enabled ? limitProviderPresentationApi.limitProviderDisplayLabel(account.accountLabel) : t('settings.mimo.disabled');
+      const failedProvider = enabled && providers.find((provider) => (
+        provider.accountKey === account.accountKey
+        && provider.sourceDetail === (detected ? 'app' : 'managed')
+        && provider.status === 'unauthorized'
+      ));
+      const statusLabel = failedProvider
+        ? translatedLimitProviderTag(limitProviderPresentationApi.limitProviderStatusLabel(failedProvider))
+        : '';
+      info.textContent = !enabled ? t('settings.mimo.disabled')
+        : statusLabel || limitProviderPresentationApi.limitProviderDisplayLabel(account.accountLabel);
+      info.title = info.textContent;
 
-      const remove = document.createElement('button');
-      remove.type = 'button';
-      remove.className = 'managed-account-remove';
-      remove.textContent = '✕';
-      remove.title = t('settings.mimo.remove');
-      let confirmingRemove = false;
-      remove.addEventListener('click', async () => {
-        if (!confirmingRemove) {
-          confirmingRemove = true;
-          remove.classList.add('confirming');
-          remove.textContent = '✓';
-          remove.title = t('settings.mimo.removeConfirm', {
-            account: accountName
-          });
-          return;
-        }
-        const result = await window.tokenMonitor.mimo.removeAccount(account.id);
-        if (result?.ok) {
-          state.mimoAccountError = '';
-          state.settings.mimoManagedAccounts = result.accounts || [];
+      const remove = detected ? null : document.createElement('button');
+      if (remove) {
+        remove.type = 'button';
+        remove.className = 'managed-account-remove';
+        remove.textContent = '✕';
+        remove.title = t('settings.mimo.remove');
+        let confirmingRemove = false;
+        remove.addEventListener('click', async () => {
+          if (!confirmingRemove) {
+            confirmingRemove = true;
+            remove.classList.add('confirming');
+            remove.textContent = '✓';
+            remove.title = t('settings.mimo.removeConfirm', {
+              account: accountName
+            });
+            return;
+          }
+          const result = await window.tokenMonitor.mimo.removeAccount(account.id);
+          if (result?.ok) {
+            state.mimoAccountError = '';
+            state.settings.mimoManagedAccounts = result.accounts || [];
+            renderMimoStatus();
+            renderSettingsSummaries();
+            refreshStats({ force: true }).catch(() => {});
+            return;
+          }
+          state.mimoAccountError = result?.error || t('settings.mimo.removeFailed');
           renderMimoStatus();
           renderSettingsSummaries();
-          refreshStats({ force: true }).catch(() => {});
-          return;
-        }
-        state.mimoAccountError = result?.error || t('settings.mimo.removeFailed');
-        renderMimoStatus();
-        renderSettingsSummaries();
-      });
+        });
+      }
 
-      right.append(info, remove);
-      row.append(input, main, right);
+      right.append(info);
+      if (remove) right.append(remove);
+      row.append(input || document.createElement('span'), main, right);
       listEl.append(row);
     }
   }
   renderSettingsSummaries();
-}
-
-function minimaxProviderStatus() {
-  return localProviderStatus('minimax');
-}
-
-function minimaxAccountLinked() {
-  const provider = minimaxProviderForAccount();
-  return Boolean(state.settings?.minimaxApiKeyConfigured) && provider?.status === 'ok';
-}
-
-function minimaxProviderForAccount() {
-  const provider = minimaxProviderStatus();
-  const pendingSince = Number(state.minimaxPendingCheckSince || 0);
-  if (!provider || !pendingSince) return provider;
-  const updatedAt = Date.parse(provider.updatedAt || '');
-  if (!Number.isFinite(updatedAt) || updatedAt < pendingSince) return null;
-  state.minimaxPendingCheckSince = 0;
-  return provider;
-}
-
-function markMinimaxKeyCheckPending() {
-  state.minimaxPendingCheckSince = Date.now();
-  clearMinimaxProviderStatus();
-}
-
-function clearMinimaxPendingCheck() {
-  state.minimaxPendingCheckSince = 0;
-}
-
-function clearMinimaxProviderStatus() {
-  if (!Array.isArray(state.stats?.limits?.providers)) return;
-  state.stats.limits.providers = state.stats.limits.providers.filter((provider) => provider.provider !== 'minimax');
 }
 
 function copilotProviderStatus() {
@@ -13201,65 +14621,29 @@ function clearCopilotProviderStatus() {
 }
 
 const externalLimitAccountConfig = {
-  claude: {
-    configuredKey: 'claudeWebCookieConfigured',
-    sourceKey: 'claudeWebCookieSource',
-    pendingKey: 'claudePendingCheckSince'
-  },
-  zai: {
-    configuredKey: 'zaiApiKeyConfigured',
-    sourceKey: 'zaiApiKeySource',
-    pendingKey: 'zaiPendingCheckSince'
-  },
-  zaiteam: {
-    configuredKey: 'zaiTeamApiKeyConfigured',
-    sourceKey: 'zaiTeamApiKeySource',
-    pendingKey: 'zaiteamPendingCheckSince'
-  },
-  volcengine: {
-    configuredKey: 'volcengineCredentialsConfigured',
-    sourceKey: 'volcengineCredentialsSource',
-    pendingKey: 'volcenginePendingCheckSince'
-  },
-  qoder: {
-    configuredKey: 'qoderCookieConfigured',
-    sourceKey: 'qoderCookieSource',
-    pendingKey: 'qoderPendingCheckSince'
-  },
-  trae: {
-    configuredKey: 'traeAccessTokenConfigured',
-    sourceKey: 'traeAccessTokenSource',
-    pendingKey: 'traePendingCheckSince'
-  },
-  commandcode: {
-    configuredKey: 'commandcodeCookieConfigured',
-    sourceKey: 'commandcodeCookieSource',
-    pendingKey: 'commandcodePendingCheckSince'
-  },
   kimi: {
     configuredKey: 'kimiCredentialConfigured',
     sourceKey: 'kimiCredentialSource',
     pendingKey: 'kimiPendingCheckSince'
   },
-  ollama: {
-    configuredKey: 'ollamaCookieConfigured',
-    sourceKey: 'ollamaCookieSource',
-    pendingKey: 'ollamaPendingCheckSince'
+  volcengine: {
+    configuredKey: 'volcengineCredentialsConfigured',
+    sourceKey: 'volcengineCredentialsSource',
+    pendingKey: 'volcenginePendingCheckSince'
   }
 };
 
 function clearDisabledLimitProviderPendingChecks(enabledProviders) {
-  if (!enabledProviders.has('deepseek')) clearDeepseekPendingCheck();
-  if (!enabledProviders.has('minimax')) clearMinimaxPendingCheck();
   if (!enabledProviders.has('copilot')) clearCopilotPendingCheck();
-  for (const providerName of Object.keys(externalLimitAccountConfig)) {
+  for (const providerName of [...Object.keys(externalLimitAccountConfig),
+    ...(state.settings?.limitAccountForms || []).map((form) => form.id)]) {
     if (!enabledProviders.has(providerName)) clearExternalProviderCheckPending(providerName);
   }
 }
 
 function externalProviderForAccount(providerName) {
   const provider = localProviderStatus(providerName);
-  const config = externalLimitAccountConfig[providerName];
+  const config = externalLimitAccountConfig[providerName] || limitAccountForm(providerName)?.status;
   const pendingSince = Number(config ? state[config.pendingKey] : 0);
   if (!provider || !pendingSince) return provider;
   const updatedAt = Date.parse(provider.updatedAt || '');
@@ -13269,20 +14653,25 @@ function externalProviderForAccount(providerName) {
 }
 
 function externalProviderAccountLinked(providerName) {
-  const config = externalLimitAccountConfig[providerName];
+  const config = externalLimitAccountConfig[providerName] || limitAccountForm(providerName)?.status;
   const provider = externalProviderForAccount(providerName);
   return Boolean(config && state.settings?.[config.configuredKey]) && provider?.status === 'ok';
 }
 
+function setAccountPanelMessage(providerName, message) {
+  if (message) state.accountPanelMessages[providerName] = message;
+  else delete state.accountPanelMessages[providerName];
+}
+
 function markExternalProviderCheckPending(providerName) {
-  const config = externalLimitAccountConfig[providerName];
+  const config = externalLimitAccountConfig[providerName] || limitAccountForm(providerName)?.status;
   if (!config) return;
   state[config.pendingKey] = Date.now();
   clearExternalProviderPendingStatus(providerName);
 }
 
 function clearExternalProviderCheckPending(providerName) {
-  const config = externalLimitAccountConfig[providerName];
+  const config = externalLimitAccountConfig[providerName] || limitAccountForm(providerName)?.status;
   if (config) state[config.pendingKey] = 0;
 }
 
@@ -13333,9 +14722,27 @@ function copilotAccountStatusText(provider, configured, source, enabled = true) 
 function apiKeyAccountStatusText(providerName, provider, configured, source, enabled = true) {
   const accountStatus = limitProviderPresentationApi.apiKeyAccountStatus(provider, configured, enabled);
   if (accountStatus === 'linked') {
-    return t(source === 'env' ? `settings.${providerName}.statusEnv` : `settings.${providerName}.statusSet`);
+    // A ZCode-discovered login is an OAuth-style link, not a pasted API key,
+    // so it reads as connected the way Zed's linked sessions do.
+    const linkedKey = providerName === 'zai' && source === 'zcode-auto'
+      ? 'settings.zai.statusLinked'
+      : providerName === 'factory' && source === 'droid-env'
+        ? 'settings.factory.statusDroidEnv'
+        : providerName === 'cline' && source === 'cline-signin'
+          ? 'settings.cline.statusSignin'
+          : null;
+    return t(linkedKey || (source === 'env' ? `settings.${providerName}.statusEnv` : `settings.${providerName}.statusSet`));
   }
-  if (accountStatus === 'invalid') return t(`settings.${providerName}.statusInvalid`);
+  if (accountStatus === 'invalid') {
+    // Cline's two lanes refuse in different places, and this row names the lane the
+    // credential came from rather than always the key field: Cline owns recovery for
+    // the discovered sign-in, while Token Monitor owns the configured API key. Every
+    // other provider here keeps the one statusInvalid string.
+    const invalidKey = providerName === 'cline' && source === 'cline-signin'
+      ? 'settings.cline.statusSigninInvalid'
+      : `settings.${providerName}.statusInvalid`;
+    return t(invalidKey);
+  }
   if (accountStatus === 'notConfigured') return t(`settings.${providerName}.statusNotSet`);
   const statusKeys = {
     checking: 'settings.common.checking',
@@ -13348,133 +14755,302 @@ function apiKeyAccountStatusText(providerName, provider, configured, source, ena
   return t(statusKeys[accountStatus] || 'settings.common.error');
 }
 
-// Follow the region we last successfully polled so a global (minimax.io)
-// account lands on platform.minimax.io, not the CN landing page. Fall back
-// to the CN host until we've seen a successful poll.
-function minimaxPlatformUrl() {
-  const provider = minimaxProviderForAccount();
-  const region = provider && provider.region === 'en' ? 'en' : 'cn';
-  return region === 'en'
-    ? 'https://platform.minimax.io/user-center/payment/token-plan'
-    : 'https://platform.minimaxi.com/user-center/payment/token-plan';
-}
-
 function setExternalAccountExpanded(providerName, expanded) {
   const details = document.getElementById(`${providerName}SettingsDetails`);
   const toggle = document.getElementById(`${providerName}SettingsToggle`);
   if (!details || !toggle) return;
   const next = Boolean(expanded);
   state[`${providerName}AccountExpanded`] = next;
-  details.classList.toggle('hidden', !next);
-  toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
-  limitProviderAccountGroup(providerName)?.classList.toggle('expanded', next);
-  syncLimitProviderAccountExpansion(providerName, next);
-}
-
-function zaiPlatformUrl() {
-  const selectedRegion = document.getElementById('zaiApiRegionInput')?.value;
-  const region = selectedRegion || (state.settings?.zaiApiRegion === 'bigmodel-cn' ? 'bigmodel-cn' : 'global');
-  return region === 'bigmodel-cn'
-    ? 'https://bigmodel.cn/coding-plan/personal/usage'
-    : 'https://z.ai/manage-apikey/coding-plan/personal/my-plan';
-}
-
-function zaiteamPlatformUrl() {
-  return 'https://bigmodel.cn/coding-plan/team/usage-stats';
+  accountShellApi.setExpanded({
+    toggle, details, group: limitProviderAccountGroup(providerName), expanded: next,
+    onChange: (open) => syncLimitProviderAccountExpansion(providerName, open)
+  });
 }
 
 function volcenginePlatformUrl() {
   return 'https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement?LLM=%7B%7D&advancedActiveKey=subscribe';
 }
 
-function claudePlatformUrl() {
-  return 'https://claude.ai/settings/usage';
-}
-
-function selectedQoderSite() {
-  const selectedSite = document.getElementById('qoderSiteInput')?.value;
-  return selectedSite || (state.settings?.qoderSite === 'cn' ? 'cn' : 'global');
-}
-
-function qoderUsagePagePath() {
-  return selectedQoderSite() === 'cn' ? 'qoder.com.cn/account/usage' : 'qoder.com/account/usage';
-}
-
-function qoderPlatformUrl() {
-  return `https://${qoderUsagePagePath()}`;
-}
-
-function updateQoderUsagePageHint() {
-  const hint = document.getElementById('qoderUsagePageHint');
-  if (hint) hint.textContent = qoderUsagePagePath();
-}
-
 function kimiPlatformUrl() {
   return 'https://www.kimi.com/code/console';
 }
 
-function ollamaPlatformUrl() {
-  return 'https://ollama.com/settings';
-}
-
-function commandcodePlatformUrl() {
-  // Account-scoped in the address bar (/<username>/settings/usage), but this
-  // path resolves to it and bounces through signin?returnTo= when signed out,
-  // so it is the one link that works without knowing the username.
-  return 'https://commandcode.ai/settings/usage';
-}
-
-function ollamaValidationError(provider) {
-  if (provider?.status === 'unauthorized') return t('settings.ollama.validationInvalid');
-  if (provider?.status === 'rateLimited' || provider?.status === 'sourceRateLimited') {
-    return t('settings.ollama.validationRateLimited');
-  }
-  return t('settings.ollama.validationUnavailable');
-}
-
 function renderExternalProviderStatus(providerName) {
-  const config = externalLimitAccountConfig[providerName];
+  const config = externalLimitAccountConfig[providerName] || limitAccountForm(providerName)?.status;
   const statusEl = document.getElementById(`${providerName}AccountStatus`);
   const openBtn = document.getElementById(`${providerName}OpenBrowser`);
   const logoutBtn = document.getElementById(`${providerName}LogoutButton`);
   const refreshBtn = document.getElementById(`${providerName}RefreshButton`);
   const manualPanel = document.getElementById(`${providerName}ManualPanel`);
   const errorEl = document.getElementById(`${providerName}ErrorMessage`);
-  if (!config || !statusEl || !openBtn || !logoutBtn || !refreshBtn || !manualPanel || !errorEl) return;
-
-  errorEl.classList.add('hidden');
-  errorEl.textContent = '';
+  if (!config || !statusEl || !openBtn || !refreshBtn || !manualPanel || !errorEl) return;
 
   const source = state.settings?.[config.sourceKey] || '';
   const wasPending = Number(state[config.pendingKey] || 0) > 0;
   const provider = externalProviderForAccount(providerName);
+  // The message line is state, not DOM: this runs on every stats push, and a
+  // line written straight into the element would be wiped by the next one.
+  // A "saved but not yet confirmed" notice retires once a record newer than
+  // the save arrives, because the pill then carries the real answer.
+  if (state.accountPanelMessages[providerName]?.untilChecked && provider) {
+    delete state.accountPanelMessages[providerName];
+  }
+  const message = state.accountPanelMessages[providerName];
+  errorEl.textContent = message ? t(message.key, message.params) : '';
+  errorEl.classList.toggle('hidden', !message);
+  errorEl.classList.toggle('error', message?.tone !== 'notice');
   const configured = Boolean(state.settings?.[config.configuredKey]);
   const enabled = limitProviderEnabled(providerName);
   const pending = enabled && Number(state[config.pendingKey] || 0) > 0;
   const linked = externalProviderAccountLinked(providerName);
-  if (providerName === 'ollama' && wasPending && !pending && linked) {
-    setExternalAccountExpanded('ollama', false);
-  }
-  if (providerName === 'zai') {
-    const regionInput = document.getElementById('zaiApiRegionInput');
-    if (regionInput) regionInput.value = state.settings?.zaiApiRegion === 'bigmodel-cn' ? 'bigmodel-cn' : 'global';
-  }
+  // A pending check that comes back linked folds the panel: the refresh that
+  // followed the save may have returned before the new record did.
+  if (wasPending && !pending && linked) setExternalAccountExpanded(providerName, false);
+  const form = limitAccountForm(providerName);
+  if (form) limitAccountPanelsApi.syncCredentialFields(form, { document, settings: state.settings });
   if (providerName === 'volcengine') renderVolcengineAgentOverrideState();
-  if (providerName === 'qoder') {
-    const siteInput = document.getElementById('qoderSiteInput');
-    if (siteInput) siteInput.value = state.settings?.qoderSite === 'cn' ? 'cn' : 'global';
-    updateQoderUsagePageHint();
-  }
   setCursorStatusText(
     statusEl,
     pending ? t('settings.common.checking') : apiKeyAccountStatusText(providerName, provider, configured, source, enabled)
   );
+  // A local ZCode install keeps the Z.ai row honest when unchecked: the
+  // auto-discovered plans still exist, so the pill shows auto-detect instead
+  // of the final "disabled" state the generic seven-state map lands on.
+  if (providerName === 'zai' && !enabled && state.settings?.zcodeLoginDetected === true) {
+    setCursorStatusText(statusEl, t('settings.limits.connection.autoDetect'));
+  }
   manualPanel.classList.toggle('hidden', linked);
   openBtn.classList.toggle('hidden', linked);
-  const canClearConfiguredClaude = providerName === 'claude' && configured;
-  logoutBtn.classList.toggle('hidden', source !== 'settings' || (!linked && !canClearConfiguredClaude));
+  const discoveredLogin = (providerName === 'zai' && source === 'zcode-auto')
+    || (providerName === 'cline' && source === 'cline-signin');
+  if (discoveredLogin) {
+    // The discovered login is not user-entered, so the override input and the
+    // console link stay reachable instead of hiding behind linked. Cline's stored
+    // sign-in is the same situation as Zai's ZCode login.
+    manualPanel.classList.remove('hidden');
+    openBtn.classList.remove('hidden');
+  }
+  const canClearConfiguredCredential = source === 'settings' && configured;
+  logoutBtn.classList.toggle('hidden', !canClearConfiguredCredential);
   refreshBtn.classList.toggle('hidden', !configured);
+  if (providerName === 'claude') renderClaudeWebAccounts(statusEl, linked, enabled && !pending);
   renderSettingsSummaries();
+}
+
+function claudeWebAccountInfoText(account) {
+  if (!account.accountKey) return t('settings.common.notChecked');
+  const provider = localProviderStatuses('claude').find((entry) => entry.accountKey === account.accountKey);
+  return provider?.status === 'unauthorized'
+    ? t('settings.claude.statusInvalid')
+    : limitProviderPresentationApi.limitProviderDisplayLabel(account.accountLabel);
+}
+
+function claudeWebAccountRejection(result) {
+  if (result?.status === 'invalid' || result?.errorCode === 'INVALID_CLAUDE_WEB_SESSION_KEY') {
+    return { key: 'settings.claude.cookieInvalidFormat' };
+  }
+  if (result?.status === 'unauthorized') return { key: 'settings.claude.cookieRejected' };
+  return { key: 'settings.claude.addAccountCheckFailed' };
+}
+
+function renderClaudeAddAccountOrganizations(choices) {
+  const select = document.getElementById('claudeAddAccountOrganizationInput');
+  if (!select) return;
+  document.getElementById('claudeAddAccountOrganizationRow')?.classList.toggle('hidden', choices.length === 0);
+  select.replaceChildren(...[{ id: '', name: t('settings.claude.organizationChoose') }, ...choices].map((choice) => {
+    const option = document.createElement('option');
+    option.value = choice.id;
+    option.textContent = [choice.name || choice.id, choice.plan ? choice.plan[0].toUpperCase() + choice.plan.slice(1) : '']
+      .filter(Boolean).join(' · ');
+    return option;
+  }));
+  select.value = '';
+}
+
+async function submitClaudeWebAccount(button) {
+  const input = document.getElementById('claudeAddAccountCookieInput');
+  const organization = document.getElementById('claudeAddAccountOrganizationInput');
+  if (!input || button.disabled) return;
+  if (!String(input.value || '').trim()) {
+    setAccountPanelMessage('claude', { key: 'settings.claude.cookieRequired' });
+    renderExternalProviderStatus('claude');
+    return;
+  }
+  button.disabled = true;
+  button.textContent = t('settings.common.checking');
+  setAccountPanelMessage('claude', null);
+  renderExternalProviderStatus('claude');
+  let added = false;
+  try {
+    const result = await window.tokenMonitor.claude.addAccount(input.value, organization?.value || '');
+    if (result?.organizationChoices?.length) {
+      // An account in several organizations has to name the one to read.
+      renderClaudeAddAccountOrganizations(result.organizationChoices);
+      setAccountPanelMessage('claude', { key: 'settings.claude.organizationRequired', tone: 'notice' });
+    } else if (!result?.ok) {
+      setAccountPanelMessage('claude', claudeWebAccountRejection(result));
+    } else {
+      added = true;
+      input.value = '';
+      renderClaudeAddAccountOrganizations([]);
+      state.claudeAddAccountExpanded = false;
+      markExternalProviderCheckPending('claude');
+    }
+  } catch (error) {
+    setAccountPanelMessage('claude', { key: 'settings.claude.saveFailed', params: { message: error.message } });
+  } finally {
+    button.disabled = false;
+    button.textContent = t('settings.claude.saveCookie');
+  }
+  renderExternalProviderStatus('claude');
+  if (!added) return;
+  // The group stays open on the list, so the account just added is visible and
+  // the next one is a single click away.
+  await refreshStats({ force: true });
+  renderExternalProviderStatus('claude');
+}
+
+// The generated Claude panel holds one cookie. This adds, once, what lets it
+// hold more: the list of additional logins and a form that saves one. The
+// panel's own paste box stays the way the first login is saved.
+function attachClaudeWebAccounts() {
+  if (document.getElementById('claudeAccountList')) return;
+  const details = document.getElementById('claudeSettingsDetails');
+  const actions = details?.querySelector('.settings-actions');
+  const errorEl = document.getElementById('claudeErrorMessage');
+  if (!details || !actions || !errorEl) return;
+  const localized = (node, key) => {
+    node.dataset.i18n = key;
+    node.textContent = t(key);
+    return node;
+  };
+
+  const list = document.createElement('div');
+  list.id = 'claudeAccountList';
+  list.className = 'managed-account-list';
+  details.insertBefore(list, actions);
+
+  const addButton = localized(document.createElement('button'), 'settings.claude.addAccount');
+  addButton.id = 'claudeAddAccountButton';
+  addButton.type = 'button';
+  addButton.className = 'hidden';
+  addButton.setAttribute('aria-controls', 'claudeAddAccountPanel');
+  addButton.setAttribute('aria-expanded', 'false');
+  actions.insertBefore(addButton, document.getElementById('claudeRefreshButton'));
+
+  const panel = document.createElement('div');
+  panel.id = 'claudeAddAccountPanel';
+  panel.className = 'credential-manual-panel hidden';
+  const note = localized(document.createElement('p'), 'settings.claude.addAccountNote');
+  note.className = 'settings-note';
+  const input = document.createElement('textarea');
+  input.id = 'claudeAddAccountCookieInput';
+  input.className = 'credential-input';
+  input.rows = 3;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.dataset.i18nPlaceholder = 'settings.claude.cookiePlaceholder';
+  input.placeholder = t('settings.claude.cookiePlaceholder');
+  const organizationRow = document.createElement('div');
+  organizationRow.id = 'claudeAddAccountOrganizationRow';
+  organizationRow.className = 'settings-row hidden';
+  const organizationLabel = localized(document.createElement('label'), 'settings.claude.organization');
+  organizationLabel.setAttribute('for', 'claudeAddAccountOrganizationInput');
+  const organization = document.createElement('select');
+  organization.id = 'claudeAddAccountOrganizationInput';
+  organization.className = 'credential-input';
+  organizationRow.append(organizationLabel, organization);
+  const submitActions = document.createElement('div');
+  submitActions.className = 'settings-actions';
+  const submit = localized(document.createElement('button'), 'settings.claude.saveCookie');
+  submit.id = 'claudeAddAccountSubmit';
+  submit.type = 'button';
+  submitActions.append(submit);
+  panel.append(note, input, organizationRow, submitActions);
+  details.insertBefore(panel, errorEl);
+
+  addButton.addEventListener('click', () => {
+    state.claudeAddAccountExpanded = !state.claudeAddAccountExpanded;
+    if (!state.claudeAddAccountExpanded) renderClaudeAddAccountOrganizations([]);
+    renderExternalProviderStatus('claude');
+  });
+  submit.addEventListener('click', () => submitClaudeWebAccount(submit));
+}
+
+function renderClaudeWebAccounts(statusEl, linked, settled) {
+  const listEl = document.getElementById('claudeAccountList');
+  const addBtn = document.getElementById('claudeAddAccountButton');
+  const addPanel = document.getElementById('claudeAddAccountPanel');
+  if (!listEl || !addBtn || !addPanel) return;
+  const accounts = state.settings?.claudeWebAccounts || [];
+  const formCookieStored = state.settings?.claudeWebCookie === 'set';
+  const count = accounts.length + (formCookieStored ? 1 : 0);
+  if (settled && count > 1) {
+    setCursorStatusText(statusEl, t('settings.claude.nAccounts', { count }));
+  }
+  // The first added account took the form's cookie into the list, so with the
+  // form empty its paste box and clear button would only edit an empty slot.
+  // Adding goes through the add form instead.
+  if (accounts.length > 0 && !formCookieStored) {
+    document.getElementById('claudeManualPanel')?.classList.add('hidden');
+    document.getElementById('claudeLogoutButton')?.classList.add('hidden');
+  }
+  const canAdd = linked || accounts.length > 0;
+  if (!canAdd) state.claudeAddAccountExpanded = false;
+  const adding = canAdd && state.claudeAddAccountExpanded === true;
+  addBtn.classList.toggle('hidden', !canAdd);
+  addBtn.setAttribute('aria-expanded', adding ? 'true' : 'false');
+  addPanel.classList.toggle('hidden', !adding);
+  // The usage page is where the next account's cookie is copied from.
+  if (adding) document.getElementById('claudeOpenBrowser')?.classList.remove('hidden');
+
+  listEl.replaceChildren(...accounts.map((account, index) => {
+    const accountName = limitAccountTitle('claude', account, index, accounts);
+    const row = document.createElement('div');
+    row.className = 'managed-account-row';
+
+    const main = document.createElement('div');
+    main.className = 'managed-account-main';
+    const label = document.createElement('div');
+    label.className = 'managed-account-email';
+    label.textContent = accountName;
+    main.append(label);
+
+    const right = document.createElement('span');
+    right.className = 'managed-account-right';
+    const info = document.createElement('span');
+    info.className = 'managed-account-info';
+    info.textContent = claudeWebAccountInfoText(account);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'managed-account-remove';
+    remove.textContent = '✕';
+    remove.title = t('settings.claude.remove');
+    let confirmingRemove = false;
+    remove.addEventListener('click', async () => {
+      if (!confirmingRemove) {
+        confirmingRemove = true;
+        remove.classList.add('confirming');
+        remove.textContent = '✓';
+        remove.title = t('settings.claude.removeConfirm', { account: accountName });
+        return;
+      }
+      const result = await window.tokenMonitor.claude.removeAccount(account.id);
+      if (result?.ok) {
+        state.settings.claudeWebAccounts = accounts.filter((entry) => entry.id !== account.id);
+        setAccountPanelMessage('claude', null);
+      } else {
+        setAccountPanelMessage('claude', { key: 'settings.claude.removeFailed', params: { message: result?.error || '' } });
+      }
+      renderExternalProviderStatus('claude');
+      if (result?.ok) refreshStats({ force: true }).catch(() => {});
+    });
+
+    right.append(info, remove);
+    row.append(main, right);
+    return row;
+  }));
 }
 
 // The override inputs are password fields, cleared after every save and never
@@ -13501,42 +15077,6 @@ function setVolcengineAgentExpanded(expanded) {
   document.getElementById('volcengineAgentPanel')?.classList.toggle('expanded', next);
 }
 
-function setMinimaxAccountExpanded(expanded) {
-  const details = document.getElementById('minimaxSettingsDetails');
-  const toggle = document.getElementById('minimaxSettingsToggle');
-  if (!details || !toggle) return;
-  const next = Boolean(expanded);
-  state.minimaxAccountExpanded = next;
-  details.classList.toggle('hidden', !next);
-  toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
-  limitProviderAccountGroup('minimax')?.classList.toggle('expanded', next);
-  syncLimitProviderAccountExpansion('minimax', next);
-}
-
-function renderMinimaxStatus() {
-  const statusEl = document.getElementById('minimaxApiKeyStatus');
-  const openBtn = document.getElementById('minimaxOpenBrowser');
-  const logoutBtn = document.getElementById('minimaxLogoutButton');
-  const refreshBtn = document.getElementById('minimaxRefreshButton');
-  const manualPanel = document.getElementById('minimaxManualPanel');
-  const errorEl = document.getElementById('minimaxErrorMessage');
-  if (!statusEl || !openBtn || !logoutBtn || !refreshBtn || !manualPanel || !errorEl) return;
-
-  errorEl.classList.add('hidden');
-  errorEl.textContent = '';
-
-  const source = state.settings?.minimaxApiKeySource || '';
-  const provider = minimaxProviderForAccount();
-  const configured = Boolean(state.settings?.minimaxApiKeyConfigured);
-  const enabled = limitProviderEnabled('minimax');
-  const linked = minimaxAccountLinked();
-  setCursorStatusText(statusEl, apiKeyAccountStatusText('minimax', provider, configured, source, enabled));
-  manualPanel.classList.toggle('hidden', linked);
-  openBtn.classList.toggle('hidden', linked);
-  logoutBtn.classList.toggle('hidden', !linked || source !== 'settings');
-  refreshBtn.classList.toggle('hidden', !configured);
-  renderSettingsSummaries();
-}
 
 function renderCopilotStatus() {
   const statusEl = document.getElementById('copilotApiTokenStatus');
@@ -13554,57 +15094,44 @@ function renderCopilotStatus() {
   const configured = Boolean(state.settings?.copilotApiTokenConfigured);
   const enabled = limitProviderEnabled('copilot');
   const linked = copilotAccountLinked();
-  errorEl.textContent = state.copilotErrorMessage || '';
-  errorEl.classList.toggle('hidden', !state.copilotErrorMessage);
-  setCursorStatusText(statusEl, copilotAccountStatusText(provider, configured, source, enabled));
+  accountShellApi.render({
+    status: statusEl,
+    statusText: copilotAccountStatusText(provider, configured, source, enabled),
+    error: errorEl,
+    errorText: state.copilotErrorMessage,
+    progress: loginStatusEl,
+    progressText: state.copilotLoginStatus
+  });
   manualPanel.classList.toggle('hidden', linked);
   if (linked && state.copilotManualExpanded) setCopilotManualExpanded(false);
   signInBtn.classList.toggle('hidden', linked || state.copilotSignInBusy);
   cancelBtn.classList.toggle('hidden', !state.copilotSignInBusy || !state.copilotSignInCancelable || linked);
   logoutBtn.classList.toggle('hidden', !linked || source !== 'settings');
   refreshBtn.classList.toggle('hidden', !configured || (state.copilotSignInBusy && !linked));
-  loginStatusEl.classList.toggle('hidden', !state.copilotLoginStatus);
-  loginStatusEl.textContent = state.copilotLoginStatus;
   renderSettingsSummaries();
 }
 
-function renderDeepseekStatus() {
-  const statusEl = document.getElementById('deepseekApiKeyStatus');
-  const openBtn = document.getElementById('deepseekOpenBrowser');
-  const logoutBtn = document.getElementById('deepseekLogoutButton');
-  const refreshBtn = document.getElementById('deepseekRefreshButton');
-  const manualPanel = document.getElementById('deepseekManualPanel');
-  const errorEl = document.getElementById('deepseekErrorMessage');
-  if (!statusEl || !openBtn || !logoutBtn || !refreshBtn || !manualPanel || !errorEl) return;
-
-  errorEl.classList.add('hidden');
-  errorEl.textContent = '';
-
-  const source = state.settings?.deepseekApiKeySource || '';
-  const provider = deepseekProviderForAccount();
-  const configured = Boolean(state.settings?.deepseekApiKeyConfigured);
-  const enabled = limitProviderEnabled('deepseek');
-  const linked = deepseekAccountLinked();
-  setCursorStatusText(statusEl, apiKeyAccountStatusText('deepseek', provider, configured, source, enabled));
-  manualPanel.classList.toggle('hidden', linked);
-  openBtn.classList.toggle('hidden', linked);
-  logoutBtn.classList.toggle('hidden', !linked || source !== 'settings');
-  refreshBtn.classList.toggle('hidden', !configured);
-  renderSettingsSummaries();
-}
 
 function renderOpenCodeProfiles() {
+  if (!isSettingsSurfaceVisible()) return;
   const listEl = document.getElementById('opencodeProfileList');
   if (!listEl) return;
+  renderAccountShellError('opencode');
 
   const api = window.tokenMonitor.opencode;
 
+  const isCurrent = accountProfileRequests.begin('opencode');
   api.getProfiles().then(({ profiles, hasEnvVar, hasAmbientKey, ambientEnabled = true }) => {
-    listEl.innerHTML = '';
+    if (!isCurrent() || !isSettingsSurfaceVisible() || document.getElementById('opencodeProfileList') !== listEl) return;
+    accountProfileStatuses.retire('opencode');
+    listEl.replaceChildren();
     const entries = Object.entries(profiles);
 
     if (entries.length === 0 && !hasEnvVar && !hasAmbientKey) {
-      listEl.innerHTML = '<div class="opencode-empty">' + t('settings.opencode.emptyList') + '</div>';
+      const empty = document.createElement('div');
+      empty.className = 'opencode-empty';
+      empty.textContent = t('settings.opencode.emptyList');
+      listEl.append(empty);
       state.opencodeProfileCount = 0;
       renderOpenCodeProfilesStatusSummary({});
       renderSettingsSummaries();
@@ -13665,11 +15192,10 @@ function renderOpenCodeProfiles() {
             return;
           }
           if (offer.stale(at)) return;
-          const errorEl = document.getElementById('opencodeErrorMessage');
-          errorEl.textContent = opencodeSaveErrorText(result);
-          errorEl.classList.remove('hidden');
+          setAccountShellError('opencode', opencodeSaveErrorText(result));
           return;
         }
+        setAccountShellError('opencode', '');
         renderOpenCodeProfiles();
         updateOpenCodeProfilesStatus();
         renderSettingsSummaries();
@@ -13743,9 +15269,10 @@ function renderOpenCodeProfiles() {
       nameInput.value = name;
 
       const renameBtn = document.createElement('button');
+      renameBtn.type = 'button';
       renameBtn.className = 'profile-rename-btn';
-      renameBtn.textContent = '✎';
       renameBtn.title = t('settings.opencode.rename');
+      renameBtn.setAttribute('aria-label', renameBtn.title);
 
       let editing = false;
       function beginRename() {
@@ -13765,7 +15292,6 @@ function renderOpenCodeProfiles() {
       const offer = opencodeMergeOffer(mergeBtn, (next) => applyRename(next, true));
       const applyRename = async (next, merge) => {
         const at = offer.revision();
-        const errorEl = document.getElementById('opencodeErrorMessage');
         const result = await api.renameProfile(name, next, { merge });
         if (!result.ok) {
           if (result.nameTaken) {
@@ -13773,11 +15299,10 @@ function renderOpenCodeProfiles() {
             return;
           }
           if (offer.stale(at)) return;
-          errorEl.textContent = opencodeSaveErrorText(result);
-          errorEl.classList.remove('hidden');
+          setAccountShellError('opencode', opencodeSaveErrorText(result));
           return;
         }
-        errorEl.classList.add('hidden');
+        setAccountShellError('opencode', '');
         renderOpenCodeProfiles();
         updateOpenCodeProfilesStatus();
         renderSettingsSummaries();
@@ -13900,6 +15425,12 @@ function renderOpenCodeProfiles() {
     }
 
     updateOpenCodeProfilesStatus();
+  }).catch(() => {
+    if (!isCurrent() || !isSettingsSurfaceVisible()) return;
+    accountShellApi.render({
+      status: document.getElementById('opencodeCookieStatus'),
+      statusText: t('settings.opencode.connectFailed')
+    });
   });
 }
 
@@ -13978,7 +15509,6 @@ function opencodeRowId(prefix, name) {
 // deleting drops just this credential and leaves the rest of the account.
 function opencodeCredentialRow(accountName, kind, label) {
   const api = window.tokenMonitor.opencode;
-  const errorEl = () => document.getElementById('opencodeErrorMessage');
   const refresh = () => {
     renderOpenCodeProfiles();
     updateOpenCodeProfilesStatus();
@@ -14021,10 +15551,10 @@ function opencodeCredentialRow(accountName, kind, label) {
         return;
       }
       if (offer.stale(at)) return;
-      errorEl().textContent = opencodeSaveErrorText(result);
-      errorEl().classList.remove('hidden');
+      setAccountShellError('opencode', opencodeSaveErrorText(result));
       return;
     }
+    setAccountShellError('opencode', '');
     refresh();
   };
   const endMove = async (save) => {
@@ -14073,7 +15603,9 @@ function opencodeCredentialRow(accountName, kind, label) {
 
 async function updateOpenCodeProfilesStatus() {
   const api = window.tokenMonitor.opencode;
+  const isCurrent = accountProfileStatuses.begin('opencode');
   const status = await api.status();
+  if (!isCurrent() || !isSettingsSurfaceVisible()) return;
   const profiles = status.profiles || {};
 
   // The auto-detected key has no account name, so it arrives in its own field
@@ -14127,11 +15659,12 @@ function renderOpenCodeProfilesStatusSummary(profiles, ambient = null) {
     const linkedCount = statuses.filter(s => s.linked).length;
     const configuredProfileCount = state.opencodeProfileCount || 0;
     const totalCount = Math.max(statuses.length, configuredProfileCount);
-    if (totalCount > 0) {
-      totalEl.textContent = t('settings.opencode.connected', { linked: linkedCount, total: totalCount });
-    } else {
-      totalEl.textContent = t('settings.opencode.statusNotSet');
-    }
+    accountShellApi.render({
+      status: totalEl,
+      statusText: totalCount > 0
+        ? t('settings.opencode.connected', { linked: linkedCount, total: totalCount })
+        : t('settings.opencode.statusNotSet')
+    });
   }
 }
 
@@ -14158,7 +15691,7 @@ function thirdPartyProfileStatusText(provider, options = {}) {
   if (status === 'invalid') return t('settings.thirdparty.invalidKey');
   if (status !== 'linked') return t('settings.thirdparty.unavailable');
   const balance = optionalFiniteNumber(provider.balance?.amount);
-  if (balance !== null) return `✓ ${formatCompactMoney(balance, provider.balance?.currency || 'USD')}`;
+  if (balance !== null) return `✓ ${formatCompactMoney(balance, provider.balance?.currency || 'USD', state.settings?.compactTokenUnits, currentLocale())}`;
   const unlimited = (provider.windows || []).some((window) => (
     window?.showMeter === false && String(window?.detail || '').toLowerCase() === 'unlimited'
   ));
@@ -14193,11 +15726,14 @@ function updateNamedApiProfilesStatus({
   if (!statusEl) return;
   const total = state[profileCountStateKey] || 0;
   const linked = providers.filter((provider) => provider.status === 'ok').length;
-  statusEl.textContent = total === 0
-    ? t(`settings.${providerId}.statusNotSet`)
-    : !providerEnabled
-      ? t(`settings.${providerId}.nAccounts`, { count: total })
-      : t(`settings.${providerId}.connected`, { linked, total });
+  accountShellApi.render({
+    status: statusEl,
+    statusText: total === 0
+      ? t(`settings.${providerId}.statusNotSet`)
+      : !providerEnabled
+        ? t(`settings.${providerId}.nAccounts`, { count: total })
+        : t(`settings.${providerId}.connected`, { linked, total })
+  });
 }
 
 function updateOpenRouterProfilesStatus() {
@@ -14315,9 +15851,10 @@ function appendNamedApiProfileRow(listEl, config) {
     nameInput.type = 'text';
     nameInput.value = name;
     const renameBtn = document.createElement('button');
+    renameBtn.type = 'button';
     renameBtn.className = 'profile-rename-btn';
-    renameBtn.textContent = '✎';
     renameBtn.title = t('settings.profiles.rename');
+    renameBtn.setAttribute('aria-label', renameBtn.title);
     let editing = false;
     const finishRename = async (save) => {
       if (!editing) return;
@@ -14328,14 +15865,11 @@ function appendNamedApiProfileRow(listEl, config) {
       if (save && nextName && nextName !== name) {
         const result = await api.renameProfile(name, nextName);
         if (result?.ok) {
+          setAccountShellError(providerId, '');
           rerender();
         } else {
           nameInput.value = name;
-          const errorEl = document.getElementById(`${providerId}ErrorMessage`);
-          if (errorEl) {
-            errorEl.textContent = errorText(result);
-            errorEl.classList.remove('hidden');
-          }
+          setAccountShellError(providerId, errorText(result));
         }
       }
     };
@@ -14388,6 +15922,7 @@ function appendNamedApiProfileRow(listEl, config) {
 }
 
 function renderNamedApiProfiles(config) {
+  if (!isSettingsSurfaceVisible()) return;
   const {
     providerId,
     profileSettingsKey,
@@ -14401,7 +15936,10 @@ function renderNamedApiProfiles(config) {
   } = config;
   const listEl = document.getElementById(`${providerId}ProfileList`);
   if (!listEl || !api) return;
+  renderAccountShellError(providerId);
+  const isCurrent = accountProfileRequests.begin(providerId);
   api.getProfiles().then(({ profiles, hasEnvVar }) => {
+    if (!isCurrent() || !isSettingsSurfaceVisible() || document.getElementById(`${providerId}ProfileList`) !== listEl) return;
     listEl.replaceChildren();
     state.settings[profileSettingsKey] = profiles;
     state.settings[envConfiguredKey] = Boolean(hasEnvVar);
@@ -14442,8 +15980,11 @@ function renderNamedApiProfiles(config) {
     updateStatus();
     renderSettingsSummaries();
   }).catch(() => {
-    const statusEl = document.getElementById(`${providerId}Status`);
-    if (statusEl) statusEl.textContent = t(`settings.${providerId}.unavailable`);
+    if (!isCurrent() || !isSettingsSurfaceVisible()) return;
+    accountShellApi.render({
+      status: document.getElementById(`${providerId}Status`),
+      statusText: t(`settings.${providerId}.unavailable`)
+    });
   });
 }
 
@@ -14486,18 +16027,21 @@ function renderThirdPartyProfiles() {
 }
 
 function renderCursorStatus() {
+  if (!isSettingsSurfaceVisible()) return;
   const statusEl = document.getElementById('cursorAccountStatus');
   const listEl = document.getElementById('cursorAccountList');
   const errorEl = document.getElementById('cursorErrorMessage');
   if (!statusEl || !listEl || !errorEl) return;
 
-  errorEl.classList.add('hidden');
-  errorEl.textContent = '';
+  accountShellApi.render({
+    error: errorEl,
+    errorText: state.cursorAccount.error
+      ? t('settings.cursor.statusCheckFailed', { message: state.cursorAccount.error })
+      : accountShellErrors.cursor || ''
+  });
 
   if (state.cursorAccount.error) {
     setCursorStatusText(statusEl, t('settings.common.error'));
-    errorEl.textContent = t('settings.cursor.statusCheckFailed', { message: state.cursorAccount.error });
-    errorEl.classList.remove('hidden');
     setCursorCheckboxesEnabled(Boolean(state.cursorAccount.status?.accounts?.length));
     setSettingsSectionExpanded('limits', true);
     setCursorAccountExpanded(true);
@@ -14614,6 +16158,7 @@ function renderCursorStatus() {
 }
 
 async function refreshCursorStatus({ force = false, discover = false } = {}) {
+  setAccountShellError('cursor', '');
   state.cursorAccount = { status: null, error: '', busy: true };
   renderCursorStatus();
   try {
@@ -14636,20 +16181,59 @@ function setCursorCheckboxesEnabled(enabled) {
 }
 
 let openCustomPricingForm = null;
+let modelAliasForm = null;
+let modelAliasSaveConflict = false;
+
+function setupModelAliasesUI() {
+  const toggle = document.getElementById('modelAliasesSettingsToggle');
+  if (!toggle) return;
+  toggle.addEventListener('click', () => setAccountGroupExpanded('modelAliases', !state.modelAliasesExpanded, 'modelAliasesExpanded'));
+  setAccountGroupExpanded('modelAliases', false, 'modelAliasesExpanded');
+  modelAliasForm = window.TokenMonitorModelAliasForm.createModelAliasForm({
+    document, t: (key, params) => t(key === 'settings.modelAliases.saveError' && modelAliasSaveConflict ? 'settings.sync.content.conflict' : key, params),
+    getAliases: () => state.settings?.modelAliases || {},
+    getBase: () => syncContentForm?.base(),
+    getGrouping: () => state.settings?.modelAliasGrouping || 'off',
+    getModelIds: () => [
+      ...customPricingFormApi.inUseModelIds(state.stats),
+      ...(state.settings?.customModelPricing || []).map(entry => entry.modelId)
+    ],
+    saveAliases: async (modelAliases, base) => {
+      modelAliasSaveConflict = false;
+      try {
+        await saveSettings({ modelAliases }, base);
+      } catch (error) {
+        modelAliasSaveConflict = window.TokenMonitorSyncContentForm.isConflictError(error);
+        throw error;
+      }
+    }
+  });
+  for (const input of document.querySelectorAll('input[name="modelAliasGrouping"]')) {
+    input.addEventListener('change', async () => {
+      if (!input.checked) return;
+      try { await saveSettings({ modelAliasGrouping: input.value }); } catch (_) { return; }
+      modelAliasForm?.syncSettings();
+    });
+  }
+}
 
 function customPricingMeta(ov) {
   const parts = [];
   if (typeof ov.cacheReadPerM === 'number') parts.push(`${t('settings.customPricing.cacheRead')} $${ov.cacheReadPerM}`);
   if (typeof ov.inputPerM === 'number') parts.push(`${t('settings.customPricing.input')} $${ov.inputPerM}`);
   if (typeof ov.outputPerM === 'number') parts.push(`${t('settings.customPricing.output')} $${ov.outputPerM}`);
+  if (typeof ov.cacheWritePerM === 'number') parts.push(`${t('settings.customPricing.cacheWrite')} $${ov.cacheWritePerM}`);
+  if (typeof ov.cacheWrite1hPerM === 'number') parts.push(`${t('settings.customPricing.cacheWrite1h')} $${ov.cacheWrite1hPerM}`);
   return parts.length ? `${parts.join(' · ')} / 1M` : '';
 }
 
 function renderCustomPricing() {
+  if (!isSettingsSurfaceVisible()) return;
   const listEl = document.getElementById('customPricingList');
   const statusEl = document.getElementById('customPricingStatus');
   if (!listEl) return;
   const overrides = state.settings?.customModelPricing || [];
+  const pricingBase = syncContentForm?.base();
   if (statusEl) {
     statusEl.textContent = overrides.length
       ? t('settings.customPricing.count', { count: overrides.length })
@@ -14683,8 +16267,8 @@ function renderCustomPricing() {
     remove.className = 'managed-account-remove custom-pricing-remove';
     remove.textContent = t('settings.customPricing.remove');
     remove.addEventListener('click', async () => {
-      const next = customPricingFormApi.removeOverride(state.settings?.customModelPricing || [], ov.modelId);
-      await saveSettings({ customModelPricing: next });
+      const next = customPricingFormApi.removeOverride(overrides, ov.modelId);
+      try { await saveSettings({ customModelPricing: next }, pricingBase); } catch (_) { return; }
       renderCustomPricing();
     });
     row.append(main, remove);
@@ -14705,6 +16289,18 @@ function setupCustomPricingUI() {
   const inputEl = document.getElementById('customPricingInput');
   const outputEl = document.getElementById('customPricingOutput');
   const cacheReadEl = document.getElementById('customPricingCacheRead');
+  const cacheWriteEl = document.getElementById('customPricingCacheWrite');
+  const cacheWrite1hEl = document.getElementById('customPricingCacheWrite1h');
+  const advanced = document.getElementById('customPricingAdvanced');
+  const advancedSummary = document.getElementById('customPricingAdvancedSummary');
+  const help = document.getElementById('customPricingHelp');
+  const rateFields = [
+    [inputEl, 'inputPerM'], [outputEl, 'outputPerM'], [cacheReadEl, 'cacheReadPerM'],
+    [cacheWriteEl, 'cacheWritePerM'], [cacheWrite1hEl, 'cacheWrite1hPerM']
+  ];
+  let lookupRevision = 0;
+  let pricingEdit = null;
+  const editedFields = new Set();
   const hintEl = document.getElementById('customPricingHint');
   const errorEl = document.getElementById('customPricingError');
   const saveButton = document.getElementById('customPricingSaveButton');
@@ -14716,10 +16312,15 @@ function setupCustomPricingUI() {
   const selectedModelId = () => (select.value === '__manual__' ? manualInput.value.trim() : select.value);
 
   const resetForm = () => {
-    inputEl.value = ''; outputEl.value = ''; cacheReadEl.value = '';
+    lookupRevision += 1;
+    editedFields.clear();
+    advanced.open = false;
+    if (help.matches(':popover-open')) help.hidePopover();
+    for (const [el] of rateFields) el.value = '';
+    updateAdvancedSummary();
     manualInput.value = ''; manualInput.classList.add('hidden');
-    for (const id of ['customPricingInputApprox', 'customPricingOutputApprox', 'customPricingCacheReadApprox']) {
-      const span = document.getElementById(id);
+    for (const [el] of rateFields) {
+      const span = document.getElementById(el.id + 'Approx');
       if (span) span.textContent = '';
     }
     showHint(''); showError('');
@@ -14750,6 +16351,7 @@ function setupCustomPricingUI() {
     resetForm();
   };
   openCustomPricingForm = (prefill) => {
+    pricingEdit = { base: syncContentForm?.base(), entries: structuredClone(state.settings?.customModelPricing || []) };
     resetForm();
     populateModels();
     if (prefill && prefill.modelId) {
@@ -14761,10 +16363,11 @@ function setupCustomPricingUI() {
         manualInput.classList.remove('hidden');
         manualInput.value = prefill.modelId;
       }
-      inputEl.value = prefill.inputPerM ?? '';
-      outputEl.value = prefill.outputPerM ?? '';
-      cacheReadEl.value = prefill.cacheReadPerM ?? '';
-      for (const el of [inputEl, outputEl, cacheReadEl]) el.dispatchEvent(new Event('input'));
+      for (const [el, key] of rateFields) {
+        el.value = prefill[key] ?? '';
+        updateApproximation(el);
+      }
+      advanced.open = cacheWriteEl.value !== '' || cacheWrite1hEl.value !== '';
     }
     form.classList.remove('hidden');
     addButton.classList.add('hidden');
@@ -14774,6 +16377,10 @@ function setupCustomPricingUI() {
   cancelButton.addEventListener('click', closeForm);
 
   select.addEventListener('change', async () => {
+    const revision = ++lookupRevision;
+    editedFields.clear();
+    advanced.open = false;
+    for (const [el] of rateFields) { el.value = ''; updateApproximation(el); }
     showError('');
     manualInput.classList.toggle('hidden', select.value !== '__manual__');
     if (!select.value || select.value === '__manual__') { showHint(''); return; }
@@ -14781,27 +16388,42 @@ function setupCustomPricingUI() {
     showHint(t('settings.customPricing.lookingUp'));
     try {
       const res = await window.tokenMonitor.lookupModelPricing(id);
+      if (revision !== lookupRevision) return;
       if (res?.ok && res.result?.pricing) {
         const p = customPricingFormApi.perMillionFromPricing(res.result);
-        if (p.inputPerM !== undefined) inputEl.value = p.inputPerM;
-        if (p.outputPerM !== undefined) outputEl.value = p.outputPerM;
-        if (p.cacheReadPerM !== undefined) cacheReadEl.value = p.cacheReadPerM;
-        for (const el of [inputEl, outputEl, cacheReadEl]) el.dispatchEvent(new Event('input'));
+        for (const [el, key] of rateFields) {
+          if (!editedFields.has(key)) el.value = p[key] ?? '';
+          updateApproximation(el);
+        }
         showHint(t('settings.customPricing.currentPrice', { key: res.result.matchedKey || id, source: res.result.source || '' }));
       } else {
         showHint(t('settings.customPricing.noCurrentPrice'));
       }
     } catch (_) {
+      if (revision !== lookupRevision) return;
       showHint(t('settings.customPricing.noCurrentPrice'));
     }
   });
 
-  for (const el of [inputEl, outputEl, cacheReadEl]) {
+  function updateAdvancedSummary() {
+    const count = [cacheWriteEl, cacheWrite1hEl].filter(el => el.value !== '').length;
+    advancedSummary.textContent = count ? t('settings.customPricing.advancedConfigured', { count }) : '';
+  }
+
+  function updateApproximation(el) {
+    updateAdvancedSummary();
+    const span = document.getElementById(el.id + 'Approx');
+    if (!span) return;
+    const v = Number(el.value);
+    span.textContent = (el.value !== '' && Number.isFinite(v)) ? `≈ ${formatCost(v)} / 1M` : '';
+  }
+
+  for (const [el, key] of rateFields) {
+    const writeDescription = el === cacheWrite1hEl ? ' customPricingWriteNote' : '';
+    el.setAttribute('aria-describedby', 'customPricingRateUnits customPricingCoverageNote customPricingHint customPricingError' + writeDescription);
     el.addEventListener('input', () => {
-      const span = document.getElementById(el.id + 'Approx');
-      if (!span) return;
-      const v = Number(el.value);
-      span.textContent = (el.value !== '' && Number.isFinite(v)) ? `≈ ${formatCost(v)} / 1M` : '';
+      editedFields.add(key);
+      updateApproximation(el);
     });
   }
 
@@ -14809,17 +16431,24 @@ function setupCustomPricingUI() {
     showError('');
     const modelId = selectedModelId();
     if (!modelId) { showError(t('settings.customPricing.errorNoModel')); return; }
-    const entry = {
-      modelId,
-      inputPerM: inputEl.value === '' ? undefined : Number(inputEl.value),
-      outputPerM: outputEl.value === '' ? undefined : Number(outputEl.value),
-      cacheReadPerM: cacheReadEl.value === '' ? undefined : Number(cacheReadEl.value)
-    };
-    if (!customPricingFormApi.hasUsableBasePrice(entry)) { showError(t('settings.customPricing.errorNoPrice')); return; }
-    const next = customPricingFormApi.upsertOverride(state.settings?.customModelPricing || [], entry);
-    await saveSettings({ customModelPricing: next });
-    closeForm();
-    renderCustomPricing();
+    const entry = { modelId };
+    for (const [el, key] of rateFields) entry[key] = el.value === '' ? undefined : Number(el.value);
+    if (!customPricingFormApi.hasUsableBasePrice(entry)) {
+      if ([entry.cacheWritePerM, entry.cacheWrite1hPerM].some(value => value !== undefined && (!Number.isFinite(value) || value < 0))) advanced.open = true;
+      showError(t('settings.customPricing.errorNoPrice'));
+      return;
+    }
+    const next = customPricingFormApi.upsertOverride(pricingEdit?.entries || [], entry);
+    saveButton.disabled = true;
+    try {
+      await saveSettings({ customModelPricing: next }, pricingEdit?.base);
+      closeForm();
+      renderCustomPricing();
+    } catch (error) {
+      showError(t(window.TokenMonitorSyncContentForm.isConflictError(error) ? 'settings.sync.content.conflict' : 'settings.customPricing.saveFailed'));
+    } finally {
+      saveButton.disabled = false;
+    }
   });
 
   renderCustomPricing();
@@ -14991,25 +16620,25 @@ function setupCursorAccountUI() {
     window.tokenMonitor.openExternal('https://cursor.com/dashboard');
   });
 
-  document.getElementById('cursorManualSubmit').addEventListener('click', async () => {
+  const cursorManualSubmit = document.getElementById('cursorManualSubmit');
+  cursorManualSubmit.addEventListener('click', () => accountProfileSaves.run('cursor', cursorManualSubmit, async () => {
     const input = document.getElementById('cursorManualInput');
-    const errorEl = document.getElementById('cursorErrorMessage');
-    errorEl.classList.add('hidden');
+    setAccountShellError('cursor', '');
     const result = await window.tokenMonitor.cursor.loginManual(input.value);
     if (!result.ok) {
       const message = result.code === 'EXTERNAL_AGENT_ACTIVE'
         ? t('settings.cursor.agentActive')
         : result.error;
-      errorEl.textContent = t('settings.cursor.loginFailed', { message });
-      errorEl.classList.remove('hidden');
+      setAccountShellError('cursor', t('settings.cursor.loginFailed', { message }));
       return;
     }
     input.value = '';
+    setAccountShellError('cursor', '');
     state.cursorAccount = { status: result.status, error: '', busy: false };
     renderCursorStatus();
     setCursorManualExpanded(false);
     await refreshStats({ force: true });
-  });
+  }));
 
   refreshCursorStatus({ discover: true });
 
@@ -15070,23 +16699,23 @@ function setupCursorAccountUI() {
       // can never be submitted as the other.
       const stale = document.getElementById(isCookie ? 'opencodeApiKeyInput' : 'opencodeCookieInput');
       if (stale) stale.value = '';
-      document.getElementById('opencodeErrorMessage')?.classList.add('hidden');
+      setAccountShellError('opencode', '');
       clearOpenCodeMergeOffer();
     };
     kindSelect?.addEventListener('change', applyOpenCodeCredentialKind);
     applyOpenCodeCredentialKind();
 
-    document.getElementById('opencodeCookieSubmit').addEventListener('click', async () => {
+    const profileSubmit = document.getElementById('opencodeCookieSubmit');
+    profileSubmit.addEventListener('click', () => accountProfileSaves.run('opencode', profileSubmit, async () => {
       const opencodeCredentialKind = kindSelect?.value === 'cookie' ? 'cookie' : 'api';
       const input = document.getElementById(opencodeCredentialKind === 'cookie'
         ? 'opencodeCookieInput'
         : 'opencodeApiKeyInput');
       const nameInput = document.getElementById('opencodeProfileName');
-      const errorEl = document.getElementById('opencodeErrorMessage');
       const name = (nameInput.value || '').trim();
       const cookie = input.value;
 
-      errorEl.classList.add('hidden');
+      setAccountShellError('opencode', '');
 
       // The name is required rather than defaulted. Saving one credential keeps
       // the other under the same name, and the collector reads that as "these
@@ -15094,8 +16723,7 @@ function setupCursorAccountUI() {
       // could attach one account's key to another account's cookie. Making the
       // user type the name is what keeps the association explicit.
       if (!name) {
-        errorEl.textContent = t('settings.opencode.nameRequired');
-        errorEl.classList.remove('hidden');
+        setAccountShellError('opencode', t('settings.opencode.nameRequired'));
         nameInput.focus();
         return;
       }
@@ -15106,7 +16734,7 @@ function setupCursorAccountUI() {
       // it: the next click has different consequences from the one just made.
       const submit = async (merge) => {
         const at = addMergeOffer?.revision();
-        confirmOpenCodeMerge = () => submit(true);
+        confirmOpenCodeMerge = () => accountProfileSaves.run('opencode', addMergeButton, () => submit(true));
         const result = await window.tokenMonitor.opencode.saveProfile(
           name,
           cookie,
@@ -15127,6 +16755,7 @@ function setupCursorAccountUI() {
             nameInput.value = '';
             addMergeOffer?.withdraw();
           }
+          if (!stale) setAccountShellError('opencode', '');
           renderOpenCodeProfiles();
           updateOpenCodeProfilesStatus();
           renderSettingsSummaries();
@@ -15137,11 +16766,10 @@ function setupCursorAccountUI() {
           addMergeOffer.offer(at, name, t('settings.opencode.mergeInto', { name }));
           return;
         }
-        errorEl.textContent = opencodeSaveErrorText(result);
-        errorEl.classList.remove('hidden');
+        setAccountShellError('opencode', opencodeSaveErrorText(result));
       };
       await submit(false);
-    });
+    }));
   }
 
   const openrouterToggle = document.getElementById('openrouterSettingsToggle');
@@ -15164,18 +16792,15 @@ function setupCursorAccountUI() {
     document.getElementById('openrouterOpenBrowser')?.addEventListener('click', () => {
       window.tokenMonitor.openExternal('https://openrouter.ai/settings/keys');
     });
-    document.getElementById('openrouterProfileSubmit')?.addEventListener('click', async () => {
+    const profileSubmit = document.getElementById('openrouterProfileSubmit');
+    profileSubmit?.addEventListener('click', () => accountProfileSaves.run('openrouter', profileSubmit, async () => {
       const nameInput = document.getElementById('openrouterProfileName');
       const keyInput = document.getElementById('openrouterApiKeyInput');
-      const errorEl = document.getElementById('openrouterErrorMessage');
       const name = String(nameInput?.value || '').trim() || 'default';
       const apiKey = String(keyInput?.value || '').trim();
-      errorEl?.classList.add('hidden');
+      setAccountShellError('openrouter', '');
       if (!apiKey) {
-        if (errorEl) {
-          errorEl.textContent = t('settings.openrouter.statusNotSet');
-          errorEl.classList.remove('hidden');
-        }
+        setAccountShellError('openrouter', t('settings.openrouter.statusNotSet'));
         return;
       }
       const result = await window.tokenMonitor.openrouter.saveProfile(name, apiKey);
@@ -15184,11 +16809,10 @@ function setupCursorAccountUI() {
         keyInput.value = '';
         renderOpenRouterProfiles();
         await refreshStats({ force: true });
-      } else if (errorEl) {
-        errorEl.textContent = openrouterProfileErrorText(result);
-        errorEl.classList.remove('hidden');
+      } else {
+        setAccountShellError('openrouter', openrouterProfileErrorText(result));
       }
-    });
+    }));
   }
 
   const thirdpartyToggle = document.getElementById('thirdpartySettingsToggle');
@@ -15216,7 +16840,8 @@ function setupCursorAccountUI() {
       addDetails?.classList.toggle('hidden', !expanded);
       document.getElementById('thirdpartyAddForm')?.classList.toggle('expanded', expanded);
     });
-    document.getElementById('thirdpartyProfileSubmit')?.addEventListener('click', async () => {
+    const profileSubmit = document.getElementById('thirdpartyProfileSubmit');
+    profileSubmit?.addEventListener('click', () => accountProfileSaves.run('thirdparty', profileSubmit, async () => {
       const nameInput = document.getElementById('thirdpartyProfileName');
       const accessTokenInput = document.getElementById('thirdpartyAccessTokenInput');
       const refreshTokenInput = document.getElementById('thirdpartyRefreshTokenInput');
@@ -15229,7 +16854,6 @@ function setupCursorAccountUI() {
       const totalPathInput = document.getElementById('thirdpartyTotalPathInput');
       const currencyInput = document.getElementById('thirdpartyCurrencyInput');
       const divisorInput = document.getElementById('thirdpartyDivisorInput');
-      const errorEl = document.getElementById('thirdpartyErrorMessage');
       const name = String(nameInput?.value || '').trim() || 'default';
       const adapter = selectedThirdPartyAdapter();
       const baseUrl = String(baseUrlInput?.value || '').trim();
@@ -15237,7 +16861,7 @@ function setupCursorAccountUI() {
       const refreshToken = String(refreshTokenInput?.value || '').trim();
       const userId = String(userIdInput?.value || '').trim();
       const apiKey = String(keyInput?.value || '').trim();
-      errorEl?.classList.add('hidden');
+      setAccountShellError('thirdparty', '');
       const result = await window.tokenMonitor.thirdparty.saveProfile({
         name,
         adapter,
@@ -15271,211 +16895,10 @@ function setupCursorAccountUI() {
         divisorInput.value = '1';
         renderThirdPartyProfiles();
         await refreshStats({ force: true });
-      } else if (errorEl) {
-        errorEl.textContent = thirdPartyProfileErrorText(result, adapter);
-        errorEl.classList.remove('hidden');
+      } else {
+        setAccountShellError('thirdparty', thirdPartyProfileErrorText(result, adapter));
       }
-    });
-  }
-
-  const deepseekToggle = document.getElementById('deepseekSettingsToggle');
-  if (deepseekToggle) {
-    deepseekToggle.addEventListener('click', () => setDeepseekAccountExpanded(!state.deepseekAccountExpanded));
-    setDeepseekAccountExpanded(false);
-    renderDeepseekStatus();
-
-    document.getElementById('deepseekOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal('https://platform.deepseek.com/api_keys');
-    });
-
-    document.getElementById('deepseekLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ deepseekApiKey: '' });
-      clearDeepseekPendingCheck();
-      clearDeepseekProviderStatus();
-      renderDeepseekStatus();
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('deepseekRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('deepseekApiKeySubmit').addEventListener('click', async () => {
-      const input = document.getElementById('deepseekApiKeyInput');
-      const errorEl = document.getElementById('deepseekErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.deepseek.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markDeepseekKeyCheckPending();
-        await saveSettings({ deepseekApiKey: input.value });
-        input.value = '';
-        renderDeepseekStatus();
-        await refreshStats({ force: true });
-        if (deepseekAccountLinked()) setDeepseekAccountExpanded(false);
-        else setDeepseekAccountExpanded(true);
-        renderDeepseekStatus();
-      } catch (err) {
-        clearDeepseekPendingCheck();
-        errorEl.textContent = t('settings.deepseek.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
-  }
-  const minimaxToggle = document.getElementById('minimaxSettingsToggle');
-  if (minimaxToggle) {
-    minimaxToggle.addEventListener('click', () => setMinimaxAccountExpanded(!state.minimaxAccountExpanded));
-    setMinimaxAccountExpanded(false);
-    renderMinimaxStatus();
-
-    document.getElementById('minimaxOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal(minimaxPlatformUrl());
-    });
-
-    document.getElementById('minimaxLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ minimaxApiKey: '' });
-      clearMinimaxPendingCheck();
-      clearMinimaxProviderStatus();
-      renderMinimaxStatus();
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('minimaxRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('minimaxApiKeySubmit').addEventListener('click', async () => {
-      const input = document.getElementById('minimaxApiKeyInput');
-      const errorEl = document.getElementById('minimaxErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.minimax.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markMinimaxKeyCheckPending();
-        await saveSettings({ minimaxApiKey: input.value });
-        input.value = '';
-        renderMinimaxStatus();
-        await refreshStats({ force: true });
-        if (minimaxAccountLinked()) setMinimaxAccountExpanded(false);
-        else setMinimaxAccountExpanded(true);
-        renderMinimaxStatus();
-      } catch (err) {
-        clearMinimaxPendingCheck();
-        errorEl.textContent = t('settings.minimax.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
-  }
-
-  const zaiToggle = document.getElementById('zaiSettingsToggle');
-  if (zaiToggle) {
-    const zaiApiRegionInput = document.getElementById('zaiApiRegionInput');
-    if (zaiApiRegionInput) zaiApiRegionInput.value = state.settings?.zaiApiRegion === 'bigmodel-cn' ? 'bigmodel-cn' : 'global';
-    zaiApiRegionInput?.addEventListener('change', () => void saveSettings({ zaiApiRegion: zaiApiRegionInput.value || 'global' }));
-    zaiToggle.addEventListener('click', () => setExternalAccountExpanded('zai', !state.zaiAccountExpanded));
-    setExternalAccountExpanded('zai', false);
-    renderExternalProviderStatus('zai');
-
-    document.getElementById('zaiOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal(zaiPlatformUrl());
-    });
-
-    document.getElementById('zaiLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ zaiApiKey: '' });
-      clearExternalProviderCheckPending('zai');
-      clearExternalProviderPendingStatus('zai');
-      renderExternalProviderStatus('zai');
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('zaiRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('zaiApiKeySubmit').addEventListener('click', async () => {
-      const input = document.getElementById('zaiApiKeyInput');
-      const regionInput = document.getElementById('zaiApiRegionInput');
-      const errorEl = document.getElementById('zaiErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.zai.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('zai');
-        await saveSettings({ zaiApiKey: input.value, zaiApiRegion: regionInput?.value || 'global' });
-        input.value = '';
-        renderExternalProviderStatus('zai');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('zai', !externalProviderAccountLinked('zai'));
-        renderExternalProviderStatus('zai');
-      } catch (err) {
-        clearExternalProviderCheckPending('zai');
-        errorEl.textContent = t('settings.zai.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
-  }
-
-  const zaiteamToggle = document.getElementById('zaiteamSettingsToggle');
-  if (zaiteamToggle) {
-    zaiteamToggle.addEventListener('click', () => setExternalAccountExpanded('zaiteam', !state.zaiteamAccountExpanded));
-    setExternalAccountExpanded('zaiteam', false);
-    renderExternalProviderStatus('zaiteam');
-
-    document.getElementById('zaiteamOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal(zaiteamPlatformUrl());
-    });
-
-    document.getElementById('zaiteamLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ zaiTeamApiKey: '', zaiTeamOrganizationId: '', zaiTeamProjectId: '' });
-      clearExternalProviderCheckPending('zaiteam');
-      clearExternalProviderPendingStatus('zaiteam');
-      renderExternalProviderStatus('zaiteam');
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('zaiteamRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('zaiteamApiKeySubmit').addEventListener('click', async () => {
-      const keyInput = document.getElementById('zaiteamApiKeyInput');
-      const orgInput = document.getElementById('zaiteamOrganizationIdInput');
-      const projectInput = document.getElementById('zaiteamProjectIdInput');
-      const errorEl = document.getElementById('zaiteamErrorMessage');
-      errorEl.classList.add('hidden');
-      const apiKey = String(keyInput.value || '').trim();
-      const organizationId = String(orgInput.value || '').trim();
-      const projectId = String(projectInput.value || '').trim();
-      if (!apiKey || !organizationId || !projectId) {
-        errorEl.textContent = t('settings.zaiteam.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('zaiteam');
-        await saveSettings({ zaiTeamApiKey: apiKey, zaiTeamOrganizationId: organizationId, zaiTeamProjectId: projectId });
-        keyInput.value = '';
-        orgInput.value = '';
-        projectInput.value = '';
-        renderExternalProviderStatus('zaiteam');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('zaiteam', !externalProviderAccountLinked('zaiteam'));
-        renderExternalProviderStatus('zaiteam');
-      } catch (err) {
-        clearExternalProviderCheckPending('zaiteam');
-        errorEl.textContent = t('settings.zaiteam.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
+    }));
   }
 
   const volcengineToggle = document.getElementById('volcengineSettingsToggle');
@@ -15501,368 +16924,52 @@ function setupCursorAccountUI() {
       await refreshStats({ force: true });
     });
 
-    document.getElementById('volcengineLogoutButton').addEventListener('click', async () => {
-      await saveSettings({
-        volcengineAccessKeyId: '', volcengineSecretAccessKey: '', volcengineRegion: '',
-        volcengineAgentAccessKeyId: '', volcengineAgentSecretAccessKey: '', volcengineAgentRegion: ''
-      });
-      clearExternalProviderCheckPending('volcengine');
-      clearExternalProviderPendingStatus('volcengine');
-      renderExternalProviderStatus('volcengine');
-      await refreshStats({ force: true });
-    });
+    document.getElementById('volcengineLogoutButton').addEventListener('click', () => clearAccountCredential('volcengine'));
 
     document.getElementById('volcengineRefreshButton').addEventListener('click', async () => {
       await refreshStats({ force: true });
     });
 
-    document.getElementById('volcengineCredentialsSubmit').addEventListener('click', async () => {
+    document.getElementById('volcengineCredentialsSubmit').addEventListener('click', async (event) => {
       const accessKeyInput = document.getElementById('volcengineAccessKeyInput');
       const secretInput = document.getElementById('volcengineSecretAccessKeyInput');
       const regionInput = document.getElementById('volcengineRegionInput');
       const agentAccessKeyInput = document.getElementById('volcengineAgentAccessKeyInput');
       const agentSecretInput = document.getElementById('volcengineAgentSecretAccessKeyInput');
       const agentRegionInput = document.getElementById('volcengineAgentRegionInput');
-      const errorEl = document.getElementById('volcengineErrorMessage');
-      errorEl.classList.add('hidden');
       const accessKeyValue = String(accessKeyInput.value || '').trim();
       const secretValue = String(secretInput.value || '').trim();
-      if (!accessKeyValue || (/^AKLT/i.test(accessKeyValue) && !secretValue)) {
-        errorEl.textContent = t('settings.volcengine.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      // Only sent when the user actually filled the override in, so saving the
-      // Coding Plan key again cannot silently wipe a separate Agent account.
+      // Checks only this panel can make: which fields pair with which.
       const agentAccessKeyValue = String(agentAccessKeyInput?.value || '').trim();
       const agentSecretValue = String(agentSecretInput?.value || '').trim();
-      if (agentAccessKeyValue && !agentSecretValue) {
-        errorEl.textContent = t('settings.volcengine.agentSecretRequired');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('volcengine');
-        await saveSettings({
-          volcengineAccessKeyId: accessKeyInput.value,
-          volcengineSecretAccessKey: secretInput.value,
-          volcengineRegion: regionInput.value || 'cn-beijing',
-          ...(agentAccessKeyValue ? {
-            volcengineAgentAccessKeyId: agentAccessKeyValue,
-            volcengineAgentSecretAccessKey: agentSecretValue,
-            volcengineAgentRegion: agentRegionInput?.value || 'cn-beijing'
-          } : {})
-        });
-        accessKeyInput.value = '';
-        secretInput.value = '';
-        if (agentAccessKeyInput) agentAccessKeyInput.value = '';
-        if (agentSecretInput) agentSecretInput.value = '';
+      const pairing = accessKeyValue && /^AKLT/i.test(accessKeyValue) && !secretValue
+        ? 'settings.volcengine.secretRequired'
+        : agentAccessKeyValue && !agentSecretValue ? 'settings.volcengine.agentSecretRequired' : '';
+      if (pairing) {
+        setAccountPanelMessage('volcengine', { key: pairing });
         renderExternalProviderStatus('volcengine');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('volcengine', !externalProviderAccountLinked('volcengine'));
-        renderExternalProviderStatus('volcengine');
-      } catch (err) {
-        clearExternalProviderCheckPending('volcengine');
-        errorEl.textContent = t('settings.volcengine.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
-  }
-
-  const claudeToggle = document.getElementById('claudeSettingsToggle');
-  if (claudeToggle) {
-    claudeToggle.addEventListener('click', () => setExternalAccountExpanded('claude', !state.claudeAccountExpanded));
-    setExternalAccountExpanded('claude', false);
-    renderExternalProviderStatus('claude');
-
-    document.getElementById('claudeOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal(claudePlatformUrl());
-    });
-
-    document.getElementById('claudeLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ claudeWebCookie: '' });
-      clearExternalProviderCheckPending('claude');
-      clearExternalProviderPendingStatus('claude');
-      renderExternalProviderStatus('claude');
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('claudeRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('claudeWebCookieSubmit').addEventListener('click', async () => {
-      const input = document.getElementById('claudeWebCookieInput');
-      const submitButton = document.getElementById('claudeWebCookieSubmit');
-      const errorEl = document.getElementById('claudeErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.claude.cookieRequired');
-        errorEl.classList.remove('hidden');
         return;
       }
-      if (/[\r\n]/.test(input.value)) {
-        errorEl.textContent = t('settings.claude.cookieInvalidFormat');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      if (submitButton.disabled) return;
-      submitButton.disabled = true;
-      submitButton.textContent = t('settings.common.checking');
-      try {
-        const result = await window.tokenMonitor.claude.saveCookie(input.value);
-        if (result?.superseded) return;
-        if (!result?.ok) {
-          if (result?.errorCode === 'INVALID_CLAUDE_WEB_SESSION_KEY') {
-            errorEl.textContent = t('settings.claude.cookieInvalidFormat');
-          } else if (result?.errorCode === 'CLAUDE_WEB_SOURCE_CHALLENGE') {
-            errorEl.textContent = t('settings.claude.sourceChallenge');
-          } else if (result?.status === 'unauthorized') {
-            errorEl.textContent = t('settings.claude.cookieRejected');
-          } else {
-            errorEl.textContent = t('settings.claude.cookieCheckFailed');
-          }
-          errorEl.classList.remove('hidden');
-          return;
+      await submitAccountCredential(event.currentTarget, 'volcengine', {
+        volcengineAccessKeyId: accessKeyInput.value,
+        volcengineSecretAccessKey: secretInput.value,
+        volcengineRegion: regionInput.value || 'cn-beijing',
+        // Only sent when the user actually filled the override in, so saving the
+        // Coding Plan key again cannot silently wipe a separate Agent account.
+        ...(agentAccessKeyValue ? {
+          volcengineAgentAccessKeyId: agentAccessKeyValue,
+          volcengineAgentSecretAccessKey: agentSecretValue,
+          volcengineAgentRegion: agentRegionInput?.value || 'cn-beijing'
+        } : {})
+      }, {
+        failedKey: 'settings.volcengine.saveFailed',
+        clearInput: () => {
+          accessKeyInput.value = '';
+          secretInput.value = '';
+          if (agentAccessKeyInput) agentAccessKeyInput.value = '';
+          if (agentSecretInput) agentSecretInput.value = '';
         }
-        markExternalProviderCheckPending('claude');
-        await saveSettings({
-          limitProviders: limitProviderSelectionIncluding('claude'),
-          limitsEnabled: true
-        });
-        input.value = '';
-        renderExternalProviderStatus('claude');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('claude', !externalProviderAccountLinked('claude'));
-        renderExternalProviderStatus('claude');
-      } catch (err) {
-        clearExternalProviderCheckPending('claude');
-        errorEl.textContent = t('settings.claude.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      } finally {
-        submitButton.disabled = false;
-        submitButton.textContent = t('settings.claude.saveCookie');
-      }
-    });
-  }
-
-  const qoderToggle = document.getElementById('qoderSettingsToggle');
-  if (qoderToggle) {
-    qoderToggle.addEventListener('click', () => setExternalAccountExpanded('qoder', !state.qoderAccountExpanded));
-    setExternalAccountExpanded('qoder', false);
-    renderExternalProviderStatus('qoder');
-
-    const qoderSiteInput = document.getElementById('qoderSiteInput');
-    if (qoderSiteInput) qoderSiteInput.value = state.settings?.qoderSite === 'cn' ? 'cn' : 'global';
-    updateQoderUsagePageHint();
-    qoderSiteInput?.addEventListener('change', () => {
-      updateQoderUsagePageHint();
-      void saveSettings({ qoderSite: qoderSiteInput.value || 'global' });
-    });
-
-    document.getElementById('qoderOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal(qoderPlatformUrl());
-    });
-
-    document.getElementById('qoderLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ qoderCookie: '' });
-      clearExternalProviderCheckPending('qoder');
-      clearExternalProviderPendingStatus('qoder');
-      renderExternalProviderStatus('qoder');
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('qoderRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('qoderCookieSubmit').addEventListener('click', async () => {
-      const input = document.getElementById('qoderCookieInput');
-      const siteInput = document.getElementById('qoderSiteInput');
-      const errorEl = document.getElementById('qoderErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.qoder.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('qoder');
-        await saveSettings({ qoderCookie: input.value, qoderSite: siteInput?.value || 'global' });
-        input.value = '';
-        renderExternalProviderStatus('qoder');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('qoder', !externalProviderAccountLinked('qoder'));
-        renderExternalProviderStatus('qoder');
-      } catch (err) {
-        clearExternalProviderCheckPending('qoder');
-        errorEl.textContent = t('settings.qoder.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
-  }
-
-  const traeToggle = document.getElementById('traeSettingsToggle');
-  if (traeToggle) {
-    traeToggle.addEventListener('click', () => setExternalAccountExpanded('trae', !state.traeAccountExpanded));
-    setExternalAccountExpanded('trae', false);
-    renderExternalProviderStatus('trae');
-
-    document.getElementById('traeOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal('https://www.trae.cn');
-    });
-    document.getElementById('traeLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ traeAccessToken: '', traeDeviceId: '' });
-      clearExternalProviderCheckPending('trae');
-      clearExternalProviderPendingStatus('trae');
-      renderExternalProviderStatus('trae');
-      await refreshStats({ force: true });
-    });
-    document.getElementById('traeRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-    document.getElementById('traeTokenSubmit').addEventListener('click', async () => {
-      const tokenInput = document.getElementById('traeTokenInput');
-      const deviceIdInput = document.getElementById('traeDeviceIdInput');
-      const errorEl = document.getElementById('traeErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(tokenInput.value || '').trim()) {
-        errorEl.textContent = t('settings.trae.missingAuthorization');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('trae');
-        await saveSettings({
-          traeAccessToken: tokenInput.value,
-          traeDeviceId: deviceIdInput.value,
-          limitProviders: limitProviderSelectionIncluding('trae'),
-          limitsEnabled: true
-        });
-        tokenInput.value = '';
-        deviceIdInput.value = '';
-        renderExternalProviderStatus('trae');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('trae', !externalProviderAccountLinked('trae'));
-        renderExternalProviderStatus('trae');
-      } catch (err) {
-        clearExternalProviderCheckPending('trae');
-        errorEl.textContent = t('settings.trae.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
-  }
-
-  const commandcodeToggle = document.getElementById('commandcodeSettingsToggle');
-  if (commandcodeToggle) {
-    commandcodeToggle.addEventListener('click', () => setExternalAccountExpanded('commandcode', !state.commandcodeAccountExpanded));
-    setExternalAccountExpanded('commandcode', false);
-    renderExternalProviderStatus('commandcode');
-
-    document.getElementById('commandcodeOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal(commandcodePlatformUrl());
-    });
-
-    document.getElementById('commandcodeLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ commandcodeCookie: '' });
-      clearExternalProviderCheckPending('commandcode');
-      clearExternalProviderPendingStatus('commandcode');
-      renderExternalProviderStatus('commandcode');
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('commandcodeRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-
-    document.getElementById('commandcodeCookieSubmit').addEventListener('click', async () => {
-      const input = document.getElementById('commandcodeCookieInput');
-      const errorEl = document.getElementById('commandcodeErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.commandcode.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('commandcode');
-        await saveSettings({
-          commandcodeCookie: input.value,
-          limitProviders: limitProviderSelectionIncluding('commandcode'),
-          limitsEnabled: true
-        });
-        input.value = '';
-        renderExternalProviderStatus('commandcode');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('commandcode', !externalProviderAccountLinked('commandcode'));
-        renderExternalProviderStatus('commandcode');
-      } catch (err) {
-        clearExternalProviderCheckPending('commandcode');
-        errorEl.textContent = t('settings.commandcode.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
-    });
-  }
-
-  const ollamaToggle = document.getElementById('ollamaSettingsToggle');
-  if (ollamaToggle) {
-    ollamaToggle.addEventListener('click', () => setExternalAccountExpanded('ollama', !state.ollamaAccountExpanded));
-    setExternalAccountExpanded('ollama', false);
-    renderExternalProviderStatus('ollama');
-
-    document.getElementById('ollamaOpenBrowser').addEventListener('click', () => {
-      window.tokenMonitor.openExternal(ollamaPlatformUrl());
-    });
-    document.getElementById('ollamaLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ ollamaCookie: '' });
-      clearExternalProviderCheckPending('ollama');
-      clearExternalProviderPendingStatus('ollama');
-      renderExternalProviderStatus('ollama');
-      await refreshStats({ force: true });
-    });
-    document.getElementById('ollamaRefreshButton').addEventListener('click', async () => {
-      await refreshStats({ force: true });
-    });
-    document.getElementById('ollamaCookieSubmit').addEventListener('click', async () => {
-      const input = document.getElementById('ollamaCookieInput');
-      const errorEl = document.getElementById('ollamaErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.ollama.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('ollama');
-        renderExternalProviderStatus('ollama');
-        const validation = await window.tokenMonitor.ollama.validateCookie(input.value);
-        if (!validation?.ok) {
-          clearExternalProviderCheckPending('ollama');
-          renderExternalProviderStatus('ollama');
-          errorEl.textContent = ollamaValidationError(validation);
-          errorEl.classList.remove('hidden');
-          return;
-        }
-        await saveSettings({
-          ollamaCookie: input.value,
-          limitProviders: limitProviderSelectionIncluding('ollama'),
-          limitsEnabled: true
-        });
-        if (!state.settings?.ollamaCookieConfigured) {
-          clearExternalProviderCheckPending('ollama');
-          renderExternalProviderStatus('ollama');
-          errorEl.textContent = t('settings.ollama.validationInvalid');
-          errorEl.classList.remove('hidden');
-          return;
-        }
-        input.value = '';
-        renderExternalProviderStatus('ollama');
-      } catch (err) {
-        clearExternalProviderCheckPending('ollama');
-        renderExternalProviderStatus('ollama');
-        errorEl.textContent = t('settings.ollama.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
+      });
     });
   }
 
@@ -15876,70 +16983,94 @@ function setupCursorAccountUI() {
       window.tokenMonitor.openExternal(kimiPlatformUrl());
     });
 
-    document.getElementById('kimiLogoutButton').addEventListener('click', async () => {
-      await saveSettings({ kimiApiKey: '', kimiWebAccessToken: '' });
-      clearExternalProviderCheckPending('kimi');
-      clearExternalProviderPendingStatus('kimi');
-      renderExternalProviderStatus('kimi');
-      await refreshStats({ force: true });
-    });
+    document.getElementById('kimiLogoutButton').addEventListener('click', () => clearAccountCredential('kimi'));
 
     document.getElementById('kimiRefreshButton').addEventListener('click', async () => {
       await refreshStats({ force: true });
     });
 
-    document.getElementById('kimiWebAccessTokenSubmit').addEventListener('click', async () => {
-      const input = document.getElementById('kimiWebAccessTokenInput');
-      const errorEl = document.getElementById('kimiErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.kimi.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
+    // Two independent lanes: each submit sends only its own credential, so
+    // saving one never blanks the other.
+    for (const [submitId, inputId, field] of [
+      ['kimiApiKeySubmit', 'kimiApiKeyInput', 'kimiApiKey'],
+      ['kimiWebAccessTokenSubmit', 'kimiWebAccessTokenInput', 'kimiWebAccessToken']
+    ]) {
+      document.getElementById(submitId).addEventListener('click', (event) => {
+        const input = document.getElementById(inputId);
+        return submitAccountCredential(event.currentTarget, 'kimi', { [field]: input.value }, {
+          failedKey: 'settings.kimi.saveFailed',
+          clearInput: () => { input.value = ''; }
+        });
+      });
+    }
+  }
+
+  const antigravityToggle = document.getElementById('antigravitySettingsToggle');
+  if (antigravityToggle && window.tokenMonitor.antigravity) {
+    antigravityToggle.addEventListener('click', () => {
+      setAntigravityAccountExpanded(!state.antigravityAccountExpanded);
+    });
+    setAntigravityAccountExpanded(false);
+    renderAntigravityStatus();
+
+    window.tokenMonitor.antigravity.onAccounts((accounts) => {
+      state.settings.antigravityManagedAccounts = accounts || [];
+      renderAntigravityStatus();
+    });
+    window.tokenMonitor.antigravity.accounts().then((accounts) => {
+      state.settings.antigravityManagedAccounts = accounts || [];
+      renderAntigravityStatus();
+    }).catch(() => {});
+
+    document.getElementById('antigravityAddAccountButton').addEventListener('click', async () => {
+      if (state.antigravitySignInBusy) return;
+      state.antigravitySignInBusy = true;
+      state.antigravityAccountError = '';
+      renderAntigravityStatus();
+      let result;
       try {
-        markExternalProviderCheckPending('kimi');
-        await saveSettings({ kimiWebAccessToken: input.value });
-        input.value = '';
-        renderExternalProviderStatus('kimi');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('kimi', !externalProviderAccountLinked('kimi'));
-        renderExternalProviderStatus('kimi');
-      } catch (err) {
-        clearExternalProviderCheckPending('kimi');
-        errorEl.textContent = t('settings.kimi.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
+        result = await window.tokenMonitor.antigravity.addAccount();
+      } catch (error) {
+        result = { ok: false, error: error.message };
+      } finally {
+        state.antigravitySignInBusy = false;
       }
+      if (!result?.ok && result?.errorCode !== 'cancelled') {
+        const errorKeys = {
+          OAUTH_CLIENT_NOT_FOUND: 'settings.antigravity.oauthClientMissing',
+          TIMEOUT: 'settings.antigravity.loginTimeout',
+          STATE_MISMATCH: 'settings.antigravity.loginStateMismatch',
+          credentialStorageUnavailable: 'settings.antigravity.credentialStorageUnavailable',
+          loginInProgress: 'settings.antigravity.loginInProgress'
+        };
+        state.antigravityAccountError = errorKeys[result?.errorCode]
+          ? t(errorKeys[result.errorCode])
+          : result?.error || t('settings.antigravity.loginFailed');
+      } else if (result?.ok) {
+        state.antigravityAccountError = '';
+        state.settings.antigravityManagedAccounts = result.accounts || [];
+        // Match the Codex account flow: the account is connected as soon as its
+        // credential is stored. Quota onboarding and refresh continue in the
+        // background instead of leaving the login button visually busy.
+        refreshStats({ force: true }).catch(() => {});
+      }
+      renderAntigravityStatus();
     });
 
-    document.getElementById('kimiApiKeySubmit').addEventListener('click', async () => {
-      const input = document.getElementById('kimiApiKeyInput');
-      const errorEl = document.getElementById('kimiErrorMessage');
-      errorEl.classList.add('hidden');
-      if (!String(input.value || '').trim()) {
-        errorEl.textContent = t('settings.kimi.statusNotSet');
-        errorEl.classList.remove('hidden');
-        return;
-      }
-      try {
-        markExternalProviderCheckPending('kimi');
-        await saveSettings({ kimiApiKey: input.value });
-        input.value = '';
-        renderExternalProviderStatus('kimi');
-        await refreshStats({ force: true });
-        setExternalAccountExpanded('kimi', !externalProviderAccountLinked('kimi'));
-        renderExternalProviderStatus('kimi');
-      } catch (err) {
-        clearExternalProviderCheckPending('kimi');
-        errorEl.textContent = t('settings.kimi.saveFailed', { message: err.message });
-        errorEl.classList.remove('hidden');
-      }
+    document.getElementById('antigravityCancelLoginButton').addEventListener('click', async () => {
+      await window.tokenMonitor.antigravity.cancelLogin();
+      state.antigravitySignInBusy = false;
+      renderAntigravityStatus();
     });
   }
 
   const mimoToggle = document.getElementById('mimoSettingsToggle');
   if (mimoToggle) {
-    mimoToggle.addEventListener('click', () => setMimoAccountExpanded(!state.mimoAccountExpanded));
+    mimoToggle.addEventListener('click', () => {
+      const expanding = !state.mimoAccountExpanded;
+      setMimoAccountExpanded(expanding);
+      if (expanding) void refreshMimoAccounts();
+    });
 
     const addToggle = document.getElementById('mimoAddToggle');
     const addDetails = document.getElementById('mimoAddDetails');
@@ -15958,10 +17089,7 @@ function setupCursorAccountUI() {
       renderMimoStatus();
     });
 
-    window.tokenMonitor.mimo.accounts().then((accounts) => {
-      state.settings.mimoManagedAccounts = accounts || [];
-      renderMimoStatus();
-    }).catch(() => {});
+    void refreshMimoAccounts();
 
     document.getElementById('mimoOpenConsoleButton').addEventListener('click', async () => {
       const result = await window.tokenMonitor.mimo.openConsole();
@@ -16024,13 +17152,9 @@ function setupCursorAccountUI() {
     setCopilotManualExpanded(false);
     renderCopilotStatus();
 
-    const errorEl = document.getElementById('copilotErrorMessage');
     const setCopilotError = (message) => {
       state.copilotErrorMessage = message || '';
-      if (errorEl) {
-        errorEl.textContent = state.copilotErrorMessage;
-        errorEl.classList.toggle('hidden', !state.copilotErrorMessage);
-      }
+      renderCopilotStatus();
     };
 
     window.tokenMonitor.copilot?.onLoginStatus?.((status) => {
@@ -16153,22 +17277,13 @@ function initSettingsAnimationWrappers() {
     '.settings-section-details',
     '.cursor-settings-details',
     '.advanced-settings-details',
-    '.app-update-notes-details',
     '.hub-mode-fields',
     '.presence-feature-body',
-    '#claudeManualPanel',
-    '#cursorManualPanel',
     '#opencodeManualPanel',
-    '#deepseekManualPanel',
-    '#minimaxManualPanel',
-    '#zaiManualPanel',
-    '#zaiteamManualPanel',
-    '#volcengineManualPanel',
-    '#qoderManualPanel',
-    '#traeManualPanel',
-    '#commandcodeManualPanel',
+    '#cursorManualPanel',
     '#kimiManualPanel',
-    '#ollamaManualPanel'
+    '.credential-manual-panel',
+    '#volcengineManualPanel'
   ].join(', ');
 
   document.querySelectorAll(selectors).forEach(el => {
@@ -16180,9 +17295,9 @@ function initSettingsAnimationWrappers() {
       ? 'cursor-settings-details-inner'
       : el.classList.contains('settings-section-details')
         ? 'settings-section-details-inner'
-        : 'accordion-animation-inner';
+        : '';
 
-    inner.className = `accordion-animation-inner ${innerSpecificClass}`;
+    inner.className = ['accordion-animation-inner', innerSpecificClass].filter(Boolean).join(' ');
     while (el.firstChild) {
       inner.appendChild(el.firstChild);
     }
@@ -16192,7 +17307,15 @@ function initSettingsAnimationWrappers() {
 }
 
 initSettingsAnimationWrappers();
+syncContentForm = window.TokenMonitorSyncContentForm.createSyncContentForm({
+  document, bridge: window.tokenMonitor, t, saveSettings, getSettings: () => state.settings
+});
+setupSettingsAccordion(
+  document.getElementById('syncContentGroup'), document.getElementById('syncContentToggle'),
+  document.getElementById('syncContentDetails'), expanded => syncContentForm.setExpanded(expanded)
+);
 setupSettingsSections();
 setupCursorAccountUI();
 setupCustomPricingUI();
+setupModelAliasesUI();
 init();

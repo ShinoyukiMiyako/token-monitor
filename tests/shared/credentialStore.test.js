@@ -45,6 +45,7 @@ test('stores credential settings in a versioned provider document', (t) => {
     zaiTeamOrganizationId: 'organization-id',
     traeAccessToken: 'trae-token',
     traeDeviceId: 'trae-device',
+    devinBearerToken: 'devin-token',
     qoderCookie: ''
   });
 
@@ -63,6 +64,7 @@ test('stores credential settings in a versioned provider document', (t) => {
   assert.equal(document.credentials.providers.zaiTeam.organizationId, 'organization-id');
   assert.equal(document.credentials.providers.trae.accessToken, 'trae-token');
   assert.equal(document.credentials.providers.trae.deviceId, 'trae-device');
+  assert.equal(document.credentials.providers.devin.bearerToken, 'devin-token');
   assert.equal(document.credentials.providers.qoder, undefined);
   assert.equal(document.migrations.settings, 1);
 
@@ -85,7 +87,8 @@ test('stores credential settings in a versioned provider document', (t) => {
     kimiWebAccessToken: 'kimi-web-token',
     zaiTeamOrganizationId: 'organization-id',
     traeAccessToken: 'trae-token',
-    traeDeviceId: 'trae-device'
+    traeDeviceId: 'trae-device',
+    devinBearerToken: 'devin-token'
   });
 });
 
@@ -109,11 +112,34 @@ test('removes credential fields from settings without mutating runtime state', (
   assert.equal(hasCredentialSettings(clean), false);
 });
 
+test('saved Claude Web logins live in the credential store and replace the single cookie in one write', (t) => {
+  const dataDir = tempDataDir(t);
+  const store = new CredentialStore(dataDir);
+  store.replaceSettingsCredentials({ claudeWebCookie: 'sessionKey=sk-ant-legacy' });
+
+  const claudeWebAccounts = [
+    { id: 'a', cookie: 'sessionKey=sk-ant-legacy', accountKey: 'sha256:a', accountEmail: 'a@example.com' },
+    { id: 'b', cookie: 'sessionKey=sk-ant-b', accountKey: 'sha256:b', accountEmail: 'b@example.com' }
+  ];
+  // What the widget saves once the legacy cookie has become the first account.
+  store.replaceSettingsCredentials({ claudeWebCookie: '', claudeWebAccounts });
+
+  const document = JSON.parse(fs.readFileSync(path.join(dataDir, 'credentials.json'), 'utf8'));
+  assert.deepEqual(document.credentials.providers.claude, { webAccounts: claudeWebAccounts });
+  assert.deepEqual(store.settingsCredentials(), { claudeWebAccounts });
+  assert.deepEqual(stripCredentialSettings({ language: 'auto', claudeWebAccounts }), { language: 'auto' });
+
+  // Removing the last login leaves nothing behind for Claude at all.
+  store.replaceSettingsCredentials({ claudeWebAccounts: [] });
+  assert.deepEqual(store.settingsCredentials(), {});
+});
+
 test('renderer redaction defaults new credential fields to hidden with explicit exceptions', () => {
   const settings = {
     hubHostSecret: 'host-secret',
     secret: 'client-secret',
     claudeWebCookie: 'sessionKey=claude-secret',
+    claudeWebAccounts: [{ id: 'a', cookie: 'sessionKey=claude-account-secret', accountEmail: 'a@example.com' }],
     deepseekApiKey: 'provider-secret',
     opencodeProfiles: { work: { cookie: 'auth=secret' } },
     openrouterProfiles: { personal: { apiKey: 'sk-or-secret' } },
@@ -125,6 +151,7 @@ test('renderer redaction defaults new credential fields to hidden with explicit 
   assert.equal(redacted.hubHostSecret, 'host-secret');
   assert.equal(redacted.secret, 'client-secret');
   assert.equal(redacted.claudeWebCookie, '');
+  assert.equal(redacted.claudeWebAccounts, '');
   assert.equal(redacted.deepseekApiKey, '');
   assert.equal(redacted.opencodeProfiles, '');
   assert.equal(redacted.openrouterProfiles, '');
@@ -308,4 +335,35 @@ test('stores, migrates, and removes MiMo account cookies in the unified store', 
   assert.equal(store.removeMimoCredential('account-1'), true);
   assert.equal(store.readMimoCredential('account-1'), '');
   assert.equal(store.writeMimoCredential('__proto__', 'serviceToken=unsafe'), false);
+});
+
+test('stores and removes Antigravity OAuth credentials without exposing them as settings', (t) => {
+  const store = new CredentialStore(tempDataDir(t));
+  const credentials = {
+    accessToken: 'access-secret',
+    refreshToken: 'refresh-secret',
+    expiresAt: 12345,
+    clientId: 'client-id',
+    clientSecret: 'client-secret'
+  };
+  assert.equal(store.writeAntigravityCredential('account-1', credentials), true);
+  assert.deepEqual(store.readAntigravityCredential('account-1'), credentials);
+  assert.equal(store.settingsCredentials().antigravityManagedAccounts, undefined);
+  assert.equal(store.removeAntigravityCredential('account-1'), true);
+  assert.equal(store.readAntigravityCredential('account-1'), null);
+  assert.equal(store.writeAntigravityCredential('__proto__', credentials), false);
+});
+
+test('stores Zed dashboard Cookie as a fixed credential and redacts it for renderer settings', (t) => {
+  const store = new CredentialStore(tempDataDir(t));
+  store.replaceSettingsCredentials({ zedCookie: 'zed.session=secret; c15t=challenge' });
+  assert.equal(store.settingsCredentials().zedCookie, 'zed.session=secret; c15t=challenge');
+  assert.equal(credentialSettingsForRenderer({ zedCookie: 'secret' }).zedCookie, '');
+});
+
+test('stores TypeSafe Console Cookie outside settings and redacts it for the renderer', (t) => {
+  const store = new CredentialStore(tempDataDir(t));
+  store.replaceSettingsCredentials({ typesafeCookie: 'session=secret' });
+  assert.equal(store.settingsCredentials().typesafeCookie, 'session=secret');
+  assert.equal(credentialSettingsForRenderer({ typesafeCookie: 'session=secret' }).typesafeCookie, '');
 });

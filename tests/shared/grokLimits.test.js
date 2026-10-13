@@ -10,11 +10,12 @@ const test = require('node:test');
 
 const {
   GROK_WEB_BILLING_GRPC_URL,
+  GROK_CLI_SETTINGS_URL,
   resolveGrokHome,
   resolveGrokCredential,
   isRetryableNetworkError,
   validateGrokGrpcStatus
-} = require('../../src/shared/grokLimits');
+} = require('../../src/shared/providers/grok/limits');
 const {
   grokCredential,
   readAuthJson,
@@ -23,7 +24,7 @@ const {
   fetchGrokRpcBilling,
   fetchGrokLimits,
   parseLimitProviders
-} = require('../../src/shared/limitCollector');
+} = require('../../src/shared/limits/collector');
 
 function writeAuthJson(homeDir, entries) {
   const filePath = path.join(homeDir, 'auth.json');
@@ -478,6 +479,20 @@ test('fetchGrokLimits preserves cancellation after a successful web billing read
   }), /web result superseded/);
 });
 
+test('fetchGrokLimits propagates cancellation raised during the tier lookup', async () => {
+  const controller = new AbortController();
+
+  await assert.rejects(fetchGrokLimits({ grokBearerToken: 'eyJsecret.signature' }, {
+    env: {},
+    signal: controller.signal,
+    fetchWebGrpcBilling: async () => [],
+    fetchSubscriptionTier: async () => {
+      controller.abort(new Error('tier lookup superseded'));
+      throw new Error('aborted');
+    }
+  }), /tier lookup superseded/);
+});
+
 test('fetchGrokLimits prefers Grok CLI RPC billing before bearer web fallback', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'grok-rpc-'));
   writeAuthJson(home, {
@@ -495,6 +510,7 @@ test('fetchGrokLimits prefers Grok CLI RPC billing before bearer web fallback', 
     usage: { totalUsed: { val: 2500 } }
   };
   let rpcCalled = false;
+  let tierToken = '';
   const r = await fetchGrokLimits(
     {},
     {
@@ -505,6 +521,10 @@ test('fetchGrokLimits prefers Grok CLI RPC billing before bearer web fallback', 
         rpcCalled = true;
         return body;
       },
+      fetchSubscriptionTier: async (credential) => {
+        tierToken = credential.token;
+        return 'SuperGrok Heavy';
+      },
       fetch: async () => {
         throw new Error('web fallback should not run when CLI RPC succeeds');
       }
@@ -514,7 +534,8 @@ test('fetchGrokLimits prefers Grok CLI RPC billing before bearer web fallback', 
   assert.equal(r.status, 'ok');
   assert.equal(r.source, 'rpc');
   assert.equal(r.sourceDetail, 'cli');
-  assert.equal(r.accountLabel, 'SuperGrok');
+  assert.equal(r.accountLabel, 'SuperGrok Heavy');
+  assert.equal(tierToken, 'eyJsecret.signature');
   assert.equal(r.accountEmail, 'user@example.com');
   assert.match(r.accountKey, /^sha256:/);
   assert.equal(r.windows.length, 1);
@@ -530,6 +551,7 @@ test('fetchGrokLimits falls back to CodexBar grok.com grpc-web billing when CLI 
   const calls = [];
   let capturedAuth = '';
   let capturedBody = null;
+  let settingsAuth = '';
   const r = await fetchGrokLimits(
     {},
     {
@@ -544,6 +566,11 @@ test('fetchGrokLimits falls back to CodexBar grok.com grpc-web billing when CLI 
       },
       fetch: async (url, init) => {
         calls.push(url);
+        if (url === GROK_CLI_SETTINGS_URL) {
+          assert.equal(init.method, 'GET');
+          settingsAuth = init.headers.Authorization;
+          return { status: 200, ok: true, json: async () => ({ subscription_tier_display: 'SuperGrok Heavy' }) };
+        }
         assert.equal(url, GROK_WEB_BILLING_GRPC_URL);
         assert.equal(init.method, 'POST');
         assert.equal(init.headers.Authorization, 'Bearer eyJsecret.signature');
@@ -557,12 +584,36 @@ test('fetchGrokLimits falls back to CodexBar grok.com grpc-web billing when CLI 
       }
     }
   );
-  assert.deepEqual(calls, ['rpc', GROK_WEB_BILLING_GRPC_URL]);
+  assert.deepEqual(calls, ['rpc', GROK_WEB_BILLING_GRPC_URL, GROK_CLI_SETTINGS_URL]);
   assert.equal(capturedAuth, 'Bearer eyJsecret.signature');
+  assert.equal(settingsAuth, 'Bearer eyJsecret.signature');
   assert.deepEqual(Array.from(capturedBody), [0, 0, 0, 0, 0]);
   assert.equal(r.status, 'ok');
   assert.equal(r.source, 'web');
+  assert.equal(r.accountLabel, 'SuperGrok Heavy');
   assert.equal(r.windows[0].usedPercent, 67);
+});
+
+test('fetchGrokLimits keeps the quota and blanks the plan when the tier lookup has no answer', async () => {
+  const settingsReplies = [
+    { status: 503, ok: false, json: async () => ({}) },
+    { status: 200, ok: true, json: async () => ({ subscription_tier_display: null }) }
+  ];
+  for (const reply of settingsReplies) {
+    const r = await fetchGrokLimits(
+      { grokBearerToken: 'eyJsecret.signature' },
+      {
+        env: {},
+        now: () => 1_799_000_000_000,
+        fetch: async (url) => (url === GROK_CLI_SETTINGS_URL
+          ? reply
+          : grpcBillingResponse({ usedPercent: 12, resetEpoch: 1_800_000_000 }))
+      }
+    );
+    assert.equal(r.status, 'ok');
+    assert.equal(r.windows[0].usedPercent, 12);
+    assert.equal(r.accountLabel, '');
+  }
 });
 
 test('fetchGrokLimits maps CLI RPC auth failure without bearer fallback to unauthorized', async () => {
@@ -819,13 +870,15 @@ test('fetchGrokLimits uses a WSL auth.json without requiring a Windows Grok CLI'
         resetsAt: '2026-09-01T00:00:00.000Z',
         showMeter: true
       }];
-    }
+    },
+    fetchSubscriptionTier: async (credential) => (credential.token === 'wsl-token' ? 'SuperGrok' : '')
   });
 
   assert.equal(webCredential.token, 'wsl-token');
   assert.equal(result.status, 'ok');
   assert.equal(result.source, 'web');
   assert.equal(result.accountEmail, 'wsl@example.com');
+  assert.equal(result.accountLabel, 'SuperGrok');
 });
 
 test('fetchGrokLimits returns notConfigured when real ~/.grok/auth.json has no usable key', async () => {

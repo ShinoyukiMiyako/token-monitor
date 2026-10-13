@@ -132,7 +132,7 @@ test('a partly timed entry contributes its whole output and stays an integer', (
   assert.equal(result.timedTokens, 92_650);
 });
 
-test('normalizePeriod accepts both spellings and defaults an older payload to zero', () => {
+test('normalizePeriod accepts both spellings and marks older payload throughput unavailable', () => {
   assert.equal(normalizePeriod({ timedTokens: 900, timedDurationMs: 1000 }).timedDurationMs, 1000);
   assert.equal(normalizePeriod({ timed_tokens: 900, timed_duration_ms: 1000 }).timedTokens, 900);
   // outputTokens rides along in any real payload, and the cap below needs it present.
@@ -142,6 +142,7 @@ test('normalizePeriod accepts both spellings and defaults an older payload to ze
   assert.equal(legacy.timedTokens, 0);
   assert.equal(legacy.timedOutputTokens, 0);
   assert.equal(legacy.timedDurationMs, 0);
+  assert.equal(legacy.capabilities.throughput, false);
   assert.equal(legacy.capabilities.tokenComponents, false);
   assert.equal(legacy.unclassifiedTokens, 5);
   assert.equal(normalizePeriod({
@@ -150,6 +151,21 @@ test('normalizePeriod accepts both spellings and defaults an older payload to ze
     cacheWriteTokens: 0,
     outputTokens: 0
   }).capabilities.tokenComponents, true);
+  assert.equal(normalizePeriod({
+    outputTokens: 50,
+    timedTokens: 900,
+    timedOutputTokens: 42,
+    timedDurationMs: 1000
+  }).capabilities.throughput, true);
+  assert.equal(normalizePeriod({
+    outputTokens: 50,
+    timedTokens: 900,
+    timedOutputTokens: 42,
+    timedDurationMs: 1000,
+    capabilities: { throughput: false }
+  }).capabilities.throughput, false);
+  assert.equal(normalizePeriod().capabilities.throughput, false, 'a missing period is unavailable, not an exact zero');
+  assert.equal(normalizePeriod(emptyPeriod()).capabilities.throughput, true, 'a current producer can publish an exact empty period');
 });
 
 test('normalizePeriod preserves known native components beside an explicit unknown remainder', () => {
@@ -301,7 +317,9 @@ test('an unattributed fallback period reads as no throughput data, never NaN', (
     assert.ok(Number.isFinite(merged[field]), `${field} must stay finite, got ${merged[field]}`);
   }
   assert.equal(merged.timedOutputTokens, timed.timedOutputTokens, 'the fallback adds no phantom throughput');
+  assert.equal(merged.capabilities.throughput, false, 'mixed provenance stays unavailable');
   assert.equal(normalizePeriod(fallback).timedOutputTokens, 0);
+  assert.equal(normalizePeriod(fallback).capabilities.throughput, false);
 });
 
 test('aggregate fallback component provenance survives normalization and warm deltas', () => {
@@ -310,9 +328,14 @@ test('aggregate fallback component provenance survives normalization and warm de
   const aggregateFallback = extractUsageFromTokscale({ totalTokens: 200, totalCost: 2 });
 
   assert.equal(normalizePeriod(aggregateFallback).capabilities.tokenComponents, false);
+  assert.equal(normalizePeriod(aggregateFallback).capabilities.throughput, false);
   assert.equal(normalizePeriod(aggregateFallback).unclassifiedTokens, 200);
   assert.equal(
     applyPeriodDelta(exactBase, aggregateFallback, exactAnchor).capabilities.tokenComponents,
+    false
+  );
+  assert.equal(
+    applyPeriodDelta(exactBase, aggregateFallback, exactAnchor).capabilities.throughput,
     false
   );
 });
@@ -423,6 +446,20 @@ test('applyPeriodDelta updates throughput exactly from a today-only rescan', () 
   assert.equal(month.outputTokens, 430);
 });
 
+test('applyPeriodDelta keeps throughput unavailable when the Today anchor lacks provenance', () => {
+  const baseMonth = period({ timedTokens: 5000, timedOutputTokens: 380, timedDurationMs: 9000, outputTokens: 400 });
+  const freshToday = period({ timedTokens: 800, timedOutputTokens: 66, timedDurationMs: 1500, outputTokens: 70 });
+  const unavailableAnchor = period({
+    timedTokens: 0,
+    timedOutputTokens: 0,
+    timedDurationMs: 0,
+    capabilities: { tokenComponents: true, throughput: false }
+  });
+
+  const month = applyPeriodDelta(baseMonth, freshToday, unavailableAnchor);
+  assert.equal(month.capabilities.throughput, false);
+});
+
 test('applyPeriodDelta never drives throughput negative when the anchor is stale', () => {
   const month = applyPeriodDelta(
     period({ timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 200 }),
@@ -432,4 +469,162 @@ test('applyPeriodDelta never drives throughput negative when the anchor is stale
   assert.equal(month.timedTokens, 0);
   assert.equal(month.timedOutputTokens, 0);
   assert.equal(month.timedDurationMs, 0);
+});
+
+// Each session keeps its own share of the counters, under the same per-entry gate, so a
+// Sessions row can divide them into that session's tok/s. They have to survive every hop
+// a session takes: merging entries, the wire normalizer, cross-device aggregation, and the
+// today-delta.
+test('each session carries the throughput counters of its own entries', () => {
+  const result = extractUsageFromTokscale({
+    entries: [
+      tokscaleEntry({ sessionId: 'timed', model: 'claude-opus-4-8', output: 40, performance: { totalDurationMs: 1000, timedTokens: 900 } }),
+      tokscaleEntry({ sessionId: 'timed', model: 'claude-sonnet-5', output: 60, performance: { totalDurationMs: 500, timedTokens: 400 } }),
+      tokscaleEntry({ client: 'copilot', sessionId: 'untimed', output: 70, performance: undefined })
+    ]
+  });
+  const timed = result.sessions['claude:timed'];
+  assert.equal(timed.timedOutputTokens, 100, 'both entries of one session are summed');
+  assert.equal(timed.timedDurationMs, 1500);
+  assert.equal(speed(timed).toFixed(2), '66.67');
+  const untimed = result.sessions['copilot:untimed'];
+  assert.equal(untimed.outputTokens, 70);
+  assert.equal(untimed.timedOutputTokens, 0, 'an untimed entry puts no output on the clock');
+  assert.equal(untimed.timedDurationMs, 0);
+});
+
+test('session normalization caps malformed timed output at the session output total', () => {
+  for (const fields of [
+    { outputTokens: 10, timedOutputTokens: 1_000_000, timedDurationMs: 1000 },
+    { output_tokens: 10, timed_output_tokens: 1_000_000, timed_duration_ms: 1000 },
+    { timedOutputTokens: 1_000_000, timedDurationMs: 1000 },
+    { outputTokens: 10, timedOutputTokens: 1_000_000, timedDurationMs: 0 },
+    { outputTokens: 10, timedOutputTokens: 6, timedDurationMs: 1000 }
+  ]) {
+    const record = normalizeDeviceRecord({
+      deviceId: 'malformed',
+      periods: { today: { sessions: { 'claude:s1': { client: 'claude', sessionId: 's1', ...fields } } } }
+    });
+    const session = record.periods.today.sessions['claude:s1'];
+    const expected = session.timedDurationMs > 0
+      ? Math.min(session.outputTokens, fields.timedOutputTokens ?? fields.timed_output_tokens) : 0;
+    assert.equal(session.timedOutputTokens, expected);
+    const merged = aggregateDevices([record, { ...record, deviceId: 'second' }]).periods.today.sessions['claude:s1'];
+    assert.equal(merged.timedOutputTokens, expected * 2);
+    assert.ok(merged.timedOutputTokens <= merged.outputTokens);
+  }
+});
+
+test('session throughput survives the wire, device aggregation and the today-delta', () => {
+  const session = { client: 'claude', sessionId: 's1', totalTokens: 1000, outputTokens: 40, timedOutputTokens: 40, timedDurationMs: 800 };
+  const wire = normalizePeriod({ totalTokens: 1000, sessions: { 'claude:s1': session } });
+  assert.equal(wire.sessions['claude:s1'].timedOutputTokens, 40);
+  assert.equal(wire.sessions['claude:s1'].timedDurationMs, 800);
+
+  // A duration-less reading cannot carry output on its own.
+  const orphan = normalizePeriod({ totalTokens: 1000, sessions: { 'claude:s1': { ...session, timedDurationMs: 0 } } });
+  assert.equal(orphan.sessions['claude:s1'].timedOutputTokens, 0);
+
+  const device = (deviceId, timedOutputTokens, timedDurationMs) => normalizeDeviceRecord({
+    deviceId,
+    periods: { today: { totalTokens: 1000, sessions: { 'claude:s1': { ...session, outputTokens: timedOutputTokens, timedOutputTokens, timedDurationMs } } } }
+  });
+  const aggregate = aggregateDevices([device('a', 40, 800), device('b', 60, 400)]);
+  const merged = aggregate.periods.today.sessions['claude:s1'];
+  assert.equal(merged.timedOutputTokens, 100);
+  assert.equal(merged.timedDurationMs, 1200);
+
+  const month = applyPeriodDelta(
+    period({ sessions: { 'claude:s1': { ...session, outputTokens: 400, timedOutputTokens: 400, timedDurationMs: 8000 } } }),
+    period({ sessions: { 'claude:s1': { ...session, outputTokens: 70, timedOutputTokens: 66, timedDurationMs: 1500 } } }),
+    period({ sessions: { 'claude:s1': { ...session, outputTokens: 40, timedOutputTokens: 38, timedDurationMs: 900 } } })
+  );
+  assert.equal(month.sessions['claude:s1'].timedOutputTokens, 428);
+  assert.equal(month.sessions['claude:s1'].timedDurationMs, 8600);
+});
+
+test('model throughput survives extraction, normalization, merge, sync and exact deltas', () => {
+  const first = extractUsageFromTokscale({ entries: [tokscaleEntry(), tokscaleEntry({ model: 'untimed', performance: undefined })] });
+  assert.deepEqual(first.modelThroughput['claude-opus-4-8'], { timedTokens: 900, timedOutputTokens: 40, timedDurationMs: 1000 });
+  assert.equal(first.modelThroughput.untimed, undefined);
+  assert.deepEqual(normalizePeriod(first).modelThroughput, first.modelThroughput);
+  const fresh = extractUsageFromTokscale({ entries: [tokscaleEntry(), tokscaleEntry({ sessionId: 's2' })] });
+  const merged = mergePeriods(first, fresh);
+  assert.equal(merged.modelThroughput['claude-opus-4-8'].timedOutputTokens, 120);
+  const updated = applyPeriodDelta(merged, fresh, first);
+  assert.equal(updated.modelThroughput['claude-opus-4-8'].timedOutputTokens, 160);
+  const record = normalizeDeviceRecord({ deviceId: 'a', periods: { today: fresh } });
+  assert.deepEqual(record.periods.today.modelThroughput, fresh.modelThroughput);
+  const synced = normalizeDeviceRecord(JSON.parse(JSON.stringify(syncPayload(record))));
+  assert.deepEqual(synced.periods.today.modelThroughput, fresh.modelThroughput);
+  assert.equal(normalizePeriod({ totalTokens: 1 }).modelThroughput, undefined, 'legacy absence must not imply a zero baseline');
+});
+
+test('unknown model attribution survives partition merges, aggregation and anchored deltas', () => {
+  const aware = extractUsageFromTokscale({ entries: [tokscaleEntry()] });
+  const legacy = { ...aware };
+  delete legacy.modelThroughput;
+  assert.equal(normalizePeriod().modelThroughput, undefined);
+  for (const inputs of [[legacy], [legacy, aware], [aware, legacy]]) {
+    assert.equal(mergePeriods(...inputs).modelThroughput, undefined);
+    const aggregate = aggregateDevices(inputs.map((today, i) => ({ deviceId: String(i), today })));
+    assert.equal(aggregate.periods.today.modelThroughput, undefined);
+  }
+  assert.deepEqual(mergePeriods(emptyPeriod(), aware).modelThroughput, aware.modelThroughput);
+  for (const inputs of [[legacy, aware, aware], [aware, legacy, aware], [aware, aware, legacy]]) {
+    assert.equal(applyPeriodDelta(...inputs).modelThroughput, undefined);
+  }
+});
+
+test('model timed output follows session normalization and leaves other models usable', () => {
+  const valid = { timedTokens: 100, timedOutputTokens: 6, timedDurationMs: 1000 };
+  const source = {
+    outputTokens: 30, timedTokens: 200, timedOutputTokens: 30, timedDurationMs: 2000,
+    modelOutputs: { alpha: 10, beta: 20 }, models: { alpha: 10, beta: 20 }
+  };
+  for (const fields of [
+    { timedOutputTokens: 1_000_000, timedDurationMs: 1000 },
+    { timedOutputTokens: -10, timedDurationMs: 1000 },
+    { timedOutputTokens: NaN, timedDurationMs: 1000 },
+    { timedOutputTokens: '8', timedDurationMs: '1000' },
+    { timedOutputTokens: 6, timedDurationMs: 0 },
+    { timedOutputTokens: 6, timedDurationMs: -1 }
+  ]) {
+    const result = normalizePeriod({ ...source, modelThroughput: { alpha: { ...valid, ...fields }, beta: valid },
+      sessions: { 'claude:s1': { client: 'claude', sessionId: 's1', outputTokens: 10, ...fields } } });
+    assert.equal(result.modelThroughput.alpha.timedOutputTokens, result.sessions['claude:s1'].timedOutputTokens);
+    assert.deepEqual(result.modelThroughput.beta, valid);
+    assert.deepEqual(normalizePeriod(result).modelThroughput, result.modelThroughput);
+  }
+});
+
+test('model counters keep physical bounds through duplicate normalized keys and preserve valid entries', () => {
+  const source = { outputTokens: 40, timedTokens: 100, timedOutputTokens: 40, timedDurationMs: 1000,
+    modelOutputs: { alpha: 10 }, models: { alpha: 10 } };
+  const result = normalizePeriod({ ...source, modelThroughput: {
+    alpha: { timedTokens: 1_000_000, timedOutputTokens: 1_000_000, timedDurationMs: 1_000_000 },
+    ' alpha ': { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 },
+    beta: { timedTokens: 10, timedOutputTokens: 1_000_000, timedDurationMs: 1000 }, bad: null
+  } });
+  assert.deepEqual(result.modelThroughput.alpha, { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 });
+  assert.equal(result.modelThroughput.beta.timedOutputTokens, 40, 'the period bound applies when model outputs are unavailable');
+  assert.equal(Object.hasOwn(result.modelThroughput, 'bad'), false);
+  assert.deepEqual(normalizePeriod(result).modelThroughput, result.modelThroughput);
+});
+
+test('missing or malformed maps are unavailable while an empty map is an exact baseline', () => {
+  for (const modelThroughput of [undefined, null, true, 1, 'x', [], [{ timedTokens: 1 }], { bad: null }, { bad: [] }, { bad: {} }]) {
+    const normalized = normalizePeriod({ modelThroughput });
+    assert.equal(Object.hasOwn(normalized, 'modelThroughput'), false);
+    assert.equal(normalizePeriod(normalized).modelThroughput, undefined);
+  }
+  assert.deepEqual(Object.keys(normalizePeriod({ modelThroughput: {} }).modelThroughput), []);
+});
+
+test('model output bounds ignore inherited object properties', () => {
+  const modelThroughput = Object.fromEntries(['constructor', '__proto__'].map((model) =>
+    [model, { timedTokens: 10, timedOutputTokens: 2, timedDurationMs: 1000 }]));
+  const result = normalizePeriod({ outputTokens: 4, timedTokens: 20, timedOutputTokens: 4, timedDurationMs: 2000, modelThroughput });
+  for (const model of Object.keys(modelThroughput)) assert.deepEqual(result.modelThroughput[model], modelThroughput[model]);
+  assert.deepEqual(normalizePeriod(result).modelThroughput, result.modelThroughput);
 });
