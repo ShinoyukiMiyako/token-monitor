@@ -12,6 +12,8 @@
   const TOKEN_RATE_HOLD_THRESHOLD_MS = 180;
   const TOKEN_RATE_SETTLE_MS = 720;
   const TOKEN_RATE_MAX_DISPLAY_RATE = 1e12;
+  const LIVE_TOKEN_RATE_WINDOW_MS = 2 * 60 * 1000;
+  const LIVE_TOKEN_RATE_MIN_WINDOW_MS = 30 * 1000;
 
   function positiveNumber(value) {
     const parsed = Number(value);
@@ -82,56 +84,112 @@
       .filter(([, counters]) => counters));
   }
 
-  // A period is cumulative, so its ratio is necessarily an average. Live rate is the ratio
-  // of the counters added by one successful snapshot: the duration comes from the same
-  // tokscale performance entries as both token numerators, never from watcher or wall time.
+  // A period is cumulative, so its ratio is necessarily an average. The live headline is the
+  // combined throughput of every session on the device: what its counters gained over the
+  // last two minutes of its own collection clock, divided by those two minutes. Dividing by
+  // the summed message durations instead gives the speed of one average stream, so two
+  // sessions generating side by side would read the same as one. The duration gained over
+  // the same window, divided by it, is how many streams were generating at once on average.
+  //
+  // A transcript credits a reply only once it is written, whole duration included, so a
+  // window of one snapshot would read a long reply as a burst of parallel streams. Hence the
+  // two-minute window, with its start interpolated between the collections around it, and a
+  // 30 s floor while the tracker is younger than the window. Model rows keep the consecutive
+  // delta: they say how fast each model generates, not how much of the total it carries.
   // Equal snapshots keep the last sample (limits-only and final-after-preview pushes are
   // common); any regression is a new baseline boundary such as midnight or reconfiguration.
-  function createLiveTokenRateTracker({ now = defaultNow } = {}) {
+  function createLiveTokenRateTracker({
+    now = defaultNow,
+    windowMs = LIVE_TOKEN_RATE_WINDOW_MS,
+    minWindowMs = LIVE_TOKEN_RATE_MIN_WINDOW_MS
+  } = {}) {
     if (typeof now !== 'function') throw new TypeError('now must be a function');
-    let baseline = null;
+    const windowSpan = positiveNumber(windowMs);
+    if (!windowSpan) throw new TypeError('windowMs must be a positive number');
+    const windowFloor = positiveNumber(minWindowMs);
+    if (!windowFloor || windowFloor > windowSpan) throw new TypeError('minWindowMs must be positive and no greater than windowMs');
+    let history = [];
     let modelBaseline = null;
     let sample = null;
     let revision = 0;
 
-    function reset(period) {
-      baseline = period ? usageCounters(period) : null;
+    // The device's collection time when the caller knows it. Falling back to receipt time
+    // would let an unchanged record re-pushed for another device stretch this one's window.
+    function observationTime(observedAt) {
+      return typeof observedAt === 'number' && Number.isFinite(observedAt) ? observedAt : Number(now()) || 0;
+    }
+
+    function reset(period, observedAt) {
+      const counters = period ? usageCounters(period) : null;
+      history = counters ? [{ at: observationTime(observedAt), counters }] : [];
       modelBaseline = period?.modelThroughput ? modelCounters(period) : null;
       sample = null;
     }
 
-    function observe(period) {
+    // A collection only says what was credited since the previous one, so the counters at
+    // an instant between two collections are taken as moving evenly between them.
+    function countersAt(time) {
+      let index = history.length - 1;
+      while (index > 0 && history[index].at > time) index -= 1;
+      const before = history[index];
+      const after = history[index + 1];
+      if (!after || before.at >= time) return before.counters;
+      const share = (time - before.at) / (after.at - before.at);
+      return Object.fromEntries(Object.keys(before.counters).map((field) =>
+        [field, before.counters[field] + (after.counters[field] - before.counters[field]) * share]));
+    }
+
+    function windowThroughput(current, at) {
+      const start = at - windowSpan;
+      const covered = history[0].at <= start;
+      const elapsedMs = covered ? windowSpan : Math.max(windowFloor, at - history[0].at);
+      const base = covered ? countersAt(start) : history[0].counters;
+      return {
+        speed: cappedTokenRate((current.timedOutputTokens - base.timedOutputTokens) * 1000 / elapsedMs),
+        burn: cappedTokenRate((current.timedTokens - base.timedTokens) * 60000 / elapsedMs),
+        concurrency: Math.max(0, (current.timedDurationMs - base.timedDurationMs) / elapsedMs),
+        windowMs: elapsedMs
+      };
+    }
+
+    function observe(period, observedAt) {
       const current = usageCounters(period);
       const models = period?.modelThroughput ? modelCounters(period) : null;
       const previousModels = modelBaseline;
       modelBaseline = models;
       if (!current) {
-        baseline = null;
+        history = [];
         sample = null;
         return null;
       }
-      if (!baseline) {
-        baseline = current;
+      const at = observationTime(observedAt);
+      const last = history[history.length - 1];
+      if (!last) {
+        history = [{ at, counters: current }];
         return null;
       }
 
       const delta = {
-        timedTokens: current.timedTokens - baseline.timedTokens,
-        timedOutputTokens: current.timedOutputTokens - baseline.timedOutputTokens,
-        timedDurationMs: current.timedDurationMs - baseline.timedDurationMs
+        timedTokens: current.timedTokens - last.counters.timedTokens,
+        timedOutputTokens: current.timedOutputTokens - last.counters.timedOutputTokens,
+        timedDurationMs: current.timedDurationMs - last.counters.timedDurationMs
       };
-      baseline = current;
 
-      if (Object.values(delta).some((value) => value < 0)) {
+      // A clock running backwards cannot place the new counters in the window either.
+      if (at < last.at || Object.values(delta).some((value) => value < 0)) {
+        history = [{ at, counters: current }];
         sample = null;
         return null;
       }
+      const unchanged = Object.values(delta).every((value) => value === 0);
+      if (at > last.at || !unchanged) history.push({ at, counters: current });
+      // Keep the last collection at or before the window start: it anchors the interpolation.
+      while (history.length > 1 && history[1].at <= at - windowSpan) history.shift();
       if (!(delta.timedDurationMs > 0)) return sample;
 
       revision += 1;
       sample = {
-        speed: tokenRatePerSecond(delta),
-        burn: tokenBurnPerMinute(delta),
+        ...windowThroughput(current, at),
         sampledAt: Number(now()) || 0,
         revision,
         models: Object.entries(models || {}).flatMap(([model, counters]) => {
@@ -183,7 +241,7 @@
         const id = String(entry?.id || '').trim();
         if (!id || seen.has(id)) continue;
         seen.add(id);
-        result.push({ id, name: String(entry?.name || id), period: entry?.period });
+        result.push({ id, name: String(entry?.name || id), period: entry?.period, observedAt: entry?.observedAt });
       }
       return result;
     }
@@ -193,7 +251,7 @@
       lastDisplaySample = null;
       for (const entry of normalizedEntries(entries)) {
         const tracker = createLiveTokenRateTracker({ now });
-        tracker.reset(entry.period);
+        tracker.reset(entry.period, entry.observedAt);
         trackers.set(entry.id, { tracker, name: entry.name });
       }
     }
@@ -217,14 +275,14 @@
         const device = trackers.get(entry.id);
         if (!device) {
           const tracker = createLiveTokenRateTracker({ now });
-          tracker.reset(entry.period);
+          tracker.reset(entry.period, entry.observedAt);
           trackers.set(entry.id, { tracker, name: entry.name });
           continue;
         }
         device.name = entry.name;
         const { tracker } = device;
         const previous = tracker.getSample();
-        const sample = tracker.observe(entry.period);
+        const sample = tracker.observe(entry.period, entry.observedAt);
         if (sample === previous) continue;
         changed = true;
         if (sample) fresh = true;
@@ -252,6 +310,7 @@
         lastDisplaySample = {
           speed: cappedTokenRate(samples.reduce((sum, sample) => sum + sample.speed, 0)),
           burn: cappedTokenRate(samples.reduce((sum, sample) => sum + sample.burn, 0)),
+          concurrency: samples.reduce((sum, sample) => sum + sample.concurrency, 0),
           sampledAt: Math.max(...samples.map((sample) => sample.sampledAt)),
           devices: samples.filter((sample) => sample.models?.length)
             .map(({ id, name, models }) => ({ id, name, models })),
@@ -285,6 +344,14 @@
     return hubMode === 'client' || hubMode === 'host' || hubMode === 'icloud';
   }
 
+  // `updatedAt` is when the device collected its usage, on its own clock; the live window
+  // only ever compares a device's timestamps with each other, so clock skew between
+  // devices cannot distort it.
+  function collectedAt(record) {
+    const parsed = Date.parse(record?.updatedAt);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
   function selectLiveTokenRatePeriods(stats, deviceId, hubMode = 'local', scope = 'all') {
     const normalizedDeviceId = String(deviceId || '').trim();
     const syncMode = isSharedSyncMode(hubMode);
@@ -294,7 +361,12 @@
       return {
         entries: devices
           .filter((device) => device?.stale !== true && device?.periods?.today && typeof device.periods.today === 'object')
-          .map((device) => ({ id: `device:${String(device.deviceId || 'unknown')}`, name: deviceBreakdownApi.deviceLabel(device), period: device.periods.today })),
+          .map((device) => ({
+            id: `device:${String(device.deviceId || 'unknown')}`,
+            name: deviceBreakdownApi.deviceLabel(device),
+            period: device.periods.today,
+            observedAt: collectedAt(device)
+          })),
         source: 'devices:all'
       };
     }
@@ -309,7 +381,12 @@
       || (!syncMode ? stats?.periods?.today : null);
     if (localPeriod && typeof localPeriod === 'object') {
       return {
-        entries: [{ id: `device:${normalizedDeviceId}`, name: deviceBreakdownApi.deviceLabel(localDevice || { deviceId: normalizedDeviceId }), period: localPeriod }],
+        entries: [{
+          id: `device:${normalizedDeviceId}`,
+          name: deviceBreakdownApi.deviceLabel(localDevice || { deviceId: normalizedDeviceId }),
+          period: localPeriod,
+          observedAt: collectedAt(localDevice || stats)
+        }],
         source: `device:${normalizedDeviceId}`
       };
     }
@@ -540,6 +617,7 @@
   }
 
   return {
+    LIVE_TOKEN_RATE_WINDOW_MS,
     TOKEN_RATE_BOOST_DOUBLING_MS,
     TOKEN_RATE_HOLD_THRESHOLD_MS,
     TOKEN_RATE_MAX_DISPLAY_RATE,

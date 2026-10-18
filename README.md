@@ -127,7 +127,7 @@ Most usage monitors are useful on the machine they run on. Token Monitor is buil
 ### Tracking usage
 
 - **Live token tracking** — Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, OpenCode, and 35+ AI tools, with the UI updating within seconds of each turn (full list in the table above)
-- **Live token rate** — an optional live readout of generation speed in `tok/s` or total burn in `tok/min`
+- **Live token rate** — an optional live readout of the combined throughput of all sessions over the last two minutes in `tok/s` or total burn in `tok/min`, with the average number of concurrent streams on hover
 - **Per-session detail** — open a session to see tokens per prompt, expandable to each reply's exact token split and tools used (read on-demand from local transcripts or databases, never synced)
 - **Cache hit statistics** — click any tool or model to expand a detailed breakdown of input tokens (cache hit vs miss), output tokens, and hit-rate percentages
 - **Cost & currency** — cost alongside token counts, shown in USD, TWD, HKD, or CNY; exchange rates auto-update daily and can be manually overridden in Settings

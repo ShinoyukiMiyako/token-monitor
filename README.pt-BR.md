@@ -127,7 +127,7 @@ A maioria dos monitores de uso só é útil na máquina em que roda. O Token Mon
 ### Acompanhamento de uso
 
 - **Rastreamento de tokens ao vivo** — Claude Code, Codex, Cursor, GitHub Copilot, Antigravity, OpenCode e 35+ ferramentas de IA, com a interface atualizando poucos segundos após cada turno (lista completa na tabela acima)
-- **Taxa de tokens ao vivo** — uma leitura opcional da velocidade de geração em `tok/s` ou do consumo total em `tok/min`
+- **Taxa de tokens ao vivo** — uma leitura opcional da vazão de geração somada de todas as sessões nos últimos dois minutos em `tok/s` ou do consumo total em `tok/min`, com o número médio de gerações simultâneas ao passar o cursor
 - **Detalhes por sessão** — abra uma sessão para ver os tokens por prompt, expansível até a divisão exata de tokens de cada resposta e as ferramentas usadas (lido sob demanda de transcrições ou bancos locais, nunca sincronizado)
 - **Estatísticas de acerto de cache** — clique em qualquer ferramenta ou modelo para expandir um detalhamento completo dos tokens de entrada (acerto no cache vs. fora do cache), tokens de saída e as porcentagens de acerto
 - **Custo e moeda** — o custo ao lado das contagens de tokens, exibido em USD, TWD, HKD ou CNY; as taxas de câmbio são atualizadas automaticamente todos os dias e podem ser alteradas manualmente nas Configurações

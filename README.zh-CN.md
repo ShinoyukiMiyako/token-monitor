@@ -132,7 +132,7 @@ Qoder CN 的 Token 用量来自应用本地数据，而非 API —— 在 Settin
 ### 用量追踪
 
 - **实时 Token 追踪**：Claude Code、Codex、Cursor、GitHub Copilot、Antigravity、OpenCode 等 35+ 种 AI 工具，每轮对话后 UI 在数秒内刷新（完整列表见上方表格）
-- **实时 Token 速率**：可选显示的实时读数，以 `tok/s` 显示生成速度或以 `tok/min` 显示总消耗
+- **实时 Token 速率**：可选显示的实时读数，以 `tok/s` 显示近两分钟所有会话合计的生成吞吐或以 `tok/min` 显示总消耗，悬停可见平均并发路数
 - **单个 session 明细**：点进某个 session，可看每条提问的 Token 消耗，并展开查看每次回复的 Token 拆分与用到的工具（打开时才实时读取本机 transcript 或数据库，绝不同步）
 - **缓存命中统计**：点击任何工具或模型，展开查看输入 Token（缓存命中与未命中）、输出 Token 的详细分类及命中率百分比
 - **成本与币别**：Token 数量旁附带成本；可用 USD、TWD、HKD 或 CNY 显示，汇率每日自动更新，也可在设置中手动覆写

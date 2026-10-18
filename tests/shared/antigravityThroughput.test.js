@@ -61,9 +61,9 @@ test('a native generation refresh reaches the existing live tracker and model ho
     reasoningTokens: 40 * multiplier, cacheReadTokens: 20 * multiplier,
     performance: { totalDurationMs: 2_000 * multiplier, timedTokens: 190 * multiplier }
   })] });
-  assert.equal(tracker.observe(period(1)), null);
-  const sample = tracker.observe(period(2));
-  assert.equal(sample.speed, 60);
+  assert.equal(tracker.observe(period(1), 0), null);
+  const sample = tracker.observe(period(2), 30_000);
+  assert.equal(sample.speed, 4, 'the headline is 120 output tokens over the 30 s collection window');
   assert.deepEqual(sample.models, [{ model: 'gemini-3-flash', speed: 60, burn: 5_700 }]);
 });
 
@@ -83,11 +83,11 @@ test('an untimed Antigravity input does not subtract prior timing from another c
   const before = snapshot(false);
   const after = snapshot(true);
   assert.equal(after.totalTokens - before.totalTokens, 320);
-  assert.equal(tracker.observe(before), null);
-  const sample = tracker.observe(after);
+  assert.equal(tracker.observe(before, 0), null);
+  const sample = tracker.observe(after, 30_000);
   assert.equal(sample.timedOutputTokens, 120);
   assert.equal(sample.timedDurationMs, 4_000);
-  assert.equal(sample.speed, 30);
-  assert.equal(sample.burn, 3_300);
+  assert.equal(sample.speed, 4);
+  assert.equal(sample.burn, 440);
   assert.deepEqual(sample.models, [{ model: 'gpt-5', speed: 30, burn: 3_300 }]);
 });

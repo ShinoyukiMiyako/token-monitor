@@ -5698,6 +5698,16 @@ html.is-windows .limit-live-badge {
 .live-token-rate .limit-detail-tooltip-row span:first-child {
   text-align: left;
 }
+/* The throughput summary explains the headline, so it may use the popover's own width
+   instead of wrapping at the generic full-row bound, and it is ruled off from the
+   per-model rows, which are single-stream speeds rather than its parts. */
+.live-token-rate .limit-detail-tooltip-full {
+  max-width: none;
+}
+.live-token-rate .limit-detail-tooltip-full.is-heading:not(:last-child) {
+  padding-bottom: 5px;
+  border-bottom: 1px solid rgba(var(--line-rgb), 0.16);
+}
 .live-token-rate .live-token-rate-model-name { display: flex; align-items: center; gap: 7px; }
 .live-token-rate .live-token-rate-model-name .row-icon { width: 12px; height: 12px; flex: 0 0 12px; }
 .live-token-rate .live-token-rate-model-name .live-token-rate-model-label {

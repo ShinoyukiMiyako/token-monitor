@@ -1139,9 +1139,17 @@ function renderLiveTokenRate() {
     ? (burn ? 'home.liveTokenRate.burnIdleTitle' : 'home.liveTokenRate.speedIdleTitle')
     : (burn ? 'home.liveTokenRate.burnTitle' : 'home.liveTokenRate.speedTitle');
   const label = t(labelKey, { value: text, scope });
-  const detailEntries = tokenRateApi.liveTokenRateTooltipEntries(
-    sample, burn ? 'burn' : 'speed', formatLiveTokenRate
-  );
+  const detailEntries = sample ? [
+    {
+      full: t('home.liveTokenRate.throughput', {
+        value: text,
+        concurrency: sample.concurrency.toLocaleString(currentLocale(), { minimumFractionDigits: 1, maximumFractionDigits: 1 }),
+        minutes: tokenRateApi.LIVE_TOKEN_RATE_WINDOW_MS / 60000
+      }),
+      heading: true
+    },
+    ...tokenRateApi.liveTokenRateTooltipEntries(sample, burn ? 'burn' : 'speed', formatLiveTokenRate)
+  ] : [];
   limitWindowsView.setDetailTooltip(els.liveTokenRate, detailEntries.length ? detailEntries : null);
   for (const cell of els.liveTokenRate.querySelectorAll('.limit-detail-tooltip-row span:first-child')) {
     const model = cell.textContent;
