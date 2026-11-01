@@ -12,6 +12,8 @@
   const TOKEN_RATE_HOLD_THRESHOLD_MS = 180;
   const TOKEN_RATE_SETTLE_MS = 720;
   const TOKEN_RATE_MAX_DISPLAY_RATE = 1e12;
+  const LIVE_TOKEN_RATE_WINDOW_MS = 2 * 60 * 1000;
+  const LIVE_TOKEN_RATE_MIN_WINDOW_MS = 30 * 1000;
 
   function positiveNumber(value) {
     const parsed = Number(value);
@@ -82,76 +84,216 @@
       .filter(([, counters]) => counters));
   }
 
-  // A period is cumulative, so its ratio is necessarily an average. Live rate is the ratio
-  // of the counters added by one successful snapshot: the duration comes from the same
+  // A period is cumulative, so its ratio is necessarily an average. The live headline is the
+  // combined throughput of every session on the device: what its counters gained over the
+  // last two minutes of its own collection clock, divided by those two minutes. Dividing by
+  // the summed message durations instead gives the speed of one average stream, so two
+  // sessions generating side by side would read the same as one. The duration gained over
+  // the same window, divided by it, is how many streams were generating at once on average.
+  //
+  // A transcript credits a reply only once it is written, whole duration included, so a
+  // window of one snapshot would read a long reply as a burst of parallel streams. Hence the
+  // two-minute window, with its start interpolated between the collections around it, and a
+  // 30 s floor while the tracker is younger than the window.
+  //
+  // Model rows keep each model's latest active snapshot delta: they say how fast each model
+  // generates, not how much of the total it carries. Without a collection clock there is no
+  // window to place counters on, so the headline stays the matched ratio of those deltas (or
+  // of the device delta when model attribution is unavailable): durations come from the same
   // tokscale performance entries as both token numerators, never from watcher or wall time.
   // Equal snapshots keep the last sample (limits-only and final-after-preview pushes are
   // common); any regression is a new baseline boundary such as midnight or reconfiguration.
-  function createLiveTokenRateTracker({ now = defaultNow } = {}) {
+  function createLiveTokenRateTracker({
+    now = defaultNow,
+    activeMs = 8000,
+    windowMs = LIVE_TOKEN_RATE_WINDOW_MS,
+    minWindowMs = LIVE_TOKEN_RATE_MIN_WINDOW_MS
+  } = {}) {
     if (typeof now !== 'function') throw new TypeError('now must be a function');
-    let baseline = null;
+    const lifetime = positiveNumber(activeMs);
+    if (!lifetime) throw new TypeError('activeMs must be a positive number');
+    const windowSpan = positiveNumber(windowMs);
+    if (!windowSpan) throw new TypeError('windowMs must be a positive number');
+    const windowFloor = positiveNumber(minWindowMs);
+    if (!windowFloor || windowFloor > windowSpan) throw new TypeError('minWindowMs must be positive and no greater than windowMs');
+    let history = [];
     let modelBaseline = null;
+    let modelSamples = new Map();
+    let unattributedSample = null;
+    let throughput = null;
     let sample = null;
     let revision = 0;
 
-    function reset(period) {
-      baseline = period ? usageCounters(period) : null;
-      modelBaseline = period?.modelThroughput ? modelCounters(period) : null;
+    function clearSamples() {
+      modelSamples = new Map();
+      unattributedSample = null;
+      throughput = null;
       sample = null;
     }
 
-    function observe(period) {
+    function sampleAt(timestamp) {
+      const activeModels = [...modelSamples.values()]
+        .filter((entry) => timestamp < entry.sampledAt + lifetime);
+      const activeUnattributed = unattributedSample && timestamp < unattributedSample.sampledAt + lifetime
+        ? unattributedSample
+        : null;
+      const activeParts = [...activeModels, ...(activeUnattributed ? [activeUnattributed] : [])];
+      if (!activeParts.length) return null;
+      const delta = { timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 };
+      for (const part of activeParts) {
+        delta.timedTokens += part.timedTokens;
+        delta.timedOutputTokens += part.timedOutputTokens;
+        delta.timedDurationMs += part.timedDurationMs;
+      }
+      return {
+        // Concurrency needs elapsed time, so a reading without a window leaves it unmeasured.
+        ...(throughput || { speed: tokenRatePerSecond(delta), burn: tokenBurnPerMinute(delta), concurrency: 0, windowMs: 0 }),
+        sampledAt: Math.max(...activeParts.map((part) => part.sampledAt)),
+        expiresAt: Math.min(...activeParts.map((part) => part.sampledAt + lifetime)),
+        revision,
+        models: activeModels.map(({ model, speed, burn }) => ({ model, speed, burn })),
+        ...delta
+      };
+    }
+
+    // The device's collection time when the caller knows it. Receipt time is no stand-in: an
+    // unchanged record re-pushed for another device would stretch this one's window.
+    function collectionTime(observedAt) {
+      return typeof observedAt === 'number' && Number.isFinite(observedAt) ? observedAt : null;
+    }
+
+    function reset(period, observedAt) {
+      const counters = period ? usageCounters(period) : null;
+      history = counters ? [{ at: collectionTime(observedAt), counters }] : [];
+      modelBaseline = period?.modelThroughput ? modelCounters(period) : null;
+      clearSamples();
+    }
+
+    // A collection only says what was credited since the previous one, so the counters at
+    // an instant between two collections are taken as moving evenly between them.
+    function countersAt(time) {
+      let index = history.length - 1;
+      while (index > 0 && history[index].at > time) index -= 1;
+      const before = history[index];
+      const after = history[index + 1];
+      if (!after || before.at >= time) return before.counters;
+      const share = (time - before.at) / (after.at - before.at);
+      return Object.fromEntries(Object.keys(before.counters).map((field) =>
+        [field, before.counters[field] + (after.counters[field] - before.counters[field]) * share]));
+    }
+
+    function windowThroughput(current, at) {
+      const start = at - windowSpan;
+      const covered = history[0].at <= start;
+      const elapsedMs = covered ? windowSpan : Math.max(windowFloor, at - history[0].at);
+      const base = covered ? countersAt(start) : history[0].counters;
+      return {
+        speed: cappedTokenRate((current.timedOutputTokens - base.timedOutputTokens) * 1000 / elapsedMs),
+        burn: cappedTokenRate((current.timedTokens - base.timedTokens) * 60000 / elapsedMs),
+        concurrency: Math.max(0, (current.timedDurationMs - base.timedDurationMs) / elapsedMs),
+        windowMs: elapsedMs
+      };
+    }
+
+    function observe(period, observedAt) {
       const current = usageCounters(period);
       const models = period?.modelThroughput ? modelCounters(period) : null;
       const previousModels = modelBaseline;
       modelBaseline = models;
       if (!current) {
-        baseline = null;
-        sample = null;
+        history = [];
+        clearSamples();
         return null;
       }
-      if (!baseline) {
-        baseline = current;
+      const at = collectionTime(observedAt);
+      const last = history[history.length - 1];
+      if (!last) {
+        history = [{ at, counters: current }];
         return null;
       }
 
-      const delta = {
-        timedTokens: current.timedTokens - baseline.timedTokens,
-        timedOutputTokens: current.timedOutputTokens - baseline.timedOutputTokens,
-        timedDurationMs: current.timedDurationMs - baseline.timedDurationMs
+      const stepDelta = {
+        timedTokens: current.timedTokens - last.counters.timedTokens,
+        timedOutputTokens: current.timedOutputTokens - last.counters.timedOutputTokens,
+        timedDurationMs: current.timedDurationMs - last.counters.timedDurationMs
       };
-      baseline = current;
+      const clocked = at !== null && last.at !== null;
 
-      if (Object.values(delta).some((value) => value < 0)) {
-        sample = null;
+      // A clock running backwards cannot place the new counters in the window either.
+      if ((clocked && at < last.at) || Object.values(stepDelta).some((value) => value < 0)) {
+        history = [{ at, counters: current }];
+        clearSamples();
         return null;
       }
-      if (!(delta.timedDurationMs > 0)) return sample;
+      const unchanged = Object.values(stepDelta).every((value) => value === 0);
+      if (!clocked) history = [{ at, counters: current }];
+      else if (at > last.at || !unchanged) history.push({ at, counters: current });
+      // Keep the last collection at or before the window start: it anchors the interpolation.
+      while (history.length > 1 && history[1].at <= at - windowSpan) history.shift();
+      if (!(stepDelta.timedDurationMs > 0)) return sample;
 
-      revision += 1;
-      sample = {
-        speed: tokenRatePerSecond(delta),
-        burn: tokenBurnPerMinute(delta),
-        sampledAt: Number(now()) || 0,
-        revision,
-        models: Object.entries(models || {}).flatMap(([model, counters]) => {
-          // Missing attribution is unknown, not an exact zero baseline.
-          if (!previousModels) return [];
+      const sampledAt = Number(now()) || 0;
+      const nextModels = new Map();
+      const attributed = { timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 };
+      let attributionConsistent = Boolean(models && previousModels)
+        && Object.entries(previousModels).every(([model, previous]) => models[model]
+          && Object.keys(previous).every((field) => models[model][field] >= previous[field]));
+      if (attributionConsistent) {
+        for (const [model, counters] of Object.entries(models)) {
           const previous = previousModels[model] || { timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 };
           const change = Object.fromEntries(Object.keys(counters).map((field) => [field, counters[field] - previous[field]]));
           // A renamed/retroactively attributed model may appear with historical
-          // counters. It cannot have added more than this snapshot's entire delta.
-          if (Object.keys(change).some((field) => change[field] < 0 || change[field] > delta[field])
-            || !(change.timedDurationMs > 0)) return [];
-          return [{ model, speed: tokenRatePerSecond(change), burn: tokenBurnPerMinute(change) }];
-        }),
-        ...delta
+          // counters. All model deltas together must stay within this snapshot's delta.
+          if (Object.keys(change).some((field) => change[field] < 0 || change[field] > stepDelta[field])) {
+            attributionConsistent = false;
+            break;
+          }
+          if (change.timedDurationMs > 0) {
+            for (const field of Object.keys(attributed)) attributed[field] += change[field];
+            nextModels.set(model, {
+              model,
+              ...change,
+              speed: tokenRatePerSecond(change),
+              burn: tokenBurnPerMinute(change),
+              sampledAt
+            });
+          } else if (Object.values(change).every((value) => value === 0)) {
+            const retained = modelSamples.get(model);
+            if (retained && sampledAt < retained.sampledAt + lifetime) nextModels.set(model, retained);
+          } else {
+            attributionConsistent = false;
+            break;
+          }
+        }
+      }
+      const remainder = {
+        timedTokens: stepDelta.timedTokens - attributed.timedTokens,
+        timedOutputTokens: stepDelta.timedOutputTokens - attributed.timedOutputTokens,
+        timedDurationMs: stepDelta.timedDurationMs - attributed.timedDurationMs
       };
+      if (attributionConsistent
+        && Object.values(remainder).every((value) => value >= 0)
+        && (remainder.timedDurationMs > 0 || (remainder.timedTokens === 0 && remainder.timedOutputTokens === 0))) {
+        modelSamples = nextModels;
+        if (remainder.timedDurationMs > 0) {
+          unattributedSample = { ...remainder, sampledAt, independent: true };
+        } else if (!unattributedSample?.independent || sampledAt >= unattributedSample.sampledAt + lifetime) {
+          // Only a consistent remainder is disjoint from the retained model samples.
+          // A fallback after re-attribution may include those same models.
+          unattributedSample = null;
+        }
+      } else {
+        modelSamples = new Map();
+        unattributedSample = { ...stepDelta, sampledAt };
+      }
+      revision += 1;
+      throughput = clocked ? windowThroughput(current, at) : null;
+      sample = sampleAt(sampledAt);
       return sample;
     }
 
-    function getSample() {
-      return sample;
+    function getSample(timestamp) {
+      return timestamp === undefined ? sample : sampleAt(Number(timestamp) || 0);
     }
 
     function value(mode) {
@@ -166,7 +308,14 @@
   // headline jump between whichever device happened to upload last, and dividing summed
   // tokens by summed model-busy time would be an average rather than fleet throughput. Keep
   // one matched-counter tracker per device, then add only samples that are still live.
-  function createLiveTokenRateGroupTracker({ now = defaultNow, activeMs = 8000, clearMs = 180000 } = {}) {
+  // `matchedCounters` drops the collection clock from every entry: the plugin liveRate
+  // resource documents rates from matched deltas, not the native surfaces' window throughput.
+  function createLiveTokenRateGroupTracker({
+    now = defaultNow,
+    activeMs = 8000,
+    clearMs = 180000,
+    matchedCounters = false
+  } = {}) {
     if (typeof now !== 'function') throw new TypeError('now must be a function');
     const lifetime = positiveNumber(activeMs);
     if (!lifetime) throw new TypeError('activeMs must be a positive number');
@@ -183,7 +332,7 @@
         const id = String(entry?.id || '').trim();
         if (!id || seen.has(id)) continue;
         seen.add(id);
-        result.push({ id, name: String(entry?.name || id), period: entry?.period });
+        result.push({ id, name: String(entry?.name || id), period: entry?.period, observedAt: matchedCounters ? null : entry?.observedAt });
       }
       return result;
     }
@@ -192,8 +341,8 @@
       trackers.clear();
       lastDisplaySample = null;
       for (const entry of normalizedEntries(entries)) {
-        const tracker = createLiveTokenRateTracker({ now });
-        tracker.reset(entry.period);
+        const tracker = createLiveTokenRateTracker({ now, activeMs: lifetime });
+        tracker.reset(entry.period, entry.observedAt);
         trackers.set(entry.id, { tracker, name: entry.name });
       }
     }
@@ -216,15 +365,15 @@
       for (const entry of nextEntries) {
         const device = trackers.get(entry.id);
         if (!device) {
-          const tracker = createLiveTokenRateTracker({ now });
-          tracker.reset(entry.period);
+          const tracker = createLiveTokenRateTracker({ now, activeMs: lifetime });
+          tracker.reset(entry.period, entry.observedAt);
           trackers.set(entry.id, { tracker, name: entry.name });
           continue;
         }
         device.name = entry.name;
         const { tracker } = device;
         const previous = tracker.getSample();
-        const sample = tracker.observe(entry.period);
+        const sample = tracker.observe(entry.period, entry.observedAt);
         if (sample === previous) continue;
         changed = true;
         if (sample) fresh = true;
@@ -240,10 +389,10 @@
       const timestamp = Number(now()) || 0;
       return [...trackers.entries()]
         .map(([id, { tracker, name }]) => {
-          const sample = tracker.getSample();
+          const sample = tracker.getSample(timestamp);
           return sample ? { ...sample, id, name } : null;
         })
-        .filter((sample) => sample && timestamp < sample.sampledAt + lifetime);
+        .filter(Boolean);
     }
 
     function getSample() {
@@ -252,6 +401,7 @@
         lastDisplaySample = {
           speed: cappedTokenRate(samples.reduce((sum, sample) => sum + sample.speed, 0)),
           burn: cappedTokenRate(samples.reduce((sum, sample) => sum + sample.burn, 0)),
+          concurrency: samples.reduce((sum, sample) => sum + sample.concurrency, 0),
           sampledAt: Math.max(...samples.map((sample) => sample.sampledAt)),
           devices: samples.filter((sample) => sample.models?.length)
             .map(({ id, name, models }) => ({ id, name, models })),
@@ -260,7 +410,7 @@
         };
         return {
           ...lastDisplaySample,
-          expiresAt: Math.min(...samples.map((sample) => sample.sampledAt + lifetime)),
+          expiresAt: Math.min(...samples.map((sample) => sample.expiresAt)),
           idle: false
         };
       }
@@ -285,6 +435,14 @@
     return hubMode === 'client' || hubMode === 'host' || hubMode === 'icloud';
   }
 
+  // `updatedAt` is when the device collected its usage, on its own clock; the live window
+  // only ever compares a device's timestamps with each other, so clock skew between
+  // devices cannot distort it.
+  function collectedAt(record) {
+    const parsed = Date.parse(record?.updatedAt);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
   function selectLiveTokenRatePeriods(stats, deviceId, hubMode = 'local', scope = 'all') {
     const normalizedDeviceId = String(deviceId || '').trim();
     const syncMode = isSharedSyncMode(hubMode);
@@ -294,7 +452,12 @@
       return {
         entries: devices
           .filter((device) => device?.stale !== true && device?.periods?.today && typeof device.periods.today === 'object')
-          .map((device) => ({ id: `device:${String(device.deviceId || 'unknown')}`, name: deviceBreakdownApi.deviceLabel(device), period: device.periods.today })),
+          .map((device) => ({
+            id: `device:${String(device.deviceId || 'unknown')}`,
+            name: deviceBreakdownApi.deviceLabel(device),
+            period: device.periods.today,
+            observedAt: collectedAt(device)
+          })),
         source: 'devices:all'
       };
     }
@@ -309,7 +472,12 @@
       || (!syncMode ? stats?.periods?.today : null);
     if (localPeriod && typeof localPeriod === 'object') {
       return {
-        entries: [{ id: `device:${normalizedDeviceId}`, name: deviceBreakdownApi.deviceLabel(localDevice || { deviceId: normalizedDeviceId }), period: localPeriod }],
+        entries: [{
+          id: `device:${normalizedDeviceId}`,
+          name: deviceBreakdownApi.deviceLabel(localDevice || { deviceId: normalizedDeviceId }),
+          period: localPeriod,
+          observedAt: collectedAt(localDevice || stats)
+        }],
         source: `device:${normalizedDeviceId}`
       };
     }
@@ -540,6 +708,7 @@
   }
 
   return {
+    LIVE_TOKEN_RATE_WINDOW_MS,
     TOKEN_RATE_BOOST_DOUBLING_MS,
     TOKEN_RATE_HOLD_THRESHOLD_MS,
     TOKEN_RATE_MAX_DISPLAY_RATE,

@@ -1,6 +1,6 @@
 'use strict';
 
-// MiniMax (a.k.a. Minimax / Hailuo AI) Token Plan quota lookup.
+// MiniMax (a.k.a. Minimax / Hailuo AI) Token Plan quota or API balance lookup.
 //
 // Field shape verified against live Token Plan responses (see PR #32 review):
 // the array is nested under data.model_remains, and the live response does
@@ -18,6 +18,8 @@ const MINIMAX_REMAINS_URL_CN = 'https://api.minimaxi.com/v1/api/openplatform/cod
 const MINIMAX_REMAINS_URL_EN = 'https://api.minimax.io/v1/api/openplatform/coding_plan/remains';
 const MINIMAX_TOKEN_PLAN_REMAINS_URL_CN = 'https://api.minimaxi.com/v1/token_plan/remains';
 const MINIMAX_TOKEN_PLAN_REMAINS_URL_EN = 'https://api.minimax.io/v1/token_plan/remains';
+const MINIMAX_BALANCE_URL_CN = 'https://api.minimaxi.com/account/query_balance';
+const MINIMAX_BALANCE_URL_EN = 'https://api.minimax.io/account/query_balance';
 
 const MINIMAX_WINDOW_MINUTES_5H = 5 * 60;
 const MINIMAX_WINDOW_MINUTES_WEEKLY = 7 * 24 * 60;
@@ -222,6 +224,23 @@ function normalizeMinimaxRegionSetting(value) {
   return String(value || '').trim() ? minimaxRegion({ minimaxApiRegion: value }) : '';
 }
 
+function normalizeMinimaxBillingMode(value) {
+  return String(value || '').trim().toLowerCase() === 'api' ? 'api' : 'token-plan';
+}
+
+// available_amount is the spendable balance, not cash_balance alone. Missing
+// or malformed amounts must not turn into a healthy zero-balance account.
+function parseMinimaxBalance(body, region) {
+  const amount = parseNumberOrNull(body?.available_amount);
+  return amount === null ? [] : [{
+    kind: 'billing',
+    metric: 'credits',
+    label: 'Balance',
+    remaining: amount,
+    currency: region === 'cn' ? 'CNY' : 'USD'
+  }];
+}
+
 function minimaxRegionOrder(options = {}, env = {}) {
   const region = minimaxRegion(options, env);
   if (region === 'cn') return ['cn'];
@@ -236,7 +255,10 @@ function minimaxRegionOrder(options = {}, env = {}) {
   return ['en', 'cn'];
 }
 
-function minimaxUrlsForRegion(region) {
+function minimaxUrlsForRegion(region, billingMode) {
+  if (normalizeMinimaxBillingMode(billingMode) === 'api') {
+    return [{ url: region === 'cn' ? MINIMAX_BALANCE_URL_CN : MINIMAX_BALANCE_URL_EN, region, kind: 'balance' }];
+  }
   return region === 'cn'
     ? [
       { url: MINIMAX_TOKEN_PLAN_REMAINS_URL_CN, region: 'cn', kind: 'tokenPlan' },
@@ -249,19 +271,7 @@ function minimaxUrlsForRegion(region) {
 }
 
 function minimaxAttemptSpecs(options = {}, env = {}) {
-  return minimaxRegionOrder(options, env).flatMap(minimaxUrlsForRegion);
-}
-
-// Candidate URLs in region order, token-plan before legacy. A transport
-// failure skips the remaining candidates on the same host.
-function minimaxAttemptOrder(options = {}, env = {}) {
-  return minimaxAttemptSpecs(options, env).map((attempt) => attempt.url);
-}
-
-function minimaxRegionForUrl(url) {
-  if (url === MINIMAX_REMAINS_URL_EN || url === MINIMAX_TOKEN_PLAN_REMAINS_URL_EN) return 'en';
-  if (url === MINIMAX_REMAINS_URL_CN || url === MINIMAX_TOKEN_PLAN_REMAINS_URL_CN) return 'cn';
-  return '';
+  return minimaxRegionOrder(options, env).flatMap((region) => minimaxUrlsForRegion(region, options.minimaxBillingMode));
 }
 
 // Pick a single URL for callers that want a forced region without retry
@@ -363,7 +373,7 @@ async function fetchMinimaxLimits(options = {}, deps = {}) {
           });
         }
       }
-      const windows = parseMinimaxTiers(data);
+      const windows = attempt.kind === 'balance' ? parseMinimaxBalance(data, attempt.region) : parseMinimaxTiers(data);
       const next = attempts[index + 1];
       if (!windows.length && attempt.kind === 'tokenPlan' && next?.region === attempt.region) {
         throw Object.assign(new Error('MiniMax token-plan response has no quota windows'), { status: 'unavailable' });
@@ -376,7 +386,7 @@ async function fetchMinimaxLimits(options = {}, deps = {}) {
       return normalizeLimitProvider({
         provider: 'minimax',
         accountKey,
-        accountLabel: 'Token Plan',
+        accountLabel: attempt.kind === 'balance' ? 'Pay-as-you-go' : 'Token Plan',
         source: 'api',
         status: windows.length ? 'ok' : 'unavailable',
         updatedAt,
@@ -441,11 +451,10 @@ module.exports = {
   MINIMAX_TOKEN_PLAN_REMAINS_URL_EN,
   isMinimaxTransportError,
   minimaxToken,
-  minimaxAttemptOrder,
   minimaxBaseUrl,
   minimaxRegion,
   normalizeMinimaxRegionSetting,
-  minimaxRegionForUrl,
+  normalizeMinimaxBillingMode,
   parseMinimaxTiers,
   fetchMinimaxLimits
 };

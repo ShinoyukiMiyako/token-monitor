@@ -75,12 +75,14 @@ test('Devices, sync settings and TPS agree on labels in Node and browser entrypo
     }
     const tracker = api.TokenMonitorTokenRate.createLiveTokenRateGroupTracker({ now: () => 100 });
     const twoDevices = devices.slice(0, 2);
-    const base = twoDevices.map((device) => ({ ...device, periods: { today: {
+    const base = twoDevices.map((device) => ({ ...device, updatedAt: '2026-10-18T00:00:00.000Z', periods: { today: {
       timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0, modelThroughput: {}
     } } }));
+    const observed = twoDevices.map((device) => ({ ...device, updatedAt: '2026-10-18T00:00:40.000Z' }));
     tracker.reset(api.TokenMonitorTokenRate.selectLiveTokenRatePeriods({ devices: base }, 'remote', 'client', 'all').entries);
-    tracker.observe(api.TokenMonitorTokenRate.selectLiveTokenRatePeriods({ devices: twoDevices }, 'remote', 'client', 'all').entries);
-    assert.equal(tracker.getSample().speed, 80);
+    tracker.observe(api.TokenMonitorTokenRate.selectLiveTokenRatePeriods({ devices: observed }, 'remote', 'client', 'all').entries);
+    // Each device gained 40 output tokens over its own 40 s collection window.
+    assert.equal(tracker.getSample().speed, 2);
     const headings = api.TokenMonitorTokenRate.liveTokenRateTooltipEntries(tracker.getSample(), 'speed', String)
       .filter((entry) => !Array.isArray(entry)).map((entry) => entry.full);
     assert.equal(JSON.stringify(headings), JSON.stringify(settingsNames));

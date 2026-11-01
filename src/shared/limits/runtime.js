@@ -132,11 +132,16 @@ function isAccountScope(scope) {
 
 function normalizedScope(scope) {
   if (!scope || typeof scope !== 'object') return { provider: '' };
-  return { ...cloneValue(scope), provider: providerId(scope.provider) };
+  const provider = providerId(scope.provider);
+  // Muse rows identify local sources, not accounts. Display labels cannot
+  // address one source, so refresh scopes stay provider-wide. clear() can
+  // explicitly invalidate the web source when its Cookie changes.
+  return provider === 'muse' ? { provider } : { ...cloneValue(scope), provider };
 }
 
 function rowIdentityKey(row) {
   const provider = providerId(row?.provider);
+  if (provider === 'muse' && row?.source) return `${provider}:source:${row.source}`;
   const identity = accountIdentityPart(row);
   return identity ? `${provider}:${identity}` : `${provider}:*`;
 }
@@ -369,11 +374,15 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
     resetTimer = setTimer(() => {
       resetTimer = null;
       for (const key of next.keys || []) attemptedResetBoundaries.add(key);
-      for (const scope of next.scopes || []) {
+      const scopes = new Map((next.scopes || []).map((scope) => {
+        const normalized = normalizedScope(scope);
+        return [JSON.stringify(normalized), normalized];
+      }));
+      for (const scope of scopes.values()) {
         const provider = providerId(scope.provider);
         const rows = snapshot.providers.filter((row) => row.provider === provider);
         const strongIdentity = clean(scope.accountKey || scope.accountEmail || scope.accountName);
-        if (!configuredProviders.has(provider) || (rows.length > 1 && !strongIdentity)) continue;
+        if (!configuredProviders.has(provider) || (provider !== 'muse' && rows.length > 1 && !strongIdentity)) continue;
         void refresh(scope, 'reset-boundary');
       }
       scheduleResetTimer();
@@ -429,11 +438,12 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
       // Recorded for every key rather than only the dispatched ones, so a scope
       // skipped below still consumes its deadline instead of re-firing at once.
       recordLimitsUrgencyAttempt(burnState, due.keys, now());
-      for (const [index, scope] of (due.scopes || []).entries()) {
+      for (const [index, inputScope] of (due.scopes || []).entries()) {
+        const scope = normalizedScope(inputScope);
         const provider = providerId(scope.provider);
         const rows = snapshot.providers.filter((row) => row.provider === provider);
         const strongIdentity = clean(scope.accountKey || scope.accountEmail || scope.accountName);
-        if (!configuredProviders.has(provider) || (rows.length > 1 && !strongIdentity)) continue;
+        if (!configuredProviders.has(provider) || (provider !== 'muse' && rows.length > 1 && !strongIdentity)) continue;
         // A lane already running a probe is skipped whatever queued it: an
         // intent superseded by another refresh resolves its promise at once
         // while the physical probe keeps running, so inFlight alone would let an
@@ -515,19 +525,47 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
     return (lane.accountRevisions.get(identityKey) || 0) === (dispatch.accountRevisions.get(identityKey) || 0);
   }
 
-  function applyAttempt(lane, identityKey, row, status, at) {
+  function applyAttempt(lane, identityKey, row, status, at, invalidatedWindowLabels) {
     const existing = lane.identities.get(identityKey) || {
       identityKey,
       lastGood: null,
       lastAttempt: null
     };
     if (status === 'ok') {
+      const retainedWindows = existing.lastGood && invalidatedWindowLabels
+        ? existing.lastGood.windows.filter((window) => !invalidatedWindowLabels.has(window.label)
+          && !row.windows.some((current) => current.label === window.label))
+        : [];
+      if (retainedWindows.length) {
+        // The wire has row-level freshness only. Update independently reported
+        // windows, but keep cached windows visibly stale and eligible for retry.
+        status = 'unavailable';
+        row = { ...row, status, updatedAt: existing.lastGood.updatedAt, windows: [...retainedWindows, ...row.windows],
+          ...(!row.balance && retainedWindows.some((window) => window.metric === 'credits') ? { balance: existing.lastGood.balance } : {}) };
+      }
       existing.lastGood = row;
     } else if (!TRANSIENT_STATUSES.has(status)) {
       existing.lastGood = null;
+    } else if (existing.lastGood && invalidatedWindowLabels) {
+      existing.lastGood = {
+        ...existing.lastGood,
+        windows: existing.lastGood.windows.filter((window) => !invalidatedWindowLabels.has(window.label))
+      };
+    }
+    if (lane.provider === 'workbuddy' && TRANSIENT_STATUSES.has(status) && !row.accountKey) {
+      // A partial discovery can miss an encrypted identity which has never
+      // produced lastGood quota. Preserve its last known metadata as well as
+      // identities with successful readings until explicit removal confirms
+      // absence; the failed attempt must not erase the subscription key.
+      const previous = existing.lastAttempt?.row || existing.lastGood;
+      row = { ...row };
+      for (const field of ['accountKey', 'accountName', 'accountEmail', 'accountLabel', 'region', 'source', 'sourceDetail']) {
+        if (!row[field] && previous?.[field]) row[field] = previous[field];
+      }
     }
     existing.lastAttempt = { status, at, row };
     lane.identities.set(identityKey, existing);
+    return row;
   }
 
   function matchingIdentityKeys(lane, scope) {
@@ -556,12 +594,24 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
     // data), so an explicit removal is the narrow way to delete that identity.
     // It is consumed here and never enters the normalized or synced wire shape.
     const removals = inputRows.filter((row) => row?.removed === true);
+    const cacheInvalidations = new Map();
     const normalizedRows = inputRows
       .filter((row) => row?.removed !== true)
-      .map((row) => normalizeLimitProvider({ ...row, provider: lane.provider }))
+      .map((input) => {
+        const row = normalizeLimitProvider({ ...input, provider: lane.provider });
+        // An explicit provider result can invalidate known-bad windows without
+        // disabling transient retention for its other windows or other accounts.
+        // Require an account key; a generic failure cannot invalidate a lane.
+        if (row?.accountKey && Array.isArray(input.invalidateCachedWindowLabels)) {
+          cacheInvalidations.set(rowIdentityKey(row), new Set(input.invalidateCachedWindowLabels
+            .filter((label) => typeof label === 'string' && label)));
+        }
+        return row;
+      })
       .filter(Boolean);
     const expected = new Set(dispatch.expectedIdentityKeys);
     const represented = new Set();
+    const committedRows = [];
 
     if (attemptError) {
       const status = attemptError.status || (attemptError.code === 'PROBE_TIMEOUT' ? 'timeout' : 'unavailable');
@@ -573,7 +623,7 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
         applyAttempt(lane, identityKey, { provider: lane.provider }, status, attemptAt);
       }
       rebuildSnapshot();
-      return true;
+      return [];
     }
 
     const genericTerminal = normalizedRows.length === 1
@@ -601,16 +651,17 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
         for (const expectedKey of expected) {
           if (!accountRevisionStillCurrent(lane, expectedKey, dispatch)) continue;
           represented.add(expectedKey);
-          applyAttempt(lane, expectedKey, row, row.status, attemptAt);
+          committedRows.push(applyAttempt(lane, expectedKey, row, row.status, attemptAt));
         }
         continue;
       }
 
       represented.add(identityKey);
-      applyAttempt(lane, identityKey, row, row.status, attemptAt);
+      const committedRow = applyAttempt(lane, identityKey, row, row.status, attemptAt, cacheInvalidations.get(rowIdentityKey(row)));
+      committedRows.push(committedRow);
       // Marks the row as measurable by this runtime, so a persisted seed for a
       // provider that has not answered yet can never become a burn baseline.
-      if (row.status === 'ok') markLimitsProbeSuccess(burnState, row);
+      if (committedRow.status === 'ok') markLimitsProbeSuccess(burnState, committedRow);
     }
 
     if (!dispatch.accountScoped && !genericTerminal) {
@@ -620,7 +671,9 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
       }
     }
     rebuildSnapshot();
-    return true;
+    // Retry decisions must follow the published status, including partial
+    // successes that still retain stale windows, rather than the raw probe.
+    return committedRows;
   }
 
   async function dispatchIntent(lane, intent) {
@@ -666,7 +719,7 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
         { deadlineMs }
       );
       const committed = commitRows(lane, dispatch, rows);
-      if (committed) applyRetryPolicy(lane, intent, rows, null, reportedRetryAfterMs);
+      if (committed) applyRetryPolicy(lane, intent, committed, null, reportedRetryAfterMs);
       finishIntent(intent, { superseded: !committed, snapshot: getSnapshot() });
     } catch (error) {
       const committed = commitRows(lane, dispatch, [], error);
@@ -771,7 +824,8 @@ function createLimitsRuntime(initialOptions = {}, deps = {}) {
       if (!isAccountScope(normalized)) {
         cancelLane(lane, reason);
         resetRetryPolicy(lane);
-        lane.identities.clear();
+        if (provider === 'muse' && scope.source === 'web') lane.identities.delete('muse:source:web');
+        else lane.identities.clear();
         lane.accountRevisions.clear();
         continue;
       }

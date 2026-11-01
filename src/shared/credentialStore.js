@@ -320,6 +320,45 @@ class CredentialStore {
     return this.writeDocument(document);
   }
 
+  readClaudeWebCredential(id, document = this.readDocument()) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId) return '';
+    const value = valueAt(document.credentials, ['providers', 'claude', 'accounts', accountId, 'cookie']);
+    return typeof value === 'string' ? value : '';
+  }
+
+  writeClaudeWebCredential(id, cookie) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId || !credentialValuePresent(cookie)) return false;
+    const document = this.readDocument();
+    setValueAt(document.credentials, ['providers', 'claude', 'accounts', accountId, 'cookie'], cookie);
+    this.writeDocument(document);
+    return this.readClaudeWebCredential(accountId) === cookie;
+  }
+
+  removeClaudeWebCredential(id) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId) return false;
+    const document = this.readDocument();
+    deleteValueAt(document.credentials, ['providers', 'claude', 'accounts', accountId]);
+    this.writeDocument(document);
+    return !this.readClaudeWebCredential(accountId);
+  }
+
+  // Fork builds up to v0.69 kept each saved Claude Web login, cookie included,
+  // in one array. Only the migration to managed accounts still reads it.
+  readLegacyClaudeWebAccounts(document = this.readDocument()) {
+    const value = valueAt(document.credentials, ['providers', 'claude', 'webAccounts']);
+    return Array.isArray(value) ? cloneJson(value) : [];
+  }
+
+  removeLegacyClaudeWebAccounts() {
+    const document = this.readDocument();
+    deleteValueAt(document.credentials, ['providers', 'claude', 'webAccounts']);
+    this.writeDocument(document);
+    return this.readLegacyClaudeWebAccounts().length === 0;
+  }
+
   readMimoCredential(id, document = this.readDocument()) {
     const accountId = safeDynamicKey(id);
     if (!accountId) return '';
@@ -368,6 +407,31 @@ class CredentialStore {
     deleteValueAt(document.credentials, ['providers', 'antigravity', 'accounts', accountId]);
     this.writeDocument(document);
     return !this.readAntigravityCredential(accountId);
+  }
+
+  readWorkbuddyCredential(id, document = this.readDocument()) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId) return null;
+    const value = valueAt(document.credentials, ['providers', 'workbuddy', 'accounts', accountId, 'credentials']);
+    return isObject(value) ? cloneJson(value) : null;
+  }
+
+  writeWorkbuddyCredential(id, credentials) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId || !isObject(credentials) || !credentialValuePresent(credentials)) return false;
+    const document = this.readDocument();
+    setValueAt(document.credentials, ['providers', 'workbuddy', 'accounts', accountId, 'credentials'], credentials);
+    this.writeDocument(document);
+    return true;
+  }
+
+  removeWorkbuddyCredential(id) {
+    const accountId = safeDynamicKey(id);
+    if (!accountId) return false;
+    const document = this.readDocument();
+    deleteValueAt(document.credentials, ['providers', 'workbuddy', 'accounts', accountId]);
+    this.writeDocument(document);
+    return !this.readWorkbuddyCredential(accountId);
   }
 
   migrateLegacyMimoCredentials(entries) {

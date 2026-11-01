@@ -4,10 +4,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { resolveSqlite, openDb } = require('../../sqliteReadOnly');
-const { findSessionFiles, codexSessionFile } = require('../../sessionFiles');
+const { findCodexSessionFiles, codexSessionFile } = require('../../sessionFiles');
 const t3SessionMetadata = require('../../t3SessionMetadata');
 const { expandHomePath, t3HomeDir, discoverT3DbPaths } = t3SessionMetadata;
+const { nativeIdForFile } = require('./sessionIdentity');
 const { shouldReadSessionContext } = require('../../sessionContext');
+const { normalizeReasoningEffort } = require('../../sessionLive');
 const { readCodexSessionState, readCodexSessionContext, readCodexTurnEnded } = require('./sessionContext');
 
 const TITLE_MAX_CODE_POINTS = 96;
@@ -131,7 +133,7 @@ function readSessionMeta(sessionIds, deps = {}) {
       db = openDb(dbPath, sqliteMod);
       const columns = new Set(db.prepare('PRAGMA table_info(threads)').all().map((column) => String(column.name)));
       if (!columns.has('id')) continue;
-      const fields = ['name', 'title', 'thread_source', 'source'];
+      const fields = ['name', 'title', 'thread_source', 'source', 'reasoning_effort'];
       for (let offset = 0; offset < candidateIds.length; offset += QUERY_CHUNK_SIZE) {
         const chunk = candidateIds.slice(offset, offset + QUERY_CHUNK_SIZE).filter((id) => !metaByThreadId.has(id));
         if (chunk.length === 0) continue;
@@ -146,8 +148,12 @@ function readSessionMeta(sessionIds, deps = {}) {
             continue;
           }
           const title = titleForRow(row);
-          if (!title) continue;
-          metaByThreadId.set(id, { title });
+          const reasoningEffort = normalizeReasoningEffort(row.reasoning_effort);
+          if (!title && !reasoningEffort) continue;
+          metaByThreadId.set(id, {
+            ...(title ? { title } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {})
+          });
           if (isGeneratedTitle(row)) generatedTitleIds.add(id);
         }
       }
@@ -176,6 +182,28 @@ function readT3SessionMeta(sessionIds, deps = {}) {
   return t3SessionMetadata.readT3SessionMeta(sessionIds, {
     ...deps, driver: 'codex', candidatesForId: threadIdCandidates, cleanTitle: cleanSessionTitle
   });
+}
+
+function filesForSessionIds(sessionIds, { home, deps }) {
+  const codexHome = codexHomeDir({ homeDir: home, env: deps.env, useEnvRoot: !deps.scopedHome });
+  const files = new Map();
+  const missing = new Set();
+  for (const id of sessionIds) {
+    const file = codexSessionFile(home, id, { codexHome });
+    if (file) files.set(id, file);
+    else missing.add(id);
+  }
+  for (const [id, file] of findCodexSessionFiles(codexHome, missing)) files.set(id, file);
+  return files;
+}
+
+function resolveSessionIdentities(sessionIds, context) {
+  const result = new Map();
+  for (const [id, file] of filesForSessionIds(sessionIds, context)) {
+    const nativeId = nativeIdForFile(file);
+    if (nativeId) result.set(id, nativeId);
+  }
+  return result;
 }
 
 function resolveSessionMetadata(sessionIds, context) {
@@ -218,11 +246,6 @@ function resolveSessionMetadata(sessionIds, context) {
     result.set(sessionId, { ...resolved, title: meta.title });
   }
 
-  const codexHome = codexHomeDir({
-    homeDir: home,
-    env: deps.env,
-    useEnvRoot: !deps.scopedHome
-  });
   const readContext = deps.readCodexSessionContext || readCodexSessionContext;
   const readTurnEnded = deps.readCodexTurnEnded || readCodexTurnEnded;
   // The transcript this pass just stat-ed is also where the context window
@@ -231,9 +254,15 @@ function resolveSessionMetadata(sessionIds, context) {
   // `fileSessionMetadata` has to run first for that reason.
   const decorate = (sessionId, filePath) => {
     const meta = context.fileSessionMetadata(sessionId, filePath, result.get(sessionId));
+    const nativeSessionId = nativeIdForFile(filePath);
+    if (nativeSessionId) meta.nativeSessionId = nativeSessionId;
+    // Explicitly clear legacy countdowns, including sessions outside the tail-read window.
+    meta.promptCache = null;
     if (!shouldReadSessionContext(meta.lastUsedAt, context.now)) return meta;
     const state = readCodexSessionState(filePath, deps.codexDeps);
-    if (state.promptCacheState?.observation !== undefined) meta.promptCache = state.promptCacheState.observation;
+    // A fresh turn (including an explicit unknown) wins over the catalog.
+    // Age or a failed read alone must not erase this persistent setting.
+    if (Object.prototype.hasOwnProperty.call(state, 'reasoningEffort')) meta.reasoningEffort = state.reasoningEffort;
     const sessionContext = deps.readCodexSessionContext ? readContext(filePath) : state.context;
     // The turn boundary rides the same tail and answers the other half of the
     // question the window cannot: whether the agent is still generating.
@@ -244,17 +273,7 @@ function resolveSessionMetadata(sessionIds, context) {
     // earlier tick and an unknown transcript leaves the reading alone.
     return turnEnded === undefined ? decorated : { ...decorated, turnEnded };
   };
-  const missingIds = new Set();
-  for (const sessionId of sessionIds) {
-    const filePath = codexSessionFile(home, sessionId, { codexHome });
-    if (filePath) {
-      result.set(sessionId, decorate(sessionId, filePath));
-    } else {
-      missingIds.add(sessionId);
-    }
-  }
-  const files = findSessionFiles(path.join(codexHome, 'sessions'), missingIds);
-  for (const [sessionId, filePath] of files) {
+  for (const [sessionId, filePath] of filesForSessionIds(sessionIds, context)) {
     result.set(sessionId, decorate(sessionId, filePath));
   }
   return result;
@@ -272,5 +291,6 @@ module.exports = {
   readSessionMeta,
   readT3SessionMeta,
   readSessionMetaForHome,
-  resolveSessionMetadata
+  resolveSessionMetadata,
+  resolveSessionIdentities
 };

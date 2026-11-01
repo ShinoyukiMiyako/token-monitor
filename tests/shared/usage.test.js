@@ -39,6 +39,28 @@ test('session normalization preserves bounded titles and recognized background-r
   assert.equal(period.sessions['codex:unknown'].sessionKind, '');
 });
 
+test('a parent link is carried only when present, survives Hub ingress and merges first-wins', () => {
+  const period = normalizePeriod({ sessions: {
+    'codex:child': { client: 'codex', sessionId: 'child', totalTokens: 10, parentSessionId: ' parent ' },
+    'codex:self': { client: 'codex', sessionId: 'self', totalTokens: 5, parentSessionId: 'self' },
+    'codex:top': { client: 'codex', sessionId: 'top', totalTokens: 5 }
+  } });
+  assert.equal(period.sessions['codex:child'].parentSessionId, 'parent');
+  assert.equal(Object.hasOwn(period.sessions['codex:self'], 'parentSessionId'), false);
+  assert.equal(Object.hasOwn(period.sessions['codex:top'], 'parentSessionId'), false);
+
+  const stripped = stripSessionTextFromDeviceRecord({ today: period });
+  assert.equal(stripped.today.sessions['codex:child'].parentSessionId, 'parent');
+
+  const merged = mergePeriods(
+    { sessions: { 'codex:child': { client: 'codex', sessionId: 'child', totalTokens: 1 } } },
+    period,
+    { sessions: { 'codex:child': { client: 'codex', sessionId: 'child', totalTokens: 2, parentSessionId: 'other' } } }
+  );
+  assert.equal(merged.sessions['codex:child'].parentSessionId, 'parent');
+  assert.equal(merged.sessions['codex:child'].totalTokens, 13);
+});
+
 test('unpriced attribution maps stay within period and per-client token allowances', () => {
   const total = (map) => Object.values(map || {}).reduce((sum, value) => sum + value, 0);
   const input = {
@@ -651,7 +673,8 @@ test('mergeDeviceRecord preserves usage for clients omitted by the active tracke
     label: 'Shared App',
     tokens: 175,
     costUsd: 1.75,
-    clients: { codex: 75, hermes: 100 }
+    clients: { codex: 75, hermes: 100 },
+    models: { 'gpt-5': 75, 'claude-3-5-sonnet': 100 }
   });
 });
 
@@ -1029,6 +1052,19 @@ test('normalizeClientName folds both Kilo sources together and keeps Oh My Pi se
   assert.equal(period.clients.omp, 18);
   assert.equal(period.clients.pi, undefined);
   assert.ok(!('kilocode' in period.clients));
+  assert.equal(normalizeClientName('senpi'), 'senpi');
+  assert.equal(normalizeClientName('OmO Native'), 'senpi');
+  assert.equal(normalizeClientName('Senpi (OmO Native)'), 'senpi');
+  assert.notEqual(normalizeClientName('senpi'), 'pi');
+});
+
+test('normalizeClientName trims edge dashes without slowing down on long dash runs', () => {
+  assert.equal(normalizeClientName(' --My Tool!-- '), 'my-tool');
+  assert.equal(normalizeClientName('a--b'), 'a--b');
+  assert.equal(normalizeClientName('---'), null);
+  const started = process.hrtime.bigint();
+  assert.equal(normalizeClientName(`a${'-'.repeat(100_000)}a!`), `a${'-'.repeat(100_000)}a`);
+  assert.ok(process.hrtime.bigint() - started < 1_000_000_000n);
 });
 
 test('normalizeClientName keeps Qoder CN distinct from international Qoder', () => {
@@ -1064,6 +1100,28 @@ test('Muse rows fold Tokscale disjoint reasoning into output and totals', () => 
   assert.equal(session.totalTokens, 27343);
   assert.equal(session.outputTokens, 379);
   assert.equal(session.reasoningTokens, 278);
+});
+
+test('Hermes disjoint reasoning closes the public token buckets without changing cost', () => {
+  const row = {
+    client: 'hermes', sessionId: 'hermes-contract', model: 'claude-sonnet-4-5',
+    input: 1000, output: 250, cacheRead: 200, cacheWrite: 50, reasoning: 150,
+    messageCount: 1, cost: 1.25
+  };
+  for (const entry of [row, { ...row, totalTokens: 1650 }]) {
+    const period = extractUsageFromTokscale({ entries: [entry] });
+    assert.equal(period.totalTokens, 1650);
+    assert.equal(period.clients.hermes, 1650);
+    assert.equal(period.clientOutputs.hermes, 400);
+    assert.equal(period.costUsd, 1.25);
+    const session = period.sessions['hermes:hermes-contract'];
+    assert.equal(session.totalTokens, 1650);
+    assert.equal(session.outputTokens, 400);
+    assert.equal(session.reasoningTokens, 150);
+    assert.equal(session.costUsd, 1.25);
+    assert.equal(session.inputTokens + session.outputTokens + session.cacheReadTokens + session.cacheWriteTokens, session.totalTokens);
+    assert.deepEqual(normalizePeriod(period), period);
+  }
 });
 
 test('fx scan rows and the display name share the tracked client id', () => {

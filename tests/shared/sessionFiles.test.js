@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { findSessionFiles, isSafeSessionId, resolveSessionFile } = require('../../src/shared/sessionFiles');
+const { findCodexSessionFiles, findTimestampedSessionFiles, findSessionFiles, isSafeSessionId, resolveSessionFile } = require('../../src/shared/sessionFiles');
 
 function tmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tm-home-'));
@@ -215,6 +215,113 @@ test('findSessionFiles skips unsafe ids even when a sibling file exists', () => 
     assert.deepEqual([...found.keys()], ['keep']);
     assert.equal(found.get('keep'), safe);
   } finally { cleanup(home); }
+});
+
+test('resolves a pi session file by suffix inside its per-cwd folder', () => {
+  const home = tmpHome();
+  try {
+    const dir = path.join(home, '.pi', 'agent', 'sessions', '--D--project--');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, '2026-10-12T02-27-31-079Z_pi-session-1.jsonl');
+    fs.writeFileSync(file, '{}\n');
+    // A sibling whose name merely ends in the id without the `_` separator must not match.
+    fs.writeFileSync(path.join(dir, 'otherpi-session-1.jsonl'), '{}\n');
+    assert.equal(resolveSessionFile('pi', 'pi-session-1', home), file);
+  } finally { cleanup(home); }
+});
+
+test('Pi detail keeps the scanner root despite PI_CODING_AGENT_DIR', () => {
+  const home = tmpHome();
+  const agentDir = path.join(home, 'relocated-pi');
+  try {
+    const dir = path.join(home, '.pi', 'agent', 'sessions', '--proj--');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, '2026-10-12T02-27-31-079Z_cfg-session.jsonl');
+    fs.writeFileSync(file, '{}\n');
+    const relocated = path.join(agentDir, 'sessions', '--proj--');
+    fs.mkdirSync(relocated, { recursive: true });
+    fs.writeFileSync(path.join(relocated, path.basename(file)), '{}\n');
+    assert.equal(resolveSessionFile('pi', 'cfg-session', home, {
+      env: { PI_CODING_AGENT_DIR: agentDir }
+    }), file);
+    assert.equal(resolveSessionFile('pi', 'cfg-session', home, {
+      env: { PI_CODING_AGENT_DIR: '~/relocated-pi' }
+    }), file);
+    fs.unlinkSync(file);
+    assert.equal(resolveSessionFile('pi', 'cfg-session', home, {
+      env: { PI_CODING_AGENT_DIR: agentDir }
+    }), '', 'an unscanned override tree must not supply a different transcript');
+  } finally { cleanup(home); }
+});
+
+test('an explicit scoped home ignores the host PI_CODING_AGENT_DIR', () => {
+  const home = tmpHome();
+  const hostDir = path.join(home, 'host-pi');
+  try {
+    const dir = path.join(home, '.pi', 'agent', 'sessions', '--proj--');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, '2026-10-12T02-27-31-079Z_scoped.jsonl');
+    fs.writeFileSync(file, '{}\n');
+    assert.equal(resolveSessionFile('pi', 'scoped', home, {
+      env: { PI_CODING_AGENT_DIR: hostDir },
+      useEnvRoots: false
+    }), file);
+  } finally { cleanup(home); }
+});
+
+test('findTimestampedSessionFiles matches the id as a filename suffix', () => {
+  const home = tmpHome();
+  try {
+    const root = path.join(home, 'sessions');
+    const dir = path.join(root, '--proj--');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, '2026-01-01T00-00-00-000Z_abc-123.jsonl');
+    fs.writeFileSync(file, '{}\n');
+    const found = findTimestampedSessionFiles(root, ['abc-123', '../secret', 'missing']);
+    assert.deepEqual([...found.keys()], ['abc-123']);
+    assert.equal(found.get('abc-123'), file);
+  } finally { cleanup(home); }
+});
+
+test('a Codex fallback lookup is remembered, and follows its transcript once compressed or archived', () => {
+  const home = tmpHome();
+  const originalReaddir = fs.readdirSync;
+  let walks = 0;
+  fs.readdirSync = (...args) => {
+    walks += 1;
+    return originalReaddir.apply(fs, args);
+  };
+  try {
+    const codexHome = path.join(home, '.codex');
+    const plain = path.join(codexHome, 'sessions', 'custom', 'legacy-key.jsonl');
+    fs.mkdirSync(path.dirname(plain), { recursive: true });
+    fs.writeFileSync(plain, '{}\n');
+    const lookup = () => findCodexSessionFiles(codexHome, ['legacy-key', '../secret']);
+
+    assert.deepEqual([...lookup()], [['legacy-key', plain]]);
+    const walksToFind = walks;
+    assert.ok(walksToFind > 0);
+
+    assert.equal(lookup().get('legacy-key'), plain);
+    assert.equal(walks, walksToFind, 'a remembered path costs a stat, not a walk');
+
+    fs.renameSync(plain, `${plain}.zst`);
+    assert.equal(lookup().get('legacy-key'), `${plain}.zst`);
+    assert.equal(walks, walksToFind, 'the sibling spelling is checked without a walk');
+
+    fs.writeFileSync(plain, '{}\n');
+    assert.equal(lookup().get('legacy-key'), plain, 'a restored plain transcript takes precedence again');
+    fs.rmSync(plain);
+
+    const archived = path.join(codexHome, 'archived_sessions', 'legacy-key.jsonl');
+    fs.mkdirSync(path.dirname(archived), { recursive: true });
+    fs.renameSync(`${plain}.zst`, archived);
+    assert.equal(lookup().get('legacy-key'), archived);
+    assert.ok(walks > walksToFind, 'a remembered path that no longer reads is looked up again');
+  } finally {
+    fs.readdirSync = originalReaddir;
+    cleanup(home);
+  }
 });
 
 test('a found transcript is remembered, and looked up again once it moves', () => {

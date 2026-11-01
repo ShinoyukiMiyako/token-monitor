@@ -18,8 +18,9 @@
   // matter which of them can see usedPercent; usedPercent is only a fallback
   // for the never-produced remaining-absent window.
   function limitFillPercent(remainingPercent, usedPercent, showUsed) {
-    const remaining = Number(remainingPercent);
-    const used = Number(usedPercent);
+    // Number(null) is 0, which would read a missing window as a fully used one.
+    const remaining = remainingPercent === null || remainingPercent === '' ? NaN : Number(remainingPercent);
+    const used = usedPercent === null || usedPercent === '' ? NaN : Number(usedPercent);
     if (showUsed) {
       if (Number.isFinite(remaining)) return 100 - remaining;
       if (Number.isFinite(used)) return used;

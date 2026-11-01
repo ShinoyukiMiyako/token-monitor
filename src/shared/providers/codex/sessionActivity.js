@@ -3,9 +3,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { resolveSqlite, openDb } = require('../../sqliteReadOnly');
+const { nativeIdForFile } = require('./sessionIdentity');
 const { readT3Activity } = require('../../t3SessionActivity');
 const { clientSourceRoots } = require('../../clientSources');
-const { codexSessionFile } = require('../../sessionFiles');
+const { codexSessionFile, preferredCodexSessionFile } = require('../../sessionFiles');
 const { RUNNING_WINDOW_MS, isArchivedSession, sessionActivityState } = require('../../sessionLive');
 const { readCodexSessionState } = require('./sessionContext');
 const { codexHomeDir, discoverDbPaths, readSessionMeta, readT3SessionMeta } = require('./sessionMetadata');
@@ -13,7 +14,6 @@ const { codexHomeDir, discoverDbPaths, readSessionMeta, readT3SessionMeta } = re
 const { hasKnownSession, nativeSessionsForPeriod, activityEntries, codexActivityCandidates, rememberProjection } = require('../../sessionActivityProjection');
 
 const MAX_SESSIONS = 256;
-const MAX_HEADER_BYTES = 8 * 1024 * 1024;
 const RENEW_INTERVAL_MS = 10_000;
 const discoveryCache = new WeakMap();
 
@@ -29,39 +29,6 @@ function isPathInside(root, file) {
   return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-const identityCache = new Map();
-function nativeIdForFile(file) {
-  let fd;
-  try {
-    const stat = fs.lstatSync(file);
-    if (!stat.isFile()) return '';
-    const fingerprint = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
-    const cached = identityCache.get(file);
-    if (cached?.fingerprint === fingerprint) return cached.id;
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    // Instructions/tool definitions can make session_meta larger than a chunk.
-    // Read only that complete first line, with a hard bound and no retained text.
-    const chunks = [];
-    let position = 0;
-    let complete = false;
-    while (position < MAX_HEADER_BYTES) {
-      const buffer = Buffer.alloc(Math.min(64 * 1024, MAX_HEADER_BYTES - position));
-      const bytes = fs.readSync(fd, buffer, 0, buffer.length, position);
-      if (!bytes) { complete = true; break; }
-      const newline = buffer.subarray(0, bytes).indexOf(10);
-      chunks.push(buffer.subarray(0, newline >= 0 ? newline : bytes));
-      position += bytes;
-      if (newline >= 0 || position >= stat.size) { complete = true; break; }
-    }
-    const first = complete ? JSON.parse((chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)).toString('utf8')) : null;
-    const id = first?.type === 'session_meta' && typeof first.payload?.id === 'string' ? first.payload.id : '';
-    identityCache.delete(file);
-    identityCache.set(file, { fingerprint, id });
-    if (identityCache.size > 512) identityCache.delete(identityCache.keys().next().value);
-    return id;
-  } catch (_) { return ''; }
-  finally { if (fd !== undefined) fs.closeSync(fd); }
-}
 
 
 function sessionRoots(options) {
@@ -84,8 +51,10 @@ function discoverFilesUncached(options, activity, summary) {
   const accepted = new Set();
   const now = Number(new Date(options.now ?? Date.now()));
   const accept = (file, catalogActive = false) => {
-    if (files.size >= MAX_SESSIONS || !/^rollout-.+\.jsonl$/.test(path.basename(file))) return;
-    const id = path.basename(file, '.jsonl');
+    if (files.size >= MAX_SESSIONS || !/^rollout-.+\.jsonl(?:\.zst)?$/.test(path.basename(file))) return;
+    file = preferredCodexSessionFile(file);
+    if (!file) return;
+    const id = path.basename(file).replace(/\.jsonl(?:\.zst)?$/, '');
     // Today's usage rows get native metadata through the normal collector.
     // A historical session resumed without new tokens still needs a Today row.
     if (!activity.size && hasKnownSession(summary, 'codex', id, 'today', false)) return;
@@ -124,7 +93,9 @@ function discoverFilesUncached(options, activity, summary) {
   for (const root of roots) for (const offset of [0, 1]) {
     const dir = path.join(root, ...localDayParts(now, offset));
     try {
-      const names = fs.readdirSync(dir).filter((name) => /^rollout-.+\.jsonl$/.test(name)).sort().reverse().slice(0, MAX_SESSIONS);
+      const names = [...new Set(fs.readdirSync(dir)
+        .filter((name) => /^rollout-.+\.jsonl(?:\.zst)?$/.test(name))
+        .map((name) => name.replace(/\.zst$/, '')))].sort().reverse().slice(0, MAX_SESSIONS);
       for (const name of names) accept(path.join(dir, name));
     } catch (_) { /* No session on this date. */ }
   }
@@ -223,12 +194,13 @@ async function readSessionActivity(summary, options = {}) {
     }
     if (state.turnEnded !== false && !reading) continue;
     const session = {
-      client: 'codex', sessionId: id, totalTokens: 0, costUsd: 0, models: {},
+      client: 'codex', sessionId: id, nativeSessionId: nativeId, totalTokens: 0, costUsd: 0, models: {},
       native: true, tokenDataUnavailable: true, sessionDetailAvailable: true,
       lastUsedAt, lastMessageAt: lastUsedAt,
       ...metadata.get(id),
       ...(!generatedTitleIds.get(id) ? t3Metadata.get(id) : {}),
       turnEnded: state.turnEnded, waitingForInput: state.waitingForInput,
+      ...(Object.prototype.hasOwnProperty.call(state, 'reasoningEffort') ? { reasoningEffort: state.reasoningEffort } : {}),
       ...(reading ? { liveActivity: reading } : {})
     };
     if (!['running', 'waiting'].includes(sessionActivityState(session, options.now))) continue;

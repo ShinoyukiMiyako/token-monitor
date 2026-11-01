@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const { fetchAntigravityLimits, fetchClaudeLimits, mapCodexRateLimitsToProvider } = require('../../src/shared/limits/collector');
+const { aggregateLimits, normalizeLimitProvider } = require('../../src/shared/limits/core');
 
 function codexProviderForPlan(plan) {
   return mapCodexRateLimitsToProvider({
@@ -41,14 +42,18 @@ async function claudeProviderForCredentials(oauth) {
   });
 }
 
-test('Codex plan labels show the updated Pro tiers', () => {
-  assert.equal(codexProviderForPlan('pro').accountLabel, 'Pro More');
-  assert.equal(codexProviderForPlan('Codex Pro').accountLabel, 'Pro More');
-  assert.equal(codexProviderForPlan('OpenAI Codex Pro').accountLabel, 'Pro More');
-  assert.equal(codexProviderForPlan('prolite').accountLabel, 'Pro');
-  assert.equal(codexProviderForPlan('Codex Pro Lite').accountLabel, 'Pro');
-  assert.equal(codexProviderForPlan('promax').accountLabel, 'Pro Max');
-  assert.equal(codexProviderForPlan('Codex Pro Max').accountLabel, 'Pro Max');
+test('Codex plan labels show the Pro tiers by their monthly price', () => {
+  assert.equal(codexProviderForPlan('pro').accountLabel, 'Pro 200');
+  assert.equal(codexProviderForPlan('Codex Pro').accountLabel, 'Pro 200');
+  assert.equal(codexProviderForPlan('OpenAI Codex Pro').accountLabel, 'Pro 200');
+  assert.equal(codexProviderForPlan('prolite').accountLabel, 'Pro 100');
+  assert.equal(codexProviderForPlan('pro_lite').accountLabel, 'Pro 100');
+  assert.equal(codexProviderForPlan('pro-lite').accountLabel, 'Pro 100');
+  assert.equal(codexProviderForPlan('Codex Pro Lite').accountLabel, 'Pro 100');
+  assert.equal(codexProviderForPlan('promax').accountLabel, 'Pro 500');
+  assert.equal(codexProviderForPlan('pro_max').accountLabel, 'Pro 500');
+  assert.equal(codexProviderForPlan('pro-max').accountLabel, 'Pro 500');
+  assert.equal(codexProviderForPlan('Codex Pro Max').accountLabel, 'Pro 500');
 });
 
 test('Codex plan labels compact common enterprise identifiers and humanize fallback identifiers', () => {
@@ -57,12 +62,12 @@ test('Codex plan labels compact common enterprise identifiers and humanize fallb
   assert.equal(codexProviderForPlan('self_serve_business_usage_based').accountLabel, 'Business');
 });
 
-test('Claude plan labels preserve Max multiplier tiers only for Max subscriptions', async () => {
+test('Claude plan labels use current names for legacy Max tiers without relabeling Team', async () => {
   const max = await claudeProviderForCredentials({
     subscriptionType: 'max',
     rateLimitTier: 'default_claude_max_20x'
   });
-  assert.equal(max.accountLabel, 'Max 20x');
+  assert.equal(max.accountLabel, 'Ultra');
 
   const team = await claudeProviderForCredentials({
     subscriptionType: 'team',
@@ -75,7 +80,39 @@ test('Claude plan labels can fall back to rate limit tier when subscription type
   const provider = await claudeProviderForCredentials({
     rateLimitTier: 'default_claude_max_5x'
   });
-  assert.equal(provider.accountLabel, 'Max 5x');
+  assert.equal(provider.accountLabel, 'Max');
+});
+
+test('Claude plan labels accept current names and legacy subscription labels', async () => {
+  for (const [subscriptionType, accountLabel] of [
+    ['max', 'Max'], ['ultra', 'Ultra'], ['max_5x', 'Max'], ['max_20x', 'Ultra']
+  ]) {
+    const provider = await claudeProviderForCredentials({ subscriptionType });
+    assert.equal(provider.accountLabel, accountLabel);
+  }
+  const provider = await claudeProviderForCredentials({ rateLimitTier: 'default_claude_max_20x' });
+  assert.equal(provider.accountLabel, 'Ultra');
+});
+
+test('rows from agents older than the Claude rename read with the current plan names', () => {
+  const label = (provider, accountLabel) => normalizeLimitProvider({ provider, accountLabel, status: 'ok', windows: [] }).accountLabel;
+  assert.equal(label('claude', 'Max 20x'), 'Ultra');
+  assert.equal(label('claude', 'Max 5x'), 'Max');
+  assert.equal(label('claude', 'Team'), 'Team');
+  assert.equal(label('commandcode', 'Max 20x'), 'Max 20x', 'another product may keep the old wording');
+});
+
+test('an old and an upgraded device reporting one Claude account agree on its plan', () => {
+  const device = (deviceId, accountLabel, updatedAt) => ({ deviceId, limits: { providers: [
+    { provider: 'claude', accountKey: 'shared', accountLabel, status: 'ok', updatedAt, windows: [{ kind: 'weekly', usedPercent: 3 }] }
+  ] } });
+  for (const devices of [
+    [device('new', 'Ultra', '2026-11-01T00:00:00Z'), device('old', 'Max 20x', '2026-11-01T00:01:00Z')],
+    [device('old', 'Max 20x', '2026-11-01T00:00:00Z'), device('new', 'Ultra', '2026-11-01T00:01:00Z')]
+  ]) {
+    const { providers } = aggregateLimits(devices);
+    assert.deepEqual(providers.map((provider) => provider.accountLabel), ['Ultra']);
+  }
 });
 
 test('Antigravity plan labels compact Google AI plan names for the provider row', async () => {

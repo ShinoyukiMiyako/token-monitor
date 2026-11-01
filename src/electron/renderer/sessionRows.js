@@ -17,6 +17,7 @@
     : root?.TokenMonitorSessionLive;
   const sessionActivityState = sessionLive.sessionActivityState;
   const sessionContextForRow = sessionLive.sessionContextForRow;
+  const isGrokBotSession = sessionLive.isGrokBotSession;
   const fallbackColors = ['#6ab4f0', '#cc7c5e', '#a57df0', '#49a3b0', '#f0d66a', '#f06a7b'];
 
   function setSessionTooltip(node, context, promptCache, translate, view) {
@@ -27,6 +28,82 @@
     }
     if (promptCache) entries.push({ full: translate('session.cacheEstimateTooltip', { minutes: promptCache.minutes }) });
     view.setDetailTooltip(node, entries);
+  }
+
+  function sessionReasoningEffortForRow(row) {
+    const main = row?.groupRows?.[0] || row;
+    return sessionLive.isSessionReasoningEffortClient(main?.client) ? sessionLive.normalizeReasoningEffort(main.reasoningEffort) : null;
+  }
+
+  function sessionModelMetadataLabel(row) {
+    return [row?.modelLabel ?? sessionModelLabel(row), sessionReasoningEffortForRow(row)].filter(Boolean).join(' · ');
+  }
+
+  // Shared by full session rows and compact Home/Dock/Notch rows. Settings
+  // remain visible after live metrics expire, including archived sessions.
+  function sessionModelMetadataNode(document, row, { translate, view, ...options }) {
+    const node = document.createElement('span');
+    node.className = 'session-model-metadata';
+    const modelLabel = row?.modelLabel ?? sessionModelLabel(row);
+    const entries = row?.modelTooltipEntries ?? sessionModelTooltipEntries(row, options);
+    if (modelLabel) {
+      const model = document.createElement('span');
+      model.className = 'session-models';
+      model.textContent = modelLabel;
+      if (entries.length > 1) view.setDetailTooltip(model, entries);
+      node.append(model);
+    }
+    const effort = sessionReasoningEffortForRow(row);
+    if (effort) {
+      if (modelLabel) node.append(document.createTextNode(' · '));
+      const setting = document.createElement('span');
+      setting.className = 'session-reasoning-effort';
+      setting.textContent = effort;
+      const label = translate('session.reasoningEffortLabel', { effort });
+      setting.setAttribute('aria-label', label);
+      node.append(setting);
+    }
+    return node;
+  }
+
+  // The compact status every glanceable session row shows (Home list, Edge Dock
+  // card, Notch Panel): a context gauge while the session is live, otherwise the
+  // prompt-cache estimate. The cache badge's tooltip still names the context
+  // size when the transcript reported one. Surfaces differ only in class names.
+  function sessionStatusNode(document, row, { prefix, translate, view, showUsed = true, now = Date.now() }) {
+    const statusRow = row?.groupRows?.[0] || row;
+    if (!statusRow) return null;
+    const context = sessionActivityState(statusRow, now) !== 'idle'
+      ? statusRow.context || sessionContextForRow(statusRow, now) || null : null;
+    const promptCache = sessionLive.sessionPromptCacheForRow(statusRow, now);
+    if (!context && !promptCache) return null;
+    const span = (className, text) => {
+      const node = document.createElement('span');
+      node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    };
+    if (!context) {
+      const badge = span(`${prefix}-cache`, translate('session.cacheEstimate', { minutes: promptCache.minutes }));
+      setSessionTooltip(badge, statusRow, promptCache, translate, view);
+      return badge;
+    }
+    const percent = showUsed ? context.percentUsed : context.percentLeft;
+    const node = span(`${prefix}-context`);
+    node.dataset.tone = String(context.tone || '');
+    node.setAttribute('role', 'meter');
+    node.setAttribute('aria-valuemin', '0');
+    node.setAttribute('aria-valuemax', '100');
+    node.setAttribute('aria-valuenow', String(percent));
+    node.setAttribute('aria-label', translate(showUsed ? 'session.contextUsed' : 'session.contextLeft', { percent }));
+    const meter = span(`${prefix}-context-meter`);
+    meter.setAttribute('aria-hidden', 'true');
+    const fill = span(`${prefix}-context-fill`);
+    fill.style.setProperty('--bar-scale', String(percent / 100));
+    meter.append(fill);
+    node.append(meter, span(`${prefix}-context-value`, `${percent}%`));
+    setSessionTooltip(node, context, promptCache, translate, view);
+    return node;
   }
 
   function finiteNumber(value) {
@@ -159,6 +236,16 @@
     return typeof value === 'string' ? value.trim() : '';
   }
 
+  function sessionTitleForDisplay(session) {
+    const title = textValue(session?.title);
+    // OMP persists its title card as <icon> <CODE>: <title>, including /rename
+    // titles. Hide only a private-use icon in that prefix; retain the code,
+    // body and original record for archives/sync, and leave other clients alone.
+    return session?.client === 'omp'
+      ? title.replace(/^[\uE000-\uF8FF\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}] (?=[A-Z0-9]{1,6}: \S)/u, '')
+      : title;
+  }
+
   function clearButtonSemantics(element) {
     for (const attribute of ['tabindex', 'role', 'aria-expanded', 'aria-label']) {
       element.removeAttribute(attribute);
@@ -198,7 +285,7 @@
       client,
       clientLabel,
       modelLabel,
-      titleParts: [clientLabel, modelLabel].filter(Boolean)
+      titleParts: [clientLabel, modelLabel, sessionReasoningEffortForRow(session)].filter(Boolean)
     };
   }
 
@@ -217,6 +304,25 @@
     // different measure in each locale (the Chinese candidates all read as
     // something closer to "invocations" than to billable calls).
     return `${formatNumber(count)} ${count === 1 ? 'call' : 'calls'}`;
+  }
+
+  // Preserve raw counters on presentation rows so a family divides only after
+  // summing its disjoint accounting members. Clamp timed output per member:
+  // untimed or malformed output must not borrow another member's duration.
+  function sessionUsageMetrics(session) {
+    const positive = field => Math.max(0, finiteNumber(session?.[field]));
+    const timedDurationMs = positive('timedDurationMs');
+    return {
+      messageCount: positive('messageCount'),
+      inputTokens: positive('inputTokens'),
+      cacheReadTokens: positive('cacheReadTokens'),
+      cacheWriteTokens: positive('cacheWriteTokens'),
+      outputTokens: positive('outputTokens'),
+      timedOutputTokens: timedDurationMs > 0
+        ? Math.min(positive('outputTokens'), positive('timedOutputTokens')) : 0,
+      timedDurationMs,
+      cacheReported: session?.cacheReported === true
+    };
   }
 
   // The session's own generation speed: the footer's tok/s ratio over just
@@ -244,9 +350,9 @@
   function sessionCacheHitPercent(session) {
     const cacheRead = Math.max(0, finiteNumber(session?.cacheReadTokens));
     const cacheWrite = Math.max(0, finiteNumber(session?.cacheWriteTokens));
-    if (cacheRead <= 0 && cacheWrite <= 0) return null;
+    if (cacheRead <= 0 && cacheWrite <= 0 && session?.cacheReported !== true) return null;
     const input = Math.max(0, finiteNumber(session?.inputTokens)) + cacheRead + cacheWrite;
-    return cacheRead / input * 100;
+    return input > 0 ? cacheRead / input * 100 : null;
   }
 
   // A bare percentage: the line has no room for a label in a narrow window, and
@@ -260,17 +366,6 @@
 
   function isBackgroundReviewSession(session) {
     return textValue(session?.sessionKind) === 'background-review';
-  }
-
-  // Cursor's sandbox ids identify bot runs independently of the model. A
-  // positive grok-bot model also proves a bot conversation with a regular id;
-  // its other models belong to the same conversation, including Claude.
-  function isGrokBotSession(session, key) {
-    if (session?.client !== 'cursor') return false;
-    if (typeof session.grokBotSession === 'boolean') return session.grokBotSession;
-    const id = textValue(session?.sessionId) || String(key || '').replace(/^cursor:/, '');
-    return /^sand-subagent-.+/.test(id) || Object.entries(session?.models || {})
-      .some(([model, tokens]) => /^grok-bot-.+/.test(model) && finiteNumber(tokens) > 0);
   }
 
   const botIdentityCache = new WeakMap();
@@ -321,7 +416,7 @@
   }
 
   function sessionRowDetailAvailable(row) {
-    return ['claude', 'codebuddy', 'codex', 'opencode', 'dsh', 'workbuddy'].includes(row?.client)
+    return ['claude', 'codebuddy', 'codex', 'opencode', 'dsh', 'workbuddy', 'pi', 'omp', 'senpi'].includes(row?.client)
       || (row?.client === 'reasonix' && row?.sessionDetailAvailable === true);
   }
 
@@ -356,8 +451,17 @@
       cacheReadTokens: cacheRead,
       cacheWriteTokens: session?.cacheWriteTokens
     }) || (finiteNumber(session?.cacheMissTokens) > 0 ? '0%' : '');
+    const usageMetrics = sessionUsageMetrics({
+      ...session,
+      ...(tokenDataUnavailable ? { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+        outputTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 } : client === 'reasonix' ? {
+        inputTokens: cacheInput, cacheReadTokens: cacheRead,
+        cacheReported: finiteNumber(session?.cacheMissTokens) > 0
+      } : {})
+    });
+    const activityTime = sessionActivityLabel(session, now);
     const subtitleParts = [
-      sessionActivityLabel(session, now),
+      activityTime,
       messageLabel(session),
       tokenDataUnavailable ? '' : cacheLabel,
       tokenRateLabel(session)
@@ -368,6 +472,10 @@
     // same reason.
     const activityState = sessionActivityState(session, now);
     const running = activityState === 'running';
+    const parentClient = textValue(session?.parentClient) || client;
+    const parentSessionId = textValue(session?.parentSessionId);
+    const subagent = Boolean(parentSessionId) && (parentClient !== client || parentSessionId !== session.sessionId)
+      && !isBackgroundReviewSession(session);
     return {
       key: `session:${key}`,
       kind: 'session',
@@ -377,12 +485,16 @@
         unattributedLabel: options.unattributedLabel
       }),
       subtitle: subtitleParts.join(' · '),
+      activitySummary: subtitleParts.join(' · '),
+      activityTime,
+      usageMetrics,
       running: running || undefined,
       activityState,
       // Decided by the shared gate, not by `running`: it follows the recency
       // window so the reading survives the turn ending, and the dock's card
       // calls the same function so the two cannot disagree.
       context: sessionContextForRow(session, now),
+      reasoningEffort: session.reasoningEffort,
       detail: sessionIdLabel(session?.sessionId || key),
       value,
       tokenDataUnavailable,
@@ -395,6 +507,13 @@
       color: colors[client] || stable(key, palette),
       stale: false,
       client,
+      clientLabel,
+      nativeSessionId: textValue(session?.nativeSessionId),
+      t3ThreadId: textValue(session?.t3ThreadId),
+      modelTokens: session?.models || (session?.model ? { [session.model]: value } : {}),
+      parentKey: subagent ? `session:${parentClient}:${parentSessionId}` : undefined,
+      subagent: subagent || undefined,
+      subagentLabel: subagent ? options.subagentLabel || 'Subagent' : undefined,
       backgroundReview: isBackgroundReviewSession(session) || undefined,
       sortTime: sessionTimestampValue(session),
       title: `${clientLabel} session ${sessionIdLabel(session?.sessionId || key)}`
@@ -408,6 +527,7 @@
     const stable = typeof options.stableColor === 'function' ? options.stableColor : stableColor;
     const palette = options.fallbackColors || fallbackColors;
     const archivedLabel = options.archivedLabel || 'Archived';
+    const subagentLabel = options.subagentLabel || 'Subagent';
     const now = options.now || new Date();
     // A day may contain only Claude usage from a bot conversation that used a
     // grok-bot model earlier. Join evidence by conversation id, never by model.
@@ -415,6 +535,9 @@
     const rows = Object.entries(period?.sessions || {})
       .map(([key, session]) => {
         session = sessionLive.sessionWithActivity(period, key, session);
+        const grokBot = isGrokBotSession(session, key) || (session?.client === 'cursor'
+          && botIds.has(textValue(session.sessionId) || key.replace(/^cursor:/, '')));
+        if (grokBot && session.grokBotSession !== true) session = { ...session, grokBotSession: true };
         const native = options.nativeSessions?.[key];
         // A resumed source can be active before accounting replaces its archive.
         // Join only presentation activity; the retained token/cost values stay put.
@@ -422,7 +545,8 @@
           && native.sessionId === session.sessionId && ['running', 'waiting'].includes(sessionActivityState(native, now))) {
           session = { ...session, archived: false, deleted: false, sourceDeleted: false,
             lastUsedAt: native.lastUsedAt, liveActivity: native.liveActivity,
-            turnEnded: native.turnEnded, waitingForInput: native.waitingForInput };
+            turnEnded: native.turnEnded, waitingForInput: native.waitingForInput,
+            ...(sessionLive.isSessionReasoningEffortClient(session.client) ? { reasoningEffort: native.reasoningEffort ?? null } : {}) };
         }
         if (isReasonixSyntheticSession(session, key)) return null;
         const value = finiteNumber(session?.totalTokens);
@@ -430,20 +554,27 @@
         const { client, titleParts, clientLabel, modelLabel } = sessionTitleParts(session, labels);
         const sessionId = session?.sessionId || key;
         const archived = session?.archived === true || session?.deleted === true || session?.sourceDeleted === true;
-        const sessionTitle = textValue(session?.title);
+        const sessionTitle = sessionTitleForDisplay(session);
         // One derivation, as above. An archived session is idle whatever its
         // timestamp says: the source it was read from is gone, so nothing can
         // still be appending, which is what `sessionActivityState` already
         // enforces through `isArchivedSession`.
         const activityState = sessionActivityState(session, now);
         const running = activityState === 'running';
+        const backgroundReview = isBackgroundReviewSession(session);
+        const parentSessionId = textValue(session?.parentSessionId);
+        const parentClient = textValue(session?.parentClient) || client;
+        const subagent = Boolean(parentSessionId) && (parentClient !== client || parentSessionId !== sessionId) && !backgroundReview;
+        const activityTime = sessionActivityLabel(session, now);
         const activityParts = [
           archived ? archivedLabel : '',
-          sessionActivityLabel(session, now),
+          activityTime,
           messageLabel(session),
           cacheHitLabel(session),
           tokenRateLabel(session)
         ].filter(Boolean);
+        const activitySummary = activityParts.join(' · ');
+        if (subagent) activityParts.splice(archived ? 1 : 0, 0, subagentLabel);
         return {
           key: `session:${key}`,
           kind: 'session',
@@ -454,6 +585,12 @@
           }),
           subtitle: (sessionTitle ? titleParts : activityParts).join(' · '),
           activity: sessionTitle ? activityParts.join(' · ') : undefined,
+          // Group members show their role beside the tool/model, separately
+          // from the activity line. Keep archive status with the activity.
+          activitySummary,
+          activityTime,
+          archivedLabel: archived ? archivedLabel : '',
+          usageMetrics: sessionUsageMetrics(session),
           detail: sessionIdLabel(sessionId),
           value,
           cost: finiteNumber(session?.costUsd),
@@ -464,12 +601,22 @@
           running: running || undefined,
           activityState,
           context: sessionContextForRow(session, now),
+          reasoningEffort: session.reasoningEffort,
           contextSnapshot: !archived ? sessionLive.sessionContextRow(session) : undefined,
           promptCache: sessionLive.sessionPromptCacheForRow(session, now),
           client,
-          backgroundReview: isBackgroundReviewSession(session) || undefined,
-          grokBot: (isGrokBotSession(session, key) || (client === 'cursor'
-            && botIds.has(textValue(session?.sessionId) || key.replace(/^cursor:/, '')))) || undefined,
+          clientLabel,
+          nativeSessionId: textValue(session?.nativeSessionId),
+          t3ThreadId: textValue(session?.t3ThreadId),
+          titled: Boolean(sessionTitle) || undefined,
+          // Raw per-model tokens, so a group row can rebuild its model label and
+          // tooltip from every member rather than from one of them.
+          modelTokens: session?.models,
+          backgroundReview: backgroundReview || undefined,
+          subagent: subagent || undefined,
+          subagentLabel: subagent ? subagentLabel : undefined,
+          parentKey: subagent ? `session:${parentClient}:${parentSessionId}` : undefined,
+          grokBot: grokBot || undefined,
           sortTime: sessionTimestampValue(session),
           title: `${clientLabel} session${sessionIdLabel(sessionId) ? ` ${sessionIdLabel(sessionId)}` : ''}`
         };
@@ -495,6 +642,180 @@
       ...options, id: 'codex-auto-review', client: 'codex',
       label: options.label || 'Codex Auto Review'
     })];
+  }
+
+  // A subagent session folds under the session that started it while that
+  // parent is visible in the same list. Background reviews keep their own
+  // global group and Grok Bot runs theirs, so neither side of a link may be one.
+  // A child whose parent is outside the period stays a row of its own.
+  function groupSubagentRows(rows, options = {}) {
+    const list = Array.isArray(rows) ? rows : [];
+    const eligible = row => row?.kind === 'session' && row.backgroundReview !== true && row.grokBot !== true;
+    // Independent conversations need neither alias resolution nor parent walks.
+    // Keep the full algorithm for repeated native/app identities and any link,
+    // including missing or cross-client parents.
+    const identities = new Set();
+    let needsGrouping = false;
+    for (const row of list) {
+      if (!eligible(row)) continue;
+      const id = sessionConversationIdentity(row);
+      if (row.parentKey || identities.has(id)) { needsGrouping = true; break; }
+      identities.add(id);
+    }
+    if (!needsGrouping) return list;
+    const byKey = new Map(list.filter(eligible).map(row => [row.key, row]));
+    // A verified native conversation can have several independent accounting
+    // rollouts. Resolve links through any visible alias, without changing those
+    // keys or pretending a continuation is a delegated child.
+    const identity = sessionConversationIdentity;
+    const aliases = new Map();
+    for (const row of byKey.values()) {
+      const id = identity(row);
+      const previous = aliases.get(id);
+      if (!previous || row.key.localeCompare(previous.key) < 0) aliases.set(id, row);
+    }
+    const parentLinks = new Map();
+    const conflicts = new Set();
+    for (const row of byKey.values()) {
+      if (!row.parentKey) continue;
+      const id = identity(row);
+      const parent = byKey.get(row.parentKey);
+      const link = parent ? identity(parent) : row.parentKey;
+      if (link === id) continue;
+      if (parentLinks.has(id) && parentLinks.get(id).link !== link) conflicts.add(id);
+      else parentLinks.set(id, { link, parentKey: row.parentKey, subagentLabel: row.subagentLabel });
+    }
+    // Contradictory relationship facts never justify collapsing identities.
+    const canonical = row => conflicts.has(identity(row)) ? row : aliases.get(identity(row));
+    const rootOf = (row) => {
+      const seen = new Set();
+      let current = canonical(row);
+      while (!seen.has(current.key)) {
+        const parentKey = conflicts.has(identity(current)) ? current.parentKey
+          : parentLinks.get(identity(current))?.parentKey;
+        if (!parentKey) break;
+        seen.add(current.key);
+        const parent = byKey.get(parentKey);
+        if (!parent) break;
+        const next = canonical(parent);
+        if (seen.has(next.key)) return canonical(row);
+        current = next;
+      }
+      return current;
+    };
+    const children = new Map();
+    const grouped = new Set();
+    for (const row of byKey.values()) {
+      const root = rootOf(row);
+      if (root.key === row.key) continue;
+      if (!children.has(root.key)) children.set(root.key, []);
+      children.get(root.key).push(row);
+      grouped.add(row.key);
+    }
+    if (grouped.size === 0) return list;
+    return list
+      .filter(row => !grouped.has(row?.key))
+      .map(row => children.has(row?.key) ? subagentGroupRow(row, children.get(row.key), options,
+        conflicts.has(identity(row)), conflicts.has(identity(row)) ? undefined : parentLinks.get(identity(row))?.subagentLabel) : row);
+  }
+
+  // The group row is the parent's own row with the group's totals: members are
+  // disjoint sessions, so their sum is the whole group and nothing is counted
+  // twice. Its id moves to the group page, where the parent is listed first.
+  function sessionConversationIdentity(row) {
+    if (row.t3ThreadId) return `t3:${row.t3ThreadId}`;
+    return row.client === 'codex' && row.nativeSessionId ? `codex:${row.nativeSessionId}` : row.key;
+  }
+
+  function subagentGroupRow(parent, members, options, splitIdentity = false, rootSubagentLabel) {
+    const sameConversation = row => sessionConversationIdentity(row) === sessionConversationIdentity(parent);
+    const all = [parent, ...members];
+    const main = all.filter(sameConversation).sort((a, b) => finiteNumber(b.sortTime) - finiteNumber(a.sortTime));
+    const ordered = all.filter(row => !sameConversation(row)).sort((a, b) => finiteNumber(b.sortTime) - finiteNumber(a.sortTime));
+    const groupRows = [...main, ...ordered].map(row => ({ ...row, groupRole: sameConversation(row) ? 'main' : 'subagent' }));
+    const subagentCount = new Set(ordered.map(sessionConversationIdentity)).size;
+    const value = groupRows.reduce((sum, row) => sum + finiteNumber(row.value), 0);
+    const cost = groupRows.reduce((sum, row) => sum + finiteNumber(row.cost), 0);
+    const unpricedTokens = groupRows.reduce((sum, row) => sum + finiteNumber(row.unpricedTokens), 0);
+    const activityState = ['running', 'waiting'].find(state => groupRows.some(row => row.activityState === state))
+      || parent.activityState;
+    const countLabel = subagentCount === 0 ? '' : (typeof options.countLabel === 'function'
+      ? options.countLabel(subagentCount) : `${subagentCount} subagents`);
+    const id = `subagents:${sessionConversationIdentity(parent).replace(/^session:/, '')}${splitIdentity ? `:root:${encodeURIComponent(parent.key)}` : ''}`;
+    // The model label and its tooltip describe the tokens the row shows, which
+    // are the whole group's, so they are rebuilt from every member's models.
+    const models = {};
+    for (const row of groupRows) {
+      for (const [model, tokens] of Object.entries(row.modelTokens || {})) {
+        models[model] = (models[model] || 0) + finiteNumber(tokens);
+      }
+    }
+    const group = { client: parent.client, models, totalTokens: value };
+    const modelLabel = sessionModelLabel(group);
+    const display = main[0];
+    const titleParts = [display.clientLabel || display.client, modelLabel, sessionReasoningEffortForRow(display)].filter(Boolean).join(' · ');
+    const usageMetrics = sessionUsageMetrics();
+    for (const row of groupRows) {
+      const metrics = row.usageMetrics;
+      if (!metrics) continue;
+      for (const field of Object.keys(usageMetrics)) {
+        if (field === 'cacheReported') usageMetrics.cacheReported ||= metrics.cacheReported === true;
+        else usageMetrics[field] += finiteNumber(metrics[field]);
+      }
+    }
+    const latest = groupRows.reduce((a, b) => finiteNumber(b.sortTime) > finiteNumber(a.sortTime) ? b : a);
+    const activityTime = latest.activityTime || '';
+    const archivedLabel = groupRows.every(row => row.archived === true) ? display.archivedLabel : '';
+    const activityParts = [
+      archivedLabel,
+      activityTime,
+      messageLabel(usageMetrics),
+      cacheHitLabel(usageMetrics),
+      tokenRateLabel(usageMetrics)
+    ].filter(Boolean);
+    const activitySummary = activityParts.join(' · ');
+    // Role follows the root conversation's non-conflicting external link, even
+    // when its display/canonical continuation has no parent of its own.
+    if (rootSubagentLabel) activityParts.splice(archivedLabel ? 1 : 0, 0, rootSubagentLabel);
+    const activity = activityParts.join(' · ');
+    const base = { ...main[0] };
+    delete base.unpricedTokens;
+    return {
+      ...base,
+      key: `session-group:${id}`,
+      kind: 'summary',
+      // An untitled row is named by client and model, so its name follows the
+      // group's models too.
+      name: display.titled ? display.name : titleParts,
+      modelLabel,
+      modelTooltipEntries: options.includeModelTooltip === false ? []
+        : sessionModelTooltipEntries(group, { unattributedLabel: options.unattributedLabel }),
+      modelTokens: models,
+      // Keep the tool/model reading order; the renderer reserves space for the
+      // count while the preceding text can shrink in a narrow window.
+      subtitle: [display.titled ? titleParts : activity, countLabel].filter(Boolean).join(' · '),
+      subtitleIdentity: display.titled ? titleParts : activity,
+      activity: display.titled ? activity : undefined,
+      subagentLabel: rootSubagentLabel || undefined,
+      activitySummary,
+      activityTime,
+      usageMetrics,
+      subagentCountLabel: countLabel,
+      subagentCount,
+      detail: display.activity ? '' : display.detail,
+      groupDetail: countLabel,
+      value,
+      cost,
+      tokenDataUnavailable: groupRows.every(row => row.tokenDataUnavailable === true),
+      ...(unpricedTokens > 0 ? { unpricedTokens } : {}),
+      barValue: value,
+      running: groupRows.some(row => row.running === true) || undefined,
+      activityState,
+      sortTime: Math.max(...groupRows.map(row => finiteNumber(row.sortTime))),
+      sessionGroup: id,
+      subagentGroup: true,
+      groupRows
+    };
   }
 
   function sessionSummaryRow(rows, options) {
@@ -536,7 +857,7 @@
     for (const row of Array.isArray(rows) ? rows : []) {
       (row?.grokBot === true ? bots : primary).push(row);
     }
-    const grouped = groupBackgroundReviewRows(primary, options.backgroundReviews);
+    const grouped = groupBackgroundReviewRows(groupSubagentRows(primary, options.subagents), options.backgroundReviews);
     if (bots.length > 0) grouped.push(sessionSummaryRow(bots, {
       // These source ids include internal subagents, not just user chat rooms.
       countLabel: (count) => `${count} activity records`,
@@ -570,11 +891,16 @@
 
   return {
     setSessionTooltip,
+    sessionStatusNode,
+    sessionReasoningEffortForRow,
+    sessionModelMetadataLabel,
+    sessionModelMetadataNode,
     applyBreakdownRowSemantics,
     archivedSessionCount,
     compactSessionTime,
     groupBackgroundReviewRows,
     groupSessionRows,
+    groupSubagentRows,
     grokBotSessionIdsForMaps,
     isGrokBotSession,
     sessionRowDetailAvailable,
@@ -583,6 +909,7 @@
     sessionCacheHitPercent,
     sessionIdLabel,
     sessionDetailIdLabel,
+    sessionTitleForDisplay,
     // Exported for the edge dock's session rows: a card that shows the top
     // model reads a different name than the list's "N models" for the same
     // session, so both surfaces compose the label from this one helper.
