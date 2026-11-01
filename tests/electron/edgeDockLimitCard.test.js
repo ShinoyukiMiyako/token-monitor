@@ -366,6 +366,21 @@ test('saved-only WorkBuddy subscription card does not appear on the sole live si
   assert.equal(card.find('subscription-tooltip'), null);
 });
 
+test('Claude weekly fills its row when the account has no five-hour window', () => {
+  const resetsAt = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+  const session = { kind: 'session', usedPercent: 6, resetsAt };
+  const weekly = { kind: 'weekly', usedPercent: 3, resetsAt };
+  const fable = { kind: 'weekly', label: 'Fable', usedPercent: 0, resetsAt };
+  const rows = (windows) => dockView()
+    .renderProviderWindows(normalizeLimitProvider({ provider: 'claude', status: 'ok', source: 'web', windows }), '#D97757')
+    .children.map((row) => [row.children[0].children[0].textContent, row.classNames.has('limit-window-wide')]);
+
+  assert.deepEqual(rows([weekly, fable]), [['Weekly', true], ['Fable', true]]);
+  assert.deepEqual(rows([weekly]), [['Weekly', true]]);
+  assert.deepEqual(rows([session, weekly, fable]), [['Session', false], ['Weekly', false], ['Fable', true]],
+    'an account that still has the limit keeps the Session and Weekly pair');
+});
+
 test('Notion rolling and monthly allowances render in both display modes and hide independently', () => {
   // Reset text is omitted once resetsAt is past the grace window, so these
   // instants stay ahead of the render clock instead of a calendar date.

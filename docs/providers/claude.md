@@ -70,6 +70,8 @@ The single-credential `fetchClaudeLimits()` remains the form validator and uses 
 2. Claude Code OAuth credentials discovered from env/file, Windows Credential Manager or macOS Keychain;
 3. the authenticated Claude CLI usage screen as a fallback only for not-configured, rate-limited, unavailable or generic OAuth failures.
 
+Verified Ultra accounts have no five-hour limit, so their usage carries no `five_hour` and the row shows weekly windows alone. Absence is the only signal of that: `five_hour` with `resets_at: null` is an idle window on any plan, and unverified Ultra accounts still have a temporary limit, so that window stays visible rather than being inferred away from the plan.
+
 An identity-resolution failure after successful OAuth quota is not allowed to fall through and mint a differently keyed CLI row. The limits runtime retains the previous stable account instead.
 
 CLI `/usage` prefers print mode on recognized stable releases at or above `2.1.178`, a conservative compatibility gate. Older, prerelease or unknown versions use the original path: PTY on macOS/Linux, direct `/usage` with stdin closed on Windows. Ordinary version/print failures or output without parseable session or all-model weekly quota fall back once. Every attempt revalidates its cwd; unsafe-directory/pin failures, rejected required flags, overflow, cancellation or cleanup failure stop without fallback. Timed-out or cancelled print processes must finish cleanup before fallback starts. Cleanup covers ordinary POSIX process-group descendants and Windows `.cmd` trees, but not deliberately daemonized descendants. Delegated macOS `/status` remains PTY-based: printed quota may be cached and does not prove an OAuth refresh.

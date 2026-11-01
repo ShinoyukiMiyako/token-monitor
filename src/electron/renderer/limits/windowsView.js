@@ -1633,10 +1633,11 @@
       if (session) windows.append(limitWindowNode(providerWindowLabel(provider, session), session, color, 0.95));
       for (const weekly of windowsForKind(provider, 'weekly')) {
         const node = limitWindowNode(providerWindowLabel(provider, weekly), weekly, color, 0.68);
-        // The all-models weekly pairs with Session in the two-column grid; a
-        // model-scoped weekly (the "Fable only" promo cap) has no partner, so span
-        // the full row instead of leaving a half-empty cell.
-        if (weekly.label) node.classList.add('limit-window-wide');
+        // The all-models weekly pairs with Session in the two-column grid. A
+        // model-scoped weekly (the "Fable only" promo cap) has no partner, and
+        // neither does any weekly on an account with no five-hour limit (verified
+        // Ultra), so span the full row instead of leaving a half-empty cell.
+        if (weekly.label || !session) node.classList.add('limit-window-wide');
         windows.append(node);
       }
       // Usage credits: "$2.35 / $20.00" with a meter when a monthly spend limit is
