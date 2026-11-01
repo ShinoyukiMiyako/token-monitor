@@ -146,8 +146,23 @@ function preferredCodexSessionFile(file) {
 
 // Both spellings share the accounting key. Plain JSONL wins deterministically
 // across roots; within one spelling, live sessions precede archived sessions.
+// Metadata asks on every collection, so a remembered path skips the walk as in
+// findSessionFiles. Checking it through preferredCodexSessionFile keeps the plain
+// spelling first when a transcript is compressed or restored after being found.
 function findCodexSessionFiles(codexHome, sessionIds) {
-  const wanted = new Set([...sessionIds].filter(isSafeSessionId));
+  const wanted = new Set();
+  const remembered = new Map();
+  for (const sessionId of sessionIds) {
+    if (!isSafeSessionId(sessionId)) continue;
+    const key = [codexHome, sessionId].join(SESSION_FILE_KEY_SEPARATOR);
+    const known = preferredCodexSessionFile(sessionFilePathCache.get(key) || '');
+    if (known) {
+      remembered.set(sessionId, known);
+      continue;
+    }
+    sessionFilePathCache.delete(key);
+    wanted.add(sessionId);
+  }
   const found = new Map();
   const ranks = new Map();
   let entriesLeft = 100_000;
@@ -173,7 +188,11 @@ function findCodexSessionFiles(codexHome, sessionIds) {
     walk(path.join(codexHome, 'sessions'), 0);
     walk(path.join(codexHome, 'archived_sessions'), 1);
   }
-  return found;
+  for (const [sessionId, file] of found) {
+    sessionFilePathCache.set([codexHome, sessionId].join(SESSION_FILE_KEY_SEPARATOR), file);
+    remembered.set(sessionId, file);
+  }
+  return remembered;
 }
 
 function codexSessionFile(home, sessionId, options = {}) {
