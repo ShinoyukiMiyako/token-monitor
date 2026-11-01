@@ -102,7 +102,9 @@
   // of the device delta when model attribution is unavailable): durations come from the same
   // tokscale performance entries as both token numerators, never from watcher or wall time.
   // Equal snapshots keep the last sample (limits-only and final-after-preview pushes are
-  // common); any regression is a new baseline boundary such as midnight or reconfiguration.
+  // common). A counter regression is a new baseline boundary, such as midnight or
+  // reconfiguration, and so is a clock running backwards, unless it is a final repeating its
+  // preview.
   function createLiveTokenRateTracker({
     now = defaultNow,
     activeMs = 8000,
@@ -218,14 +220,20 @@
         timedDurationMs: current.timedDurationMs - last.counters.timedDurationMs
       };
       const clocked = at !== null && last.at !== null;
+      const unchanged = Object.values(stepDelta).every((value) => value === 0);
+      // Equal counters place nothing in the window, which is how a full scan's final arrives,
+      // stamped with its tick's start behind the previews it repeats. A clock set back past the
+      // sample is no repeat: the sample's lifetime runs on that clock, so it would read live
+      // again until the clock caught up.
+      const repeats = unchanged && !(sample && Number(now()) < sample.sampledAt);
 
-      // A clock running backwards cannot place the new counters in the window either.
-      if ((clocked && at < last.at) || Object.values(stepDelta).some((value) => value < 0)) {
+      // A clock running backwards cannot place the new counters in the window either: there
+      // is no elapsed time to read them against.
+      if ((clocked && at < last.at && !repeats) || Object.values(stepDelta).some((value) => value < 0)) {
         history = [{ at, counters: current }];
         clearSamples();
         return null;
       }
-      const unchanged = Object.values(stepDelta).every((value) => value === 0);
       if (!clocked) history = [{ at, counters: current }];
       else if (at > last.at || !unchanged) history.push({ at, counters: current });
       // Keep the last collection at or before the window start: it anchors the interpolation.

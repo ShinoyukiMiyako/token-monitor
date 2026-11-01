@@ -114,6 +114,11 @@ function timing(output, durationMs, tokens = output * 10) {
   return { timedTokens: tokens, timedOutputTokens: output, timedDurationMs: durationMs };
 }
 
+// One stream at 100 tok/s: its counters after `ms` of generating.
+function steady(ms) {
+  return timing(ms / 10, ms);
+}
+
 test('live rate adds up streams that generate at the same time', () => {
   const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 5 });
   assert.equal(tracker.observe(timing(100, 2000), 0), null);
@@ -196,6 +201,192 @@ test('live rate resets on counter regression and waits for a fresh delta', () =>
 
   assert.equal(tracker.observe(timing(700, 31000), 80000), null, 'a collection clock that runs backwards starts over');
   assert.equal(tracker.getSample(), null);
+});
+
+test('a full scan final stamped behind its preview keeps the sample and the window', () => {
+  let now = 1000;
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => now });
+  tracker.reset(timing(0, 0), 0);
+  tracker.observe(timing(3000, 30000), 30000);
+  // The scan started at 50 s and its preview is stamped as it lands at 60 s.
+  now = 2000;
+  const preview = tracker.observe(timing(6000, 60000), 60000);
+  assert.equal(preview.speed, 100);
+
+  now = 3000;
+  assert.equal(tracker.observe(timing(6000, 60000), 50000), preview, 'the final repeats the preview under the tick start');
+  assert.equal(tracker.getSample(), preview);
+
+  now = 4000;
+  const next = tracker.observe(timing(12000, 120000), 120000);
+  assert.equal(next.windowMs, 120000, 'the window still opens at the first collection, not back at the 30 s floor');
+  assert.equal(next.speed, 100);
+  assert.equal(next.concurrency, 1);
+});
+
+test('a final adding counters behind its preview starts over and then reads the real rate', () => {
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+  tracker.reset(steady(0), 0);
+  assert.equal(tracker.observe(steady(60000), 60000).speed, 100);
+
+  assert.equal(tracker.observe(steady(66000), 50000), null, 'nothing says how long those counters took');
+  assert.equal(tracker.getSample(), null);
+  const next = tracker.observe(steady(96000), 80000);
+  assert.equal(next.speed, 100);
+  assert.equal(next.windowMs, 30000);
+  assert.equal(next.timedOutputTokens, 3000, 'the next scan is measured from the final');
+});
+
+test('new counters under the last collection\'s own stamp still count', () => {
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+  tracker.reset(steady(0), 0);
+  tracker.observe(steady(60000), 60000);
+  const same = tracker.observe(steady(66000), 60000);
+  assert.equal(same.speed, 110, 'a clock that stands still has not run backwards');
+  assert.equal(same.windowMs, 60000);
+
+  const next = tracker.observe(steady(72000), 75000);
+  assert.equal(next.timedOutputTokens, 600, 'the next scan is measured from them');
+  assert.equal(next.speed, 96);
+});
+
+test('any one counter moving makes a final behind its preview new usage', () => {
+  for (const moved of [timing(6000, 60000, 60001), timing(6001, 60000), timing(6000, 60001)]) {
+    const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+    tracker.reset(steady(0), 0);
+    tracker.observe(steady(60000), 60000);
+    assert.equal(tracker.observe(moved, 50000), null);
+  }
+});
+
+test('falling counters start over even when the clock falls with them', () => {
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+  tracker.reset(timing(0, 0), 0);
+  assert.ok(tracker.observe(timing(6000, 60000), 60000));
+  assert.equal(tracker.observe(timing(10, 100), 50000), null);
+  assert.equal(tracker.getSample(), null);
+  const fresh = tracker.observe(timing(3010, 30100), 110000);
+  assert.equal(fresh.windowMs, 60000, 'the new baseline keeps its own stamp rather than the older clock');
+  assert.equal(fresh.speed, 50);
+});
+
+test('a final restoring usage its previews left out is a new baseline, not a burst', () => {
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+  const wsl = timing(300000, 3 * 60 * 60 * 1000);
+  const withWsl = (ms) => timing(ms / 10 + wsl.timedOutputTokens, ms + wsl.timedDurationMs, ms + wsl.timedTokens);
+  const hostOnly = (ms) => timing(ms / 10, ms, ms);
+  tracker.reset(withWsl(0), 0);
+  assert.equal(tracker.observe(withWsl(120000), 120000).speed, 100);
+
+  // The scan starts at 135 s with no WSL anchor to merge into its previews.
+  assert.equal(tracker.observe(hostOnly(136000), 136000), null, 'the today preview falls by the WSL usage');
+  assert.equal(tracker.observe(hostOnly(136000), 138000), null, 'the month preview repeats it');
+  assert.equal(tracker.observe(withWsl(135000), 135000), null, 'the final brings it back behind both');
+  assert.equal(tracker.getSample(), null);
+
+  const next = tracker.observe(withWsl(165000), 165000);
+  assert.equal(next.speed, 100, 'the next scan reads the real rate rather than the WSL day over 30 s');
+  assert.equal(next.concurrency, 1);
+  assert.equal(next.windowMs, 30000);
+  assert.equal(tracker.observe(withWsl(195000), 195000).windowMs, 60000, 'the window grows from the final');
+});
+
+test('new counters on a clock set back start over and then read the real rate', () => {
+  // The second figure is the wait for the next scan: the collector's floor runs on the same
+  // clock, so after a set-back an interval tick can be the first to land, minutes later.
+  for (const [setBackMs, waitMs] of [[20000, 15000], [90000, 15000], [300000, 200000], [3600000, 15000]]) {
+    const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+    const label = `set back ${setBackMs} ms`;
+    const before = 240000;
+    const landed = before + waitMs;
+    tracker.reset(steady(0), setBackMs);
+    assert.equal(tracker.observe(steady(before), setBackMs + before).speed, 100, label);
+
+    assert.equal(tracker.observe(steady(landed), landed), null, label);
+    assert.equal(tracker.getSample(), null, label);
+    const next = tracker.observe(steady(landed + 30000), landed + 30000);
+    assert.equal(next.speed, 100, label);
+    assert.equal(next.windowMs, 30000, label);
+    assert.equal(tracker.observe(steady(landed + 150000), landed + 150000).speed, 100, label);
+  }
+});
+
+test('a clock set back behind the sample ends it instead of bringing it back to life', () => {
+  const hour = 60 * 60 * 1000;
+  let now = hour + 120000;
+  const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => now });
+  const entries = (period) => [{ id: 'device:local', name: 'Local', period, observedAt: now }];
+  tracker.reset([{ ...entries(steady(0))[0], observedAt: hour }]);
+  tracker.observe(entries(steady(120000)));
+  assert.equal(tracker.getSample().speed, 100);
+  now += 600000;
+  assert.equal(tracker.getSample(), null, 'the session ended and the reading aged out');
+
+  // Its lifetime is ahead of the clock again, and idle ticks keep landing with equal counters.
+  now -= hour;
+  for (let tick = 1; tick <= 4; tick += 1) {
+    now += 300000;
+    assert.equal(tracker.observe(entries(steady(120000))).sample, null, `idle tick ${tick}`);
+    assert.equal(tracker.getSample(), null, `idle tick ${tick}`);
+  }
+
+  now += 30000;
+  const resumed = tracker.observe(entries(steady(150000))).sample;
+  assert.equal(resumed.speed, 25, 'a new session reads against the window from the set-back on');
+  assert.equal(resumed.idle, false);
+});
+
+test('a device stamp set back over equal counters keeps the reading until the counters move', () => {
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+  const hour = 60 * 60 * 1000;
+  tracker.reset(steady(0), hour);
+  const live = tracker.observe(steady(120000), hour + 120000);
+  assert.equal(live.speed, 100);
+
+  assert.equal(tracker.observe(steady(120000), 120000), live, 'nothing new, whatever the clock says');
+  assert.equal(tracker.getSample(), live);
+  assert.equal(tracker.observe(steady(135000), 135000), null, 'the first gain has no elapsed time to read against');
+  assert.equal(tracker.getSample(), null);
+  const next = tracker.observe(steady(165000), 165000);
+  assert.equal(next.speed, 100);
+  assert.equal(next.windowMs, 30000);
+});
+
+test('a record stamped far ahead cannot inflate the readings once it is corrected', () => {
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 1000 });
+  const eightHours = 8 * 60 * 60 * 1000;
+  tracker.reset(steady(0), 0);
+  tracker.observe(steady(120000), 120000);
+  assert.ok(tracker.observe(steady(135000), 135000 + eightHours).speed < 100);
+
+  assert.equal(tracker.observe(steady(150000), 150000), null, 'the corrected record falls past the window');
+  assert.equal(tracker.getSample(), null);
+  const next = tracker.observe(steady(180000), 180000);
+  assert.equal(next.speed, 100);
+  assert.equal(next.windowMs, 30000);
+  assert.equal(next.concurrency, 1);
+});
+
+test('a full scan leaves the live reading in place instead of clearing it to a dash', () => {
+  let now = 0;
+  const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => now });
+  const device = (output, durationMs, updatedAt) => ({ deviceId: 'desk', updatedAt, periods: { today: timing(output, durationMs) } });
+  const select = (record) => tokenRateApi.selectLiveTokenRatePeriods({ devices: [record] }, 'desk', 'local', 'device').entries;
+  tracker.reset(select(device(0, 0, '2026-10-18T00:00:00.000Z')));
+  now = 1000;
+  tracker.observe(select(device(6000, 60000, '2026-10-18T00:01:00.000Z')));
+  const live = tracker.getSample();
+  assert.equal(live.speed, 100);
+
+  now = 2000;
+  const final = tracker.observe(select(device(6000, 60000, '2026-10-18T00:00:50.000Z')));
+  assert.equal(final.changed, false);
+  assert.deepEqual(final.sample, live);
+
+  now = 9001;
+  const retained = tracker.getSample();
+  assert.equal(retained.idle, true);
+  assert.equal(retained.speed, 100, 'the dimmed reading survives the final as well');
 });
 
 test('live rate waits for two complete timing snapshots', () => {
