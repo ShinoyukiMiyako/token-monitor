@@ -8,6 +8,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const main = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'electron', 'main.js'), 'utf8');
 const dock = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'electron', 'renderer', 'edgeDock', 'dock.js'), 'utf8');
@@ -38,6 +39,30 @@ test('the dock rate tracker is read on the same clock its timer is scheduled wit
   const shared = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'electron', 'renderer', 'tokenRatePresentation.js'), 'utf8');
   assert.match(shared, /function defaultNow\(\) \{/);
   assert.match(shared, /performance\.now\(\)/);
+});
+
+test('the dock rate stays live for the whole wait on the next scan', () => {
+  const source = main.slice(main.indexOf('function edgeDockLiveRateSample('), main.indexOf('// Week / last-7 / last-30 are not collector periods'));
+  let now = 1000;
+  const context = {
+    settings: { deviceId: 'here', minScanIntervalMs: 15000 }, mode: 'local', Date: { now: () => now },
+    tokenRateApi: require('../../src/electron/renderer/tokenRatePresentation'), edgeDockShowsLiveRate: () => true,
+    edgeDockRateTracker: null, edgeDockRateContext: '', edgeDockRateTimer: null,
+    clearTimeout() {}, setTimeout: () => 1, repaintDockSurfaces() {}
+  };
+  const project = vm.runInNewContext(`${source}; edgeDockLiveRateSample`, context);
+  const stats = (tokens, durationMs) => ({ periods: { today: { timedTokens: tokens, timedOutputTokens: tokens, timedDurationMs: durationMs } } });
+  assert.equal(project(stats(0, 0)), null);
+  now = 2000;
+  const sample = project(stats(50, 1000));
+  assert.equal(sample.idle, false);
+  assert.equal(sample.expiresAt, 20000, '18 s on: the 15 s scan floor plus its slack');
+
+  // The interval is part of the context, so moving it rebuilds rather than keeps the old lifetime.
+  context.settings.minScanIntervalMs = 0;
+  assert.equal(project(stats(50, 1000)), null);
+  now = 3000;
+  assert.equal(project(stats(100, 2000)).expiresAt, 11000);
 });
 
 test('a stale session expiry never shortens either self-repair wait to its floor', () => {

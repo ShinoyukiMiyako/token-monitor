@@ -56,6 +56,23 @@ test('live-rate demand baselines once, retains idle values, and expires without 
   resource.dispose();
 });
 
+test('a plugin rate stays live for the whole wait on the next scan on matched counters', () => {
+  const time = clock(), resource = createLiveRateResource({ ...time, onChange() {} });
+  const extras = { liveRateContext: { minScanIntervalMs: 15000 } };
+  // A scope demanded before the first publication has no interval yet.
+  resource.setScopes(new Set([null]));
+  resource.publish(stats(period()), extras);
+  time.advance(3000);
+  resource.publish(stats(period(100, 1000, 40)), extras);
+  const live = resource.read(null);
+  assert.deepEqual([live.state, live.speed, live.burn, live.expiresAt], ['live', 40, 6000, time.now() + 18000]);
+  time.advance(17999);
+  assert.equal(resource.read(null).state, 'live');
+  time.advance(2);
+  assert.equal(resource.read(null).state, 'idle');
+  resource.dispose();
+});
+
 test('unsupported, missing, stale, reset and measured-zero readings remain distinct', () => {
   const time = clock();
   const resource = createLiveRateResource({ ...time, onChange() {} });

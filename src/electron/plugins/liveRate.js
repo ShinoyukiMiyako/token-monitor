@@ -1,6 +1,6 @@
 'use strict';
 
-const { createLiveTokenRateGroupTracker, selectLiveTokenRatePeriods } = require('../renderer/tokenRatePresentation');
+const { createLiveTokenRateGroupTracker, liveTokenRateTiming, selectLiveTokenRatePeriods } = require('../renderer/tokenRatePresentation');
 
 // A host-owned, demand-driven reader of captured snapshots. It uses the native
 // matched-counter tracker, never collector/renderer elapsed time or new scans.
@@ -52,8 +52,11 @@ function createLiveRateResource({ now, onChange, setTimer = setTimeout, clearTim
     const signature = JSON.stringify(reading);
     if (reset || signature !== group.signature) { group.value = reading; group.signature = signature; group.revision = ++revision; }
   }
+  function createTracker() {
+    return createLiveTokenRateGroupTracker({ now, matchedCounters: true, ...liveTokenRateTiming(context.minScanIntervalMs) });
+  }
   function addScope(deviceId) {
-    const group = { deviceId, tracker: createLiveTokenRateGroupTracker({ now, matchedCounters: true }), boundary: undefined, members: [], hadSample: false };
+    const group = { deviceId, tracker: createTracker(), boundary: undefined, members: [], hadSample: false };
     groups.set(deviceId, group);
     refresh(group, false);
   }
@@ -81,10 +84,13 @@ function createLiveRateResource({ now, onChange, setTimer = setTimeout, clearTim
     },
     publish(next, extras) {
       const nextContext = extras.liveRateContext || {};
-      const nextIdentity = JSON.stringify([extras.sourceId, extras.identityEpoch, nextContext.hubMode, nextContext.deviceId, nextContext.clients]);
+      const nextIdentity = JSON.stringify([extras.sourceId, extras.identityEpoch, nextContext.hubMode, nextContext.deviceId, nextContext.clients, nextContext.minScanIntervalMs]);
       const reset = identity !== nextIdentity;
       stats = next; context = nextContext; identity = nextIdentity;
-      for (const group of groups.values()) refresh(group, true, reset);
+      for (const group of groups.values()) {
+        if (reset) group.tracker = createTracker();
+        refresh(group, true, reset);
+      }
       schedule();
     },
     read(deviceId) {

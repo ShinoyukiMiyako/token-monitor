@@ -109,6 +109,6 @@ test('the rail rolls its readouts on the shared setting, never on a reveal', () 
   const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map(([, src]) => src);
   assert.ok(scripts.indexOf('../../tokenNumberAnimation.js') < scripts.indexOf('dock.js'));
   assert.ok(scripts.indexOf('railNumberRoll.js') < scripts.indexOf('dock.js'));
-  const appearance = main.slice(main.indexOf('function edgeDockAppearance('), main.indexOf('const EDGE_DOCK_RATE_ACTIVE_MS'));
+  const appearance = main.slice(main.indexOf('function edgeDockAppearance('), main.indexOf('let edgeDockRateTracker = null'));
   assert.match(appearance, /tokenNumberAnimation: source\.tokenNumberAnimation/);
 });
