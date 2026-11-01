@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const { fetchAntigravityLimits, fetchClaudeLimits, mapCodexRateLimitsToProvider } = require('../../src/shared/limits/collector');
+const { aggregateLimits, normalizeLimitProvider } = require('../../src/shared/limits/core');
 
 function codexProviderForPlan(plan) {
   return mapCodexRateLimitsToProvider({
@@ -91,6 +92,27 @@ test('Claude plan labels accept current names and legacy subscription labels', a
   }
   const provider = await claudeProviderForCredentials({ rateLimitTier: 'default_claude_max_20x' });
   assert.equal(provider.accountLabel, 'Ultra');
+});
+
+test('rows from agents older than the Claude rename read with the current plan names', () => {
+  const label = (provider, accountLabel) => normalizeLimitProvider({ provider, accountLabel, status: 'ok', windows: [] }).accountLabel;
+  assert.equal(label('claude', 'Max 20x'), 'Ultra');
+  assert.equal(label('claude', 'Max 5x'), 'Max');
+  assert.equal(label('claude', 'Team'), 'Team');
+  assert.equal(label('commandcode', 'Max 20x'), 'Max 20x', 'another product may keep the old wording');
+});
+
+test('an old and an upgraded device reporting one Claude account agree on its plan', () => {
+  const device = (deviceId, accountLabel, updatedAt) => ({ deviceId, limits: { providers: [
+    { provider: 'claude', accountKey: 'shared', accountLabel, status: 'ok', updatedAt, windows: [{ kind: 'weekly', usedPercent: 3 }] }
+  ] } });
+  for (const devices of [
+    [device('new', 'Ultra', '2026-11-01T00:00:00Z'), device('old', 'Max 20x', '2026-11-01T00:01:00Z')],
+    [device('old', 'Max 20x', '2026-11-01T00:00:00Z'), device('new', 'Ultra', '2026-11-01T00:01:00Z')]
+  ]) {
+    const { providers } = aggregateLimits(devices);
+    assert.deepEqual(providers.map((provider) => provider.accountLabel), ['Ultra']);
+  }
 });
 
 test('Antigravity plan labels compact Google AI plan names for the provider row', async () => {

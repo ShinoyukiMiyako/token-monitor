@@ -81,6 +81,7 @@ test('saved fork logins become managed accounts the service can read, and the co
     ['login-a', 'org-a', 'key-a', true], ['login-b', '', 'key-b', true]
   ]);
   assert.equal(accounts[0].addedAt, new Date(1000).toISOString());
+  assert.equal(accounts[0].accountLabel, 'Ultra', 'a login saved before the plan rename reads with the current name');
   assert.deepEqual(persisted, [accounts]);
   assert.doesNotMatch(JSON.stringify(accounts), /sk-ant/, 'settings metadata must never carry a cookie');
 

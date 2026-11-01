@@ -1,12 +1,16 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
+const { currentClaudePlanLabel } = require('../../limits/core');
 
 const IDENTITY_FIELDS = ['accountKey', 'accountEmail', 'accountName', 'accountLabel'];
 
 function claudeWebAccountMetadata(account) {
-  return Object.fromEntries(['id', 'organizationId', ...IDENTITY_FIELDS]
+  const metadata = Object.fromEntries(['id', 'organizationId', ...IDENTITY_FIELDS]
     .map((key) => [key, String(account?.[key] || '').trim()]));
+  // Only a successful read rewrites the stored label, so a disabled or signed-out
+  // account would otherwise keep a retired plan name indefinitely.
+  return { ...metadata, accountLabel: currentClaudePlanLabel(metadata.accountLabel) };
 }
 
 function normalizeClaudeManagedAccounts(value) {

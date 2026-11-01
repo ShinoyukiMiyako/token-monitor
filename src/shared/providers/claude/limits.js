@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { BROWSER_USER_AGENT } = require('../../browserUserAgent');
-const { aggregateLimits, normalizeLimitProvider } = require('../../limits/core');
+const { aggregateLimits, currentClaudePlanLabel, normalizeLimitProvider } = require('../../limits/core');
 const { abortError, runWithProbeDeadline } = require('../../probeDeadline');
 const { claudeWebAccountMetadata, normalizeClaudeManagedAccounts } = require('./webAccounts');
 const { hashKey } = require('../../hashKey');
@@ -189,9 +189,7 @@ function claudePlanLabelFromParts(subscriptionType, rateLimitTier) {
     ? tierLabel
     : subscriptionLabel || tierLabel;
   // Legacy API tiers keep their identifiers after the public plan rename.
-  if (label === 'Max 5x') return 'Max';
-  if (label === 'Max 20x') return 'Ultra';
-  return label;
+  return currentClaudePlanLabel(label);
 }
 
 function extractClaudeOauth(credentials) {
@@ -761,11 +759,15 @@ function claudeWebEligibleOrganizations(organizations) {
 }
 
 function claudeWebOrganizationChoices(organizations) {
-  return claudeWebEligibleOrganizations(organizations).map((candidate) => ({
-    id: claudeWebOrganizationId(candidate),
-    name: String(candidate.name || candidate.display_name || '').trim(),
-    plan: claudeCapabilityPlan(claudeWebOrganizationCapabilities(candidate), candidate)
-  }));
+  return claudeWebEligibleOrganizations(organizations).map((candidate) => {
+    const plan = claudeCapabilityPlan(claudeWebOrganizationCapabilities(candidate), candidate);
+    return {
+      id: claudeWebOrganizationId(candidate),
+      name: String(candidate.name || candidate.display_name || '').trim(),
+      // Max and Ultra share the claude_max capability; only the tier separates them.
+      plan: plan ? claudePlanLabelFromParts(plan, candidate.rate_limit_tier).toLowerCase() : ''
+    };
+  });
 }
 
 function selectClaudeWebOrganization(organizations, selectedId = '') {

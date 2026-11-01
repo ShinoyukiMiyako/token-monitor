@@ -5,6 +5,20 @@ const test = require('node:test');
 const { collectLimitsOnce } = require('../../src/shared/limits/collector');
 const { createLimitsRuntime } = require('../../src/shared/limits/runtime');
 const { aggregateLimits } = require('../../src/shared/limits/core');
+const { normalizeClaudeManagedAccounts } = require('../../src/shared/providers/claude/webAccounts');
+
+test('saved accounts read with the current plan name without changing their identity', () => {
+  const accounts = normalizeClaudeManagedAccounts([
+    { id: 'disabled', accountKey: 'key-a', accountLabel: 'Max 20x', enabled: false },
+    { id: 'signed-out', accountKey: 'key-b', accountLabel: 'Max 5x' },
+    { id: 'current', accountKey: 'key-c', accountLabel: 'Team' }
+  ]);
+  assert.deepEqual(accounts.map(({ id, accountKey, accountLabel, enabled }) => [id, accountKey, accountLabel, enabled]), [
+    ['disabled', 'key-a', 'Ultra', false],
+    ['signed-out', 'key-b', 'Max', true],
+    ['current', 'key-c', 'Team', true]
+  ]);
+});
 
 function response(status, body) {
   return { status, ok: status >= 200 && status < 300, headers: { get: () => '', getSetCookie: () => [] }, json: async () => body };

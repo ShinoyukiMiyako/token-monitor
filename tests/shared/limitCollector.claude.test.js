@@ -431,6 +431,14 @@ test('Claude Web lists eligible organizations and reads the selected one', async
       [free.uuid, ''], [subscription.uuid, subscription.uuid.split('-')[1]]
     ]);
   }
+  const tiers = [
+    { uuid: 'organization-legacy-20x', capabilities: ['chat', 'claude_max'], rate_limit_tier: 'default_claude_max_20x' },
+    { uuid: 'organization-legacy-5x', capabilities: ['chat', 'claude_max'], rate_limit_tier: 'default_claude_max_5x' },
+    { uuid: 'organization-team', capabilities: ['chat', 'raven'], raven_type: 'team', rate_limit_tier: 'default_raven_max_20x' }
+  ];
+  assert.deepEqual((await choicesFor([free, ...tiers])).map(({ id, plan }) => [id, plan]), [
+    [free.uuid, ''], [tiers[0].uuid, 'ultra'], [tiers[1].uuid, 'max'], [tiers[2].uuid, 'team']
+  ]);
   for (const organizations of [subscriptions, subscriptions.toReversed()]) {
     assert.deepEqual(
       (await choicesFor(organizations)).map((choice) => choice.id),

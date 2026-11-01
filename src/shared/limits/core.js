@@ -472,6 +472,15 @@ function codexWindowRank(window) {
   return group * WINDOW_ORDER.length + WINDOW_ORDER.indexOf(kind);
 }
 
+// Older agents and saved accounts still carry the names Claude retired. Scoped
+// to Claude by the callers: commandcode has a plan of its own called Max 20x.
+const CLAUDE_RENAMED_PLANS = new Map([['Max 5x', 'Max'], ['Max 20x', 'Ultra']]);
+
+function currentClaudePlanLabel(value) {
+  const label = normalizeAccountLabel(value);
+  return CLAUDE_RENAMED_PLANS.get(label) ?? label;
+}
+
 function normalizeLimitProvider(input) {
   if (!input || typeof input !== 'object') return null;
   const provider = normalizeProviderId(input.provider);
@@ -480,7 +489,9 @@ function normalizeLimitProvider(input) {
   const accountKeyAliases = provider === 'opencode'
     ? normalizeOpenCodeAccountKeyAliases(input.accountKeyAliases, accountKey)
     : [];
-  const accountLabel = normalizeAccountLabel(input.accountLabel);
+  const accountLabel = provider === 'claude'
+    ? currentClaudePlanLabel(input.accountLabel)
+    : normalizeAccountLabel(input.accountLabel);
   const windows = Array.isArray(input.windows)
     ? input.windows.map(normalizeLimitWindow).filter(Boolean)
     : [];
@@ -1101,6 +1112,7 @@ function syncLimits(limits) {
 }
 
 module.exports = {
+  currentClaudePlanLabel,
   DEFAULT_LIMITS_REFRESH_MS,
   aggregateLimits,
   mergeCodexTransientWindows,
