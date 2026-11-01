@@ -9,15 +9,22 @@ const test = require('node:test');
 
 const { aggregateLimits } = require('../../src/shared/limits/core');
 const { claudeCommandCandidates, claudeWebCookie, fetchClaudeLimits, mapClaudeCliUsageToProvider, mapClaudeUsageToProvider, normalizeClaudeWebCookieInput } = require('../../src/shared/limits/collector');
-const { listClaudeWebOrganizations, normalizeClaudeWebAccounts, runClaudeAuthStatus, touchClaudeAuthPath } = require('../../src/shared/providers/claude/limits');
+const { listClaudeWebOrganizations, runClaudeAuthStatus, touchClaudeAuthPath } = require('../../src/shared/providers/claude/limits');
+const { claudeProbeDir } = require('../../src/shared/providers/claude/probe');
+const probeTempRoot = process.platform === 'win32' ? os.homedir() : os.tmpdir();
 
 function fakeSpawnForClaudeUsage(expectedCommand = 'cmd.exe') {
   return (command, args, options) => {
     assert.equal(command, expectedCommand);
-    assert.deepEqual(args, ['/d', '/s', '/c', '""claude.cmd" /usage"']);
+    assert.equal(args[0], '/d');
+    assert.match(args[3], /--setting-sources user/);
+    assert.match(args[3], /--settings "\{\\"disableAllHooks\\":true,/);
+    assert.match(args[3], /--allowed-tools ""/);
+    assert.match(args[3], /--strict-mcp-config -- \/usage"$/);
     assert.equal(options.shell, false);
     assert.equal(options.windowsVerbatimArguments, true);
     assert.equal(options.env.DISABLE_AUTOUPDATER, '1');
+    assert.equal(options.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY, '1');
     const child = new EventEmitter();
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
@@ -151,7 +158,7 @@ test('Claude Web source takes precedence and carries stable account metadata', a
   assert.equal(first.provider.accountKey, second.provider.accountKey);
   assert.equal(first.provider.accountEmail, 'owner@example.com');
   assert.equal(first.provider.accountName, 'Example Workspace');
-  assert.equal(first.provider.accountLabel, 'Max 20x');
+  assert.equal(first.provider.accountLabel, 'Ultra');
   assert.deepEqual(first.provider.windows.map((window) => window.kind), ['session', 'weekly']);
   // The pool is asked for, comes back unfunded, and so contributes no row.
   assert.equal(first.provider.balance, null);
@@ -819,10 +826,18 @@ test('Claude Web authentication failure does not silently fall back to another l
   assert.equal(spawned, false);
 });
 
-test('Claude limits fall back to direct CLI usage on Windows when OAuth usage is unavailable', async () => {
-  const provider = await fetchClaudeLimits({}, {
+test('Claude limits fall back to direct CLI usage in the probe directory on Windows', async t => {
+  const fixtureDir = await fs.mkdtemp(path.join(probeTempRoot, 'claude-direct-probe-'));
+  t.after(() => fs.rm(fixtureDir, { recursive: true, force: true }));
+  t.mock.method(os, 'userInfo', () => ({ homedir: fixtureDir }));
+  const probeDir = claudeProbeDir({ platform: 'win32' });
+  const spawnUsage = fakeSpawnForClaudeUsage();
+  let spawnedCwd;
+  let starts = 0;
+  const deps = {
     platform: 'win32',
-    env: {},
+    env: { CLAUDE_CODE_SKIP_PROMPT_HISTORY: '0', TOKEN_MONITOR_SHARED_DIR: path.join(fixtureDir, 'shared'),
+      APPDATA: path.join(fixtureDir, 'redirected'), LOCALAPPDATA: path.join(fixtureDir, 'redirected-local') },
     now: () => Date.parse('2026-06-11T00:00:00Z'),
     claudeCredentialPath: 'C:\\Users\\Javis\\.claude\\.credentials.json',
     stat: async () => ({ mtimeMs: 1 }),
@@ -839,9 +854,18 @@ test('Claude limits fall back to direct CLI usage on Windows when OAuth usage is
     }),
     existsSync: () => false,
     isClaudeCliAuthenticated: async () => true,
-    spawn: fakeSpawnForClaudeUsage()
-  });
+    runClaudeVersion: async () => '',
+    claudeProbeDir: path.join(fixtureDir, 'ignored-probe'),
+    spawn: (command, args, options) => {
+      starts++;
+      spawnedCwd = options.cwd;
+      return spawnUsage(command, args, options);
+    }
+  };
+  const provider = await fetchClaudeLimits({}, deps);
 
+  assert.equal(spawnedCwd, await fs.realpath(probeDir));
+  assert.equal((await fs.stat(probeDir)).isDirectory(), true);
   assert.equal(provider.provider, 'claude');
   assert.equal(provider.status, 'ok');
   assert.equal(provider.source, 'cli');
@@ -849,6 +873,13 @@ test('Claude limits fall back to direct CLI usage on Windows when OAuth usage is
   assert.equal(provider.windows[0].usedPercent, 5);
   assert.equal(provider.windows[1].kind, 'weekly');
   assert.equal(provider.windows[1].usedPercent, 20);
+  assert.equal(await fs.stat(path.join(fixtureDir, 'shared')).catch(() => null), null);
+  assert.equal(await fs.stat(deps.claudeProbeDir).catch(() => null), null);
+
+  await fs.rename(probeDir, probeDir + '-saved');
+  await fs.symlink(probeDir + '-saved', probeDir, 'junction');
+  await assert.rejects(fetchClaudeLimits({}, deps));
+  assert.equal(starts, 1, 'a linked fixed leaf must fail before the direct CLI starts');
 });
 
 test('Claude limits fall back to CLI usage when OAuth credentials are not discoverable', async () => {
@@ -972,21 +1003,24 @@ test('Claude auth status uses cmd.exe without shell mode on Windows', async () =
 });
 
 test('Claude PTY probing preserves the first executable Python failure', async (t) => {
-  const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'token-monitor-claude-python-'));
-  t.after(() => fs.rm(probeDir, { recursive: true, force: true }));
+  const fixtureDir = await fs.mkdtemp(path.join(probeTempRoot, 'token-monitor-claude-python-'));
+  t.after(() => fs.rm(fixtureDir, { recursive: true, force: true }));
+  const probeDir = path.join(fixtureDir, 'probe');
   const calls = [];
 
   await assert.rejects(
     touchClaudeAuthPath({
       platform: 'darwin',
-      env: { TERM: 'dumb' },
+      env: { TERM: 'dumb', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '0' },
       claudeProbeDir: probeDir,
       existsSync: () => false,
       spawn: (command, args, options) => {
         calls.push(command);
         assert.equal(options.env.TERM, 'xterm-256color');
         assert.equal(options.env.DISABLE_AUTOUPDATER, '1');
-        const script = args[1];
+        assert.equal(options.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY, '1');
+        assert.deepEqual(args.slice(0, 2), ['-I', '-c']);
+        const script = args[2];
         assert.match(script, /matched_at = None/);
         assert.match(script, /matched_at is not None and now - matched_at >= 2/);
         assert.doesNotMatch(script, /time\.sleep\(2\)/);
@@ -1011,18 +1045,21 @@ test('Claude PTY probing preserves the first executable Python failure', async (
 });
 
 test('Claude PTY prompt matching handles overlapping tokens with one carriage return', async (t) => {
-  const probeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'token-monitor-claude-prompt-'));
-  t.after(() => fs.rm(probeDir, { recursive: true, force: true }));
+  const fixtureDir = await fs.mkdtemp(path.join(probeTempRoot, 'token-monitor-claude-prompt-'));
+  t.after(() => fs.rm(fixtureDir, { recursive: true, force: true }));
+  const probeDir = path.join(fixtureDir, 'probe');
   let script = '';
 
   await assert.rejects(
     touchClaudeAuthPath({
       platform: 'darwin',
-      env: {},
+      env: { CLAUDE_CODE_SKIP_PROMPT_HISTORY: '0' },
       claudeProbeDir: probeDir,
       existsSync: () => false,
-      spawn: (_command, args) => {
-        script = args[1];
+      spawn: (_command, args, options) => {
+        assert.equal(options.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY, '1');
+        assert.deepEqual(args.slice(0, 2), ['-I', '-c']);
+        script = args[2];
         const child = new EventEmitter();
         child.stdout = new EventEmitter();
         child.stderr = new EventEmitter();
@@ -1044,33 +1081,78 @@ test('Claude PTY prompt matching handles overlapping tokens with one carriage re
   assert.equal(promptBlock.match(/write_master\(b"\\r"\)/g)?.length, 1);
 });
 
+test('Claude PTY usage probes suppress history without changing the parent environment', async (t) => {
+  const fixtureDir = await fs.mkdtemp(path.join(probeTempRoot, 'token-monitor-claude-history-'));
+  t.after(() => fs.rm(fixtureDir, { recursive: true, force: true }));
+  const probeDir = path.join(fixtureDir, 'probe');
+  for (const platform of ['darwin', 'linux']) {
+    const env = { CLAUDE_CODE_SKIP_PROMPT_HISTORY: '0' };
+    const provider = await fetchClaudeLimits({}, {
+      platform,
+      env,
+      claudeProbeDir: probeDir,
+      stat: async () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); },
+      readMacKeychain: false,
+      isClaudeCliAuthenticated: async () => true,
+      runClaudeVersion: async () => '',
+      existsSync: () => false,
+      spawn: (command, _args, options) => {
+        assert.equal(command, 'python3');
+        assert.equal(options.env.TOKEN_MONITOR_CLAUDE_SLASH_COMMAND, '/usage');
+        assert.equal(options.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY, '1');
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => {};
+        process.nextTick(() => {
+          child.stdout.emit('data', 'Current session\n95% left\nResets 6pm\nCurrent week\n80% left\nResets Jun 18');
+          child.emit('close', 0);
+        });
+        return child;
+      }
+    });
+    assert.equal(provider.source, 'cli');
+    assert.equal(provider.windows[0].usedPercent, 5);
+    assert.equal(env.CLAUDE_CODE_SKIP_PROMPT_HISTORY, '0');
+  }
+});
+
 test('Claude CLI commands execute from a Windows path containing spaces', {
   skip: process.platform !== 'win32'
 }, async (t) => {
-  const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), 'token monitor claude '));
+  const fixtureDir = await fs.mkdtemp(path.join(probeTempRoot, 'token monitor claude '));
+  t.mock.method(os, 'userInfo', () => ({ homedir: fixtureDir }));
+  const expectedProbeDir = claudeProbeDir({ platform: 'win32' });
   const command = path.join(fixtureDir, 'claude.cmd');
+  const handler = path.join(fixtureDir, 'fake-claude.cjs');
   t.after(() => fs.rm(fixtureDir, { recursive: true, force: true }));
-  await fs.writeFile(command, [
-    '@echo off',
-    'if /I "%~1"=="auth" goto auth',
-    'if /I "%~1"=="/usage" goto usage',
-    'exit /b 1',
-    ':auth',
-    'echo {"loggedIn":true}',
-    'exit /b 0',
-    ':usage',
-    'echo Current session',
-    'echo 95%% left',
-    'echo Resets 6pm',
-    'echo Current week ^(all models^)',
-    'echo 80%% left',
-    'echo Resets Jun 19',
-    'exit /b 0'
-  ].join('\r\n'));
+  await fs.writeFile(command, `@echo off\r\n"${process.execPath}" "${handler}" %*\r\n`);
+  await fs.writeFile(handler, `
+const assert = require('node:assert/strict');
+const args = process.argv.slice(2);
+assert.equal(process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY, '1');
+if (args[0] === 'auth') console.log('{"loggedIn":true}');
+else if (args.includes('--version')) console.log('2.1.177 (Claude Code)');
+else {
+  const fs = require('node:fs');
+  assert.equal(fs.realpathSync(process.cwd()), fs.realpathSync(process.env.EXPECTED_PROBE_CWD));
+  assert.equal(args.at(-1), '/usage');
+  assert.equal(args.at(-2), '--');
+  assert.equal(args[args.indexOf('--setting-sources') + 1], 'user');
+  assert.equal(JSON.parse(args[args.indexOf('--settings') + 1]).disableAllHooks, true);
+  assert.ok(args.includes('--strict-mcp-config'));
+  assert.equal(args[args.indexOf('--allowed-tools') + 1], '');
+  console.log('Current session\\n95% left\\nResets 6pm\\nCurrent week (all models)\\n80% left\\nResets Jun 19');
+}
+`);
 
   const deps = {
     platform: 'win32',
-    env: { ...process.env, TOKEN_MONITOR_CLAUDE_COMMAND: command },
+    env: { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec,
+      HOME: fixtureDir, USERPROFILE: fixtureDir, CLAUDE_CONFIG_DIR: path.join(fixtureDir, 'config'),
+      EXPECTED_PROBE_CWD: expectedProbeDir,
+      TOKEN_MONITOR_CLAUDE_COMMAND: command },
+    claudeProbeDir: path.join(fixtureDir, 'probe'),
     now: () => Date.parse('2026-06-13T07:00:00Z'),
     claudeCredentialPath: path.join(fixtureDir, 'missing-credentials.json'),
     stat: async () => {
@@ -1129,7 +1211,7 @@ test('Claude limits read Windows Credential Manager credentials when credential 
   assert.equal(provider.provider, 'claude');
   assert.equal(provider.status, 'ok');
   assert.equal(provider.source, 'oauth');
-  assert.equal(provider.accountLabel, 'Max 5x');
+  assert.equal(provider.accountLabel, 'Max');
   assert.equal(provider.windows[0].usedPercent, 12);
 });
 
@@ -1182,7 +1264,7 @@ test('Claude OAuth profile provides stable cross-device account identity and met
   assert.notEqual(mac.accountKey, other.accountKey);
   assert.equal(mac.accountEmail, 'owner@example.com');
   assert.equal(mac.accountName, 'Example Workspace');
-  assert.equal(mac.accountLabel, 'Max 5x');
+  assert.equal(mac.accountLabel, 'Max');
 });
 
 test('Claude OAuth profile failures never derive account identity from rotating credentials', async () => {
@@ -1458,7 +1540,7 @@ test('Claude successful OAuth keeps plan label without probing CLI', async () =>
 
   assert.equal(provider.source, 'oauth');
   assert.equal(provider.sourceDetail, '');
-  assert.equal(provider.accountLabel, 'Max 5x');
+  assert.equal(provider.accountLabel, 'Max');
   assert.equal(provider.windows[0].remainingPercent, 0);
   assert.equal(cliCalls, 0);
 });
@@ -1544,20 +1626,25 @@ test('Claude CLI usage preserves time-only resets in their own quota sections', 
   assert.equal(typeof weekly.resetsAt, 'string');
 });
 
-test('Claude CLI usage never borrows the weekly percentage for a missing session', () => {
-  assert.throws(
-    () => mapClaudeCliUsageToProvider([
-      'Current session',
-      'Current week',
-      '80% left',
-      'Resets Jul 22'
-    ].join('\n'), {
-      now: new Date('2026-07-15T00:00:00Z'),
-      updatedAt: '2026-07-15T00:00:00Z'
-    }),
-    (error) => error?.status === 'unavailable'
-      && error?.message === 'Claude CLI usage missing current session'
-  );
+test('Claude CLI usage keeps weekly quota without inventing a missing session', () => {
+  const provider = mapClaudeCliUsageToProvider([
+    'Current session',
+    'Current week',
+    '80% left',
+    'Resets Jul 22'
+  ].join('\n'), {
+    now: new Date('2026-07-15T00:00:00Z'),
+    updatedAt: '2026-07-15T00:00:00Z'
+  });
+  assert.deepEqual(provider.windows.map(window => window.kind), ['weekly']);
+  assert.equal(provider.windows[0].remainingPercent, 80);
+});
+
+test('Claude CLI usage rejects output without session or all-model weekly quota', () => {
+  for (const text of ['Plan: Ultra', '65% left', 'Current week (Sonnet only)\n65% left']) {
+    assert.throws(() => mapClaudeCliUsageToProvider(text),
+      error => error?.status === 'unavailable' && error?.message === 'Claude CLI usage missing quota');
+  }
 });
 
 test('Claude CLI usage never borrows Sonnet-only data for a missing all-model weekly window', () => {
@@ -1617,6 +1704,15 @@ test('Claude CLI usage carries account email and organization into the provider 
   assert.equal(provider.accountEmail, 'owner@example.com');
   assert.equal(provider.accountName, 'Example Team');
   assert.equal(provider.accountLabel, 'Max');
+});
+
+test('Claude CLI usage displays current names for legacy and current plan text', () => {
+  for (const [plan, accountLabel] of [
+    ['Max 5x', 'Max'], ['Max 20x', 'Ultra'], ['Max', 'Max'], ['Ultra', 'Ultra']
+  ]) {
+    const provider = mapClaudeCliUsageToProvider(`Current session\n95% left\nPlan: ${plan}`);
+    assert.equal(provider.accountLabel, accountLabel);
+  }
 });
 
 test('Claude CLI usage maps out-of-order PTY reset lines by window shape', () => {
@@ -2354,13 +2450,13 @@ test('a personal Pro account takes its plan from the organization capabilities',
   }), 'Pro');
 });
 
-test('a personal Max account keeps the rate limit tier refinement', async () => {
+test('a personal legacy Max 20x account displays Ultra', async () => {
   assert.equal(await personalPlanLabel({
     uuid: 'org-personal',
     name: 'Personal',
     capabilities: ['chat', 'claude_max'],
     rate_limit_tier: 'default_claude_max_20x'
-  }), 'Max 20x');
+  }), 'Ultra');
 });
 
 test('a membership from another organization never supplies the plan', async () => {
@@ -2389,11 +2485,11 @@ test('a membership from another organization never supplies the plan', async () 
       )
     }
   );
-  assert.equal(provider.accountLabel, 'Max 20x');
+  assert.equal(provider.accountLabel, 'Ultra');
   assert.equal(provider.accountName, 'Selected Max Org');
 });
 
-test('the Max variant comes from the rate limit tier, not the capability', async () => {
+test('the legacy Max 5x tier displays Max', async () => {
   // There is no `claude_max_5x` capability: claude.ai reports plain `claude_max`
   // for both variants and separates them on `rate_limit_tier`.
   assert.equal(await personalPlanLabel({
@@ -2401,7 +2497,7 @@ test('the Max variant comes from the rate limit tier, not the capability', async
     name: 'Personal',
     capabilities: ['chat', 'claude_max'],
     rate_limit_tier: 'default_claude_max_5x'
-  }), 'Max 5x');
+  }), 'Max');
 });
 
 async function planLabelFor(organization, seatTier) {
@@ -2501,262 +2597,4 @@ test('the prepaid TTL follows the limits refresh interval at twice its length', 
   nowMs += 61_000;
   await fetchClaudeLimits(options, deps);
   assert.equal(requests.filter((url) => url.includes('/prepaid/credits')).length, 1);
-});
-
-// Three claude.ai accounts, each behind its own session cookie. `rejected`
-// names cookies claude.ai no longer accepts.
-const WEB_LOGINS = {
-  'sessionKey=sk-ant-login-a': { account: 'account-a', email: 'a@example.com', organization: 'org-a', capability: 'claude_max', session: 11 },
-  'sessionKey=sk-ant-login-b': { account: 'account-b', email: 'b@example.com', organization: 'org-b', capability: 'claude_pro', session: 52 },
-  'sessionKey=sk-ant-login-c': { account: 'account-c', email: 'c@example.com', organization: 'org-c', capability: 'claude_pro', session: 93 }
-};
-
-function fakeClaudeWebLoginsFetch({ logins = WEB_LOGINS, rejected = [], requests = [] } = {}) {
-  return async (url, options) => {
-    const headers = { get: () => '', getSetCookie: () => [] };
-    const cookie = options.headers.cookie;
-    requests.push({ cookie, url });
-    const login = logins[cookie];
-    if (!login || rejected.includes(cookie)) return { ok: false, status: 401, headers, json: async () => ({}) };
-    if (url.endsWith('/api/organizations')) {
-      return {
-        ok: true,
-        status: 200,
-        headers,
-        json: async () => [{ uuid: login.organization, name: login.organization, capabilities: ['chat', login.capability] }]
-      };
-    }
-    if (url.endsWith('/api/account')) {
-      return { ok: true, status: 200, headers, json: async () => ({ uuid: login.account, email_address: login.email }) };
-    }
-    if (url.includes('/prepaid/credits')) {
-      return { ok: true, status: 200, headers, json: async () => ({ amount: 0, currency: 'USD' }) };
-    }
-    return {
-      ok: true,
-      status: 200,
-      headers,
-      json: async () => ({
-        five_hour: { utilization: login.session, resets_at: '2026-07-27T10:50:00Z' },
-        seven_day: { utilization: 5, resets_at: '2026-07-31T10:00:00Z' }
-      })
-    };
-  };
-}
-
-function webLogins(...suffixes) {
-  return suffixes.map((suffix) => ({ id: `login-${suffix}`, cookie: `sessionKey=sk-ant-login-${suffix}` }));
-}
-
-// The identity each login resolves to, as the widget would have stored it after
-// a first successful read.
-async function resolvedWebLogins(...suffixes) {
-  const resolved = new Map();
-  await fetchClaudeLimits({ claudeWebAccounts: webLogins(...suffixes) }, {
-    providerRuntimeState: new Map(),
-    claudeWebFetch: fakeClaudeWebLoginsFetch(),
-    onClaudeWebAccountResolved: ({ id, ...identity }) => resolved.set(id, identity)
-  });
-  return webLogins(...suffixes).map((login) => ({ ...login, ...resolved.get(login.id) }));
-}
-
-function sessionUsedPercent(provider) {
-  return provider.windows.find((window) => window.kind === 'session').usedPercent;
-}
-
-test('the form cookie and the additional logins each report their own account', async () => {
-  const providers = await fetchClaudeLimits(
-    {
-      // The account form's cookie is read first, then every additional login.
-      claudeWebCookie: 'sessionKey=sk-ant-login-a',
-      claudeWebAccounts: webLogins('b', 'c')
-    },
-    { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch() }
-  );
-
-  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'b@example.com', 'c@example.com']);
-  assert.deepEqual(providers.map((provider) => provider.status), ['ok', 'ok', 'ok']);
-  assert.deepEqual(providers.map((provider) => provider.source), ['web', 'web', 'web']);
-  assert.deepEqual(providers.map((provider) => provider.accountLabel), ['Max', 'Pro', 'Pro']);
-  assert.deepEqual(providers.map(sessionUsedPercent), [11, 52, 93]);
-  assert.equal(new Set(providers.map((provider) => provider.accountKey)).size, 3);
-});
-
-test('one saved Claude Web login keeps the single-provider shape and reports its identity once', async () => {
-  const resolutions = [];
-  const deps = {
-    providerRuntimeState: new Map(),
-    claudeWebFetch: fakeClaudeWebLoginsFetch(),
-    onClaudeWebAccountResolved: (resolution) => resolutions.push(resolution)
-  };
-
-  const provider = await fetchClaudeLimits({ claudeWebAccounts: webLogins('b') }, deps);
-
-  assert.equal(Array.isArray(provider), false);
-  assert.equal(provider.accountEmail, 'b@example.com');
-  assert.deepEqual(resolutions, [{
-    id: 'login-b',
-    accountKey: provider.accountKey,
-    accountEmail: 'b@example.com',
-    accountName: 'org-b',
-    accountLabel: 'Pro'
-  }]);
-
-  // Once the identity is stored there is nothing new to report.
-  const { id: _id, ...identity } = resolutions[0];
-  await fetchClaudeLimits({ claudeWebAccounts: [{ ...webLogins('b')[0], ...identity }] }, deps);
-  assert.equal(resolutions.length, 1);
-});
-
-test('one rejected Claude Web login still fails the way the single cookie did', async () => {
-  await assert.rejects(
-    fetchClaudeLimits({ claudeWebAccounts: webLogins('b') }, {
-      providerRuntimeState: new Map(),
-      claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
-    }),
-    (error) => error.status === 'unauthorized'
-  );
-});
-
-test('a rejected Claude Web login among several keeps its own account and leaves the others intact', async () => {
-  const accounts = await resolvedWebLogins('a', 'b', 'c');
-  const providers = await fetchClaudeLimits({ claudeWebAccounts: accounts }, {
-    now: () => Date.parse('2026-07-27T00:00:00Z'),
-    providerRuntimeState: new Map(),
-    claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
-  });
-
-  assert.deepEqual(providers.map((provider) => provider.status), ['ok', 'unauthorized', 'ok']);
-  assert.deepEqual(providers.map((provider) => provider.accountKey), accounts.map((account) => account.accountKey));
-  assert.equal(providers[1].accountEmail, 'b@example.com');
-  assert.equal(providers[1].accountLabel, 'Pro');
-  assert.equal(providers[1].source, 'web');
-  assert.deepEqual(providers[1].windows, []);
-  assert.equal(providers[1].updatedAt, '2026-07-27T00:00:00.000Z');
-  assert.deepEqual([sessionUsedPercent(providers[0]), sessionUsedPercent(providers[2])], [11, 93]);
-});
-
-test('a failing Claude Web login with no resolved identity is left out instead of reported anonymously', async () => {
-  const [known] = await resolvedWebLogins('a');
-  const providers = await fetchClaudeLimits({ claudeWebAccounts: [known, ...webLogins('b')] }, {
-    providerRuntimeState: new Map(),
-    claudeWebFetch: fakeClaudeWebLoginsFetch({ rejected: ['sessionKey=sk-ant-login-b'] })
-  });
-
-  // An unauthorized row with no accountKey is how a provider-wide failure
-  // looks, and LimitsRuntime would spread it over the healthy account too.
-  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com']);
-  assert.equal(providers[0].status, 'ok');
-});
-
-test('an account-scoped Claude refresh reads only the account it names', async () => {
-  const accounts = await resolvedWebLogins('a', 'b', 'c');
-  const requests = [];
-  const read = (limitRefreshScope) => fetchClaudeLimits({ claudeWebAccounts: accounts, limitRefreshScope }, {
-    providerRuntimeState: new Map(),
-    claudeWebFetch: fakeClaudeWebLoginsFetch({ requests })
-  });
-
-  const byKey = await read({ provider: 'claude', accountKey: accounts[1].accountKey });
-  assert.deepEqual(byKey.map((provider) => provider.accountEmail), ['b@example.com']);
-  assert.deepEqual([...new Set(requests.map((request) => request.cookie))], ['sessionKey=sk-ant-login-b']);
-
-  const byEmail = await read({ provider: 'claude', accountEmail: 'C@example.com' });
-  assert.deepEqual(byEmail.map((provider) => provider.accountEmail), ['c@example.com']);
-
-  // LimitsRuntime writes every row of a scoped refresh onto the scoped account,
-  // so a scope that names no saved login must not fall back to reading them all.
-  assert.deepEqual(await read({ provider: 'claude', accountKey: 'sha256:unknown' }), []);
-  assert.deepEqual(await read({ provider: 'claude', accountLabel: 'Pro' }), []);
-});
-
-test('a scoped Claude refresh finds a login whose identity is only cached so far', async () => {
-  const deps = { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch() };
-  const claudeWebAccounts = webLogins('a', 'b');
-  const [, second] = await fetchClaudeLimits({ claudeWebAccounts }, deps);
-
-  const scoped = await fetchClaudeLimits({
-    claudeWebAccounts,
-    limitRefreshScope: { provider: 'claude', accountKey: second.accountKey }
-  }, deps);
-
-  assert.deepEqual(scoped.map((provider) => provider.accountEmail), ['b@example.com']);
-});
-
-test('two sessions of one Claude account report a single row', async () => {
-  const providers = await fetchClaudeLimits({
-    claudeWebAccounts: [
-      ...webLogins('a'),
-      // A second cookie for account-a, saved before either identity was known.
-      { id: 'login-a-again', cookie: 'sessionKey=sk-ant-login-a-again' },
-      ...webLogins('c')
-    ]
-  }, {
-    providerRuntimeState: new Map(),
-    claudeWebFetch: fakeClaudeWebLoginsFetch({
-      logins: { ...WEB_LOGINS, 'sessionKey=sk-ant-login-a-again': WEB_LOGINS['sessionKey=sk-ant-login-a'] }
-    })
-  });
-
-  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'c@example.com']);
-});
-
-test('a login saved both in the form and in the list is read once', async () => {
-  const requests = [];
-  const providers = await fetchClaudeLimits({
-    claudeWebCookie: 'sessionKey=sk-ant-login-a',
-    claudeWebAccounts: webLogins('a', 'b')
-  }, { providerRuntimeState: new Map(), claudeWebFetch: fakeClaudeWebLoginsFetch({ requests }) });
-
-  assert.deepEqual(providers.map((provider) => provider.accountEmail), ['a@example.com', 'b@example.com']);
-  assert.equal(requests.filter((request) => request.cookie === 'sessionKey=sk-ant-login-a' && request.url.endsWith('/api/organizations')).length, 1);
-});
-
-test('each additional login reads the organization it was saved with', async () => {
-  // One account in two chat organizations: without a saved choice claude.ai
-  // offers both and nothing is read.
-  const headers = { get: () => '', getSetCookie: () => [] };
-  const usageUrls = [];
-  const claudeWebFetch = async (url) => {
-    const json = url.endsWith('/api/organizations')
-      ? [
-        { uuid: 'org-team', name: 'Team', capabilities: ['chat', 'raven'], raven_type: 'team' },
-        { uuid: 'org-personal', name: 'Personal', capabilities: ['chat', 'claude_pro'] }
-      ]
-      : url.endsWith('/api/account')
-        ? { uuid: 'account-multi', email_address: 'multi@example.com' }
-        : url.includes('/prepaid/credits')
-          ? { amount: 0, currency: 'USD' }
-          : (usageUrls.push(url), { five_hour: { utilization: 1, resets_at: '2026-07-27T10:50:00Z' } });
-    return { ok: true, status: 200, headers, json: async () => json };
-  };
-  const providers = await fetchClaudeLimits({
-    claudeWebAccounts: [
-      { id: 'personal', cookie: 'sessionKey=sk-ant-multi-1', organizationId: 'org-personal' },
-      { id: 'team', cookie: 'sessionKey=sk-ant-multi-2', organizationId: 'org-team' }
-    ]
-  }, { providerRuntimeState: new Map(), claudeWebFetch });
-
-  assert.deepEqual(providers.map((provider) => provider.accountName).sort(), ['Personal', 'Team']);
-  assert.deepEqual(usageUrls.map((url) => url.match(/organizations\/([^/]+)\/usage/)[1]).sort(), ['org-personal', 'org-team']);
-});
-
-test('saved Claude Web logins are deduplicated and invalid ones dropped', () => {
-  assert.deepEqual(
-    normalizeClaudeWebAccounts([
-      { id: 'one', cookie: 'sk-ant-one', organizationId: ' org-1 ', accountKey: 'sha256:one', accountEmail: ' One@Example.com ', accountName: ' Org ', accountLabel: 'Pro' },
-      { id: 'one', cookie: 'sessionKey=sk-ant-same-id' },
-      { id: 'two', cookie: 'sessionKey=sk-ant-one' },
-      { id: 'three', cookie: 'sessionKey=sk-ant-three', accountKey: 'sha256:one' },
-      { id: 'four', cookie: 'not-a-session-key' },
-      { id: '', cookie: 'sessionKey=sk-ant-no-id' },
-      null,
-      { id: 'five', cookie: 'sessionKey=sk-ant-five' }
-    ]),
-    [
-      { id: 'one', cookie: 'sessionKey=sk-ant-one', organizationId: 'org-1', accountKey: 'sha256:one', accountEmail: 'one@example.com', accountName: 'Org', accountLabel: 'Pro' },
-      { id: 'five', cookie: 'sessionKey=sk-ant-five', organizationId: '', accountKey: '', accountEmail: '', accountName: '', accountLabel: '' }
-    ]
-  );
-  assert.deepEqual(normalizeClaudeWebAccounts('sessionKey=sk-ant-one'), []);
 });

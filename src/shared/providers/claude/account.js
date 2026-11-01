@@ -4,8 +4,17 @@
 // src/shared/limits/accounts.js for the field schema.
 module.exports = {
   id: 'claude',
-  fetch: 'fetchClaudeLimits',
+  fetch: 'fetchClaudeAccountsLimits',
   fields: [
+    {
+      key: 'claudeManagedAccounts',
+      kind: 'managed',
+      contextOverride: true,
+      persist: 'never',
+      watch: false,
+      initial: [],
+      project: (value, limits) => limits.normalizeClaudeManagedAccounts(value)
+    },
     {
       key: 'claudeWebCookie',
       kind: 'credential',
@@ -21,19 +30,6 @@ module.exports = {
       normalize: { fn: 'normalizeClaudeWebOrganizationId', style: 'value' },
       project: 'value',
       clearWithCredential: true
-    },
-    {
-      // Logins for further claude.ai accounts, beside the one the form holds.
-      // Saved and removed through their own IPC after a successful probe, so the
-      // generic settings write never carries them; the renderer sees who each
-      // account is and never its cookie.
-      key: 'claudeWebAccounts',
-      kind: 'managed',
-      storePath: ['providers', 'claude', 'webAccounts'],
-      configDefault: [],
-      persist: 'never',
-      project: (value, limits) => limits.claudeWebAccountsForRenderer(value),
-      initial: []
     }
   ],
   status: {
@@ -42,19 +38,19 @@ module.exports = {
     sourceKey: 'claudeWebCookieSource',
     pendingKey: 'claudePendingCheckSince'
   },
-  // The form's own cookie and the additional logins both count as configured
-  // and as stored in settings: the first added account moves the form's cookie
-  // into the list, which leaves the form empty while Claude is still linked.
-  accountStatus: ({ settings, env, limits }) => {
-    const stored = Boolean(settings?.claudeWebCookie)
-      || limits.normalizeClaudeWebAccounts(settings?.claudeWebAccounts).length > 0;
-    const fromEnv = Boolean(limits.claudeWebCookie(env));
+  accountStatus({ settings, env, limits }) {
+    const stored = Boolean(settings?.claudeWebCookie);
+    const external = Boolean(limits.claudeWebCookie(env));
+    const managed = limits.normalizeClaudeManagedAccounts(settings?.claudeManagedAccounts).length > 0;
     return {
-      claudeWebCookieConfigured: stored || fromEnv,
-      claudeWebCookieSource: stored ? 'settings' : fromEnv ? 'env' : ''
+      claudeWebCookieConfigured: stored || external || managed,
+      claudeWebCookieSource: stored || managed ? 'settings' : external ? 'env' : '',
+      claudeWebLegacyCookieConfigured: stored || external,
+      claudeWebLegacyCookieSource: stored ? 'settings' : external ? 'env' : ''
     };
   },
   form: {
+    multipleAccounts: true,
     discover: { fn: 'listClaudeWebOrganizations', credential: 'claudeWebCookie', selection: 'claudeWebOrganizationId' },
     titleKey: 'settings.claude.title',
     openKey: 'settings.claude.openBrowser',

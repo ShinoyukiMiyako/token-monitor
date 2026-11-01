@@ -64,6 +64,38 @@ function fixture(t) {
   return { home, db, catalog, file, id, key, write, options, summary, runtimeFile };
 }
 
+test('pre-token sessions carry effort from the existing activity transcript read', async t => {
+  const f = fixture(t);
+  f.write([started, entry('turn_context', { effort: 'xhigh' })]);
+  const summary = { today: { sessions: {} }, month: { sessions: {} }, allTime: { sessions: {} } };
+  const result = await activity.readSessionActivity(summary, f.options);
+  assert.equal(result.sessions[f.key].reasoningEffort, 'xhigh');
+  const next = activity.projectSessionActivity(summary, result, now);
+  assert.equal(presentation.recentSessionRows({ periods: next, nativeSessions: next.nativeSessions })[0].reasoningEffort, 'xhigh');
+});
+
+test('resumed archived sessions agree on pre-token effort across Sessions and Dock', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now });
+  const f = fixture(t);
+  for (const effort of ['low', null, undefined]) {
+    f.write([started, ...(effort === undefined ? [] : [entry('turn_context', { effort })])]);
+    const summary = f.summary();
+    for (const name of ['today', 'month', 'allTime']) {
+      Object.assign(summary[name].sessions[f.key], { archived: true, reasoningEffort: 'high', costUsd: 1,
+        models: { saved: 100 }, lastUsedAt: new Date(now - 3600000).toISOString() });
+    }
+    const result = await activity.readSessionActivity(summary, { ...f.options, codexDeps: { cache: new Map() } });
+    const next = activity.projectSessionActivity(summary, result, now);
+    const [sessionRow] = rows.sessionRowsForPeriod(next.today, { nativeSessions: next.nativeSessions.today, now: new Date(now) });
+    const [dockRow] = presentation.recentSessionRows({ periods: next, nativeSessions: next.nativeSessions });
+    assert.equal(sessionRow.reasoningEffort, effort ?? null, `Sessions replaces archived high with ${effort}`);
+    assert.equal(dockRow.reasoningEffort, effort ?? null);
+    assert.equal(sessionRow.value, 100); assert.equal(sessionRow.cost, 1);
+    assert.equal(dockRow.totalTokens, 100); assert.equal(dockRow.costUsd, 1);
+    assert.equal(summary.today.sessions[f.key].reasoningEffort, 'high', 'native projection leaves accounting untouched');
+  }
+});
+
 test('large Codex session metadata verifies T3 identity with bounded header reads', async t => {
   const f = fixture(t);
   const header = entry('session_meta', { instructions: 'x'.repeat(160_000), id: nativeId });
@@ -662,7 +694,7 @@ test('collector discovers a native question before token_count and preserves exa
   assert.equal(payload.today.totalTokens, 0);
 });
 
-test('T3 polling updates waiting, response and terminal states without rescanning token usage', { timeout: 15_000 }, async t => {
+test('T3 polling updates waiting, response and terminal states without rescanning token usage', { timeout: 10_000 }, async t => {
   const f = fixture(t); f.write([started]);
   const updates = [];
   let scans = 0;
@@ -671,6 +703,11 @@ test('T3 polling updates waiting, response and terminal states without rescannin
     clients: 'codex', allTimeSince: '2024-01-01', deviceId: 'poll', agentVersion: 'test',
     historyEnabled: false, projectsEnabled: false, limitsEnabled: false, watchEnabled: false,
     intervalMs: 300_000, codexLocalUsageEnabled: false, anchorPersistenceEnabled: false,
+    // Exercise database polling without waiting for the production cadence.
+    sessionActivityTimers: {
+      setTimeout: (fn, delay) => setTimeout(fn, Math.min(delay, 25)),
+      clearTimeout
+    },
     homeDir: f.home, env: {}, sessionMetadataDeps: { readProcessStarts: f.options.readProcessStarts },
     runTokscale: async () => { scans += 1; return { entries: [{ client: 'codex', sessionId: f.id, model: 'gpt-6-luna', input: 100, output: 0, cost: 0 }] }; },
     onUpdate: (summary, reason) => { updates.push({ summary, reason }); nextUpdate?.(); },

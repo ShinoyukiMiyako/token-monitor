@@ -913,6 +913,61 @@ test('live model rates use matched model deltas and follow device expiry', () =>
   assert.equal(tracker.getSample(), null);
 });
 
+test('staggered model updates on the same device retain concurrent active models until each expires', () => {
+  let now = 0;
+  const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => now, activeMs: 8000, clearMs: 180000 });
+  const base = modelRatePeriod({});
+  const codexTick = modelRatePeriod({
+    'gpt-5': { timedTokens: 100, timedOutputTokens: 40, timedDurationMs: 1000 }
+  });
+  const antigravityTick = modelRatePeriod({
+    'gpt-5': { timedTokens: 100, timedOutputTokens: 40, timedDurationMs: 1000 },
+    'gemini-3-flash': { timedTokens: 200, timedOutputTokens: 20, timedDurationMs: 2000 }
+  });
+  tracker.reset([{ id: 'device:local', name: 'Local', period: base }]);
+
+  now = 100;
+  tracker.observe([{ id: 'device:local', name: 'Local', period: codexTick }]);
+  assert.equal(tracker.getSample().speed, 40);
+  assert.equal(tracker.nextExpiryAt(), 8100);
+  assert.deepEqual(tracker.getSample().devices[0].models, [
+    { model: 'gpt-5', speed: 40, burn: 6000 }
+  ]);
+
+  now = 200;
+  tracker.observe([{ id: 'device:local', name: 'Local', period: antigravityTick }]);
+  assert.equal(tracker.getSample().speed, 20);
+  assert.equal(tracker.getSample().burn, 6000);
+  assert.equal(tracker.nextExpiryAt(), 8100);
+  assert.deepEqual(tracker.getSample().devices[0].models, [
+    { model: 'gpt-5', speed: 40, burn: 6000 },
+    { model: 'gemini-3-flash', speed: 10, burn: 6000 }
+  ]);
+  assert.deepEqual(
+    tokenRateApi.liveTokenRateTooltipEntries(tracker.getSample(), 'speed', String),
+    [['gpt-5', '40 tok/s'], ['gemini-3-flash', '10 tok/s']]
+  );
+
+  now = 8100;
+  assert.equal(tracker.getSample().idle, false);
+  assert.equal(tracker.getSample().speed, 10);
+  assert.equal(tracker.nextExpiryAt(), 8200);
+  assert.deepEqual(tracker.getSample().devices[0].models, [
+    { model: 'gemini-3-flash', speed: 10, burn: 6000 }
+  ]);
+
+  now = 8200;
+  assert.equal(tracker.getSample().idle, true);
+  assert.equal(tracker.getSample().speed, 10);
+  assert.equal(tracker.nextExpiryAt(), 180200);
+  assert.deepEqual(tracker.getSample().devices[0].models, [
+    { model: 'gemini-3-flash', speed: 10, burn: 6000 }
+  ]);
+
+  now = 180200;
+  assert.equal(tracker.getSample(), null);
+});
+
 test('legacy model attribution establishes a baseline and regressions reset it', () => {
   const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 100 });
   tracker.reset({ timedTokens: 0, timedOutputTokens: 0, timedDurationMs: 0 });
@@ -1028,4 +1083,164 @@ test('changing a model alias cannot turn historical counters into a live model d
   assert.equal(first.speed, 0.5);
   assert.deepEqual(first.models, []);
   assert.deepEqual(tracker.observe(aliased(raw(10200, 4060, 102000)), 80000).models, [{ model: 'GPT', speed: 40, burn: 6000 }]);
+
+  // Merging alpha into an existing beta in the same snapshot where gamma adds usage
+  // makes both beta and gamma individually <= stepDelta while their sum exceeds it.
+  const mergedTracker = tokenRateApi.createLiveTokenRateTracker();
+  mergedTracker.reset(modelRatePeriod({
+    alpha: { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 },
+    beta: { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 },
+    gamma: { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 }
+  }));
+  const mergedIntoBeta = (period) => projectModelAliasStats({ periods: { today: period } }, { alpha: 'beta' }).periods.today;
+  const conflict = mergedTracker.observe(mergedIntoBeta(modelRatePeriod({
+    alpha: { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 },
+    beta: { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 },
+    gamma: { timedTokens: 200, timedOutputTokens: 110, timedDurationMs: 2000 }
+  })));
+  assert.equal(conflict.speed, 100);
+  assert.equal(conflict.burn, 6000);
+  assert.deepEqual(conflict.models, []);
+
+  const recovered = mergedTracker.observe(mergedIntoBeta(modelRatePeriod({
+    alpha: { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 },
+    beta: { timedTokens: 100, timedOutputTokens: 10, timedDurationMs: 1000 },
+    gamma: { timedTokens: 300, timedOutputTokens: 150, timedDurationMs: 3000 }
+  })));
+  assert.equal(recovered.speed, 40);
+  assert.deepEqual(recovered.models, [{ model: 'gamma', speed: 40, burn: 6000 }]);
+
+  // A partial counter regression on one model while overall device counters still
+  // grow also falls back to the device delta and re-baselines model attribution.
+  const partialRegression = mergedTracker.observe({
+    timedTokens: 600,
+    timedOutputTokens: 210,
+    timedDurationMs: 6000,
+    modelThroughput: {
+      beta: { timedTokens: 150, timedOutputTokens: 15, timedDurationMs: 1500 },
+      gamma: { timedTokens: 450, timedOutputTokens: 195, timedDurationMs: 4500 }
+    }
+  });
+  assert.equal(partialRegression.speed, 40);
+  assert.deepEqual(partialRegression.models, []);
+});
+
+test('attributed ticks retain a consistent unattributed remainder only until its own expiry', () => {
+  let now = 0;
+  const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => now });
+  const entries = (period) => [{ id: 'local', period }];
+  const base = modelRatePeriod({});
+  const unknown = { timedTokens: 100, timedOutputTokens: 80, timedDurationMs: 1000, modelThroughput: {} };
+  const known = {
+    timedTokens: 300, timedOutputTokens: 100, timedDurationMs: 3000,
+    modelThroughput: { beta: { timedTokens: 200, timedOutputTokens: 20, timedDurationMs: 2000 } }
+  };
+  tracker.reset(entries(base));
+  now = 100;
+  tracker.observe(entries(unknown));
+  assert.equal(tracker.getSample().speed, 80);
+  now = 200;
+  tracker.observe(entries(known));
+  assert.equal(tracker.getSample().speed, 100 / 3);
+  assert.equal(tracker.getSample().burn, 6000);
+  assert.equal(tracker.nextExpiryAt(), 8100);
+  assert.deepEqual(tracker.getSample().devices[0].models, [{ model: 'beta', speed: 10, burn: 6000 }]);
+  now = 8000;
+  assert.equal(tracker.observe(entries(known)).changed, false);
+  assert.equal(tracker.nextExpiryAt(), 8100, 'duplicate pushes do not renew the unknown sample');
+  now = 8100;
+  assert.equal(tracker.getSample().speed, 10);
+  assert.equal(tracker.nextExpiryAt(), 8200);
+  now = 8200;
+  assert.equal(tracker.getSample().idle, true);
+});
+
+test('without a collection clock the headline stays the matched-counter ratio', () => {
+  let now = 0;
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => now });
+  tracker.reset(timing(0, 0));
+  now = 600000;
+  const sample = tracker.observe(timing(1000, 20000));
+  assert.equal(sample.speed, 50, 'receipt time opens no window: 1000 tokens over 20 s of generation');
+  assert.equal(sample.burn, 30000);
+  assert.equal(sample.concurrency, 0, 'concurrency needs elapsed time');
+  assert.equal(sample.windowMs, 0);
+});
+
+test('the window opens at the first collection with a clock and closes when the clock is lost', () => {
+  const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 0 });
+  tracker.reset(timing(0, 0));
+  const first = tracker.observe(timing(1000, 20000), 60000);
+  assert.equal(first.speed, 50, 'an unclocked baseline has no place in the window');
+  assert.equal(first.windowMs, 0);
+  const windowed = tracker.observe(timing(4000, 50000), 120000);
+  assert.equal(windowed.speed, 50, '3000 tokens over the 60 s since that collection, not their 100 tok/s ratio');
+  assert.equal(windowed.concurrency, 0.5);
+  assert.equal(windowed.windowMs, 60000);
+  const unclocked = tracker.observe(timing(4200, 52000));
+  assert.equal(unclocked.speed, 100);
+  assert.equal(unclocked.concurrency, 0);
+});
+
+test('the window headline holds while staggered model rows expire one by one', () => {
+  let now = 0;
+  const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => now, activeMs: 8000, clearMs: 180000 });
+  const gpt = { timedTokens: 100, timedOutputTokens: 40, timedDurationMs: 1000 };
+  const gemini = { timedTokens: 200, timedOutputTokens: 20, timedDurationMs: 2000 };
+  const entries = (period, observedAt) => [{ id: 'device:local', name: 'Local', period, observedAt }];
+  tracker.reset(entries(modelRatePeriod({}), 0));
+
+  now = 100;
+  tracker.observe(entries(modelRatePeriod({ 'gpt-5': gpt }), 40000));
+  assert.equal(tracker.getSample().speed, 1);
+
+  now = 200;
+  tracker.observe(entries(modelRatePeriod({ 'gpt-5': gpt, 'gemini-3-flash': gemini }), 60000));
+  const both = tracker.getSample();
+  assert.equal(both.speed, 1, '60 output tokens over the 60 s window');
+  assert.equal(both.burn, 300);
+  assert.equal(both.concurrency, 0.05);
+  assert.deepEqual(both.devices[0].models, [
+    { model: 'gpt-5', speed: 40, burn: 6000 },
+    { model: 'gemini-3-flash', speed: 10, burn: 6000 }
+  ]);
+
+  now = 8100;
+  const remaining = tracker.getSample();
+  assert.equal(remaining.idle, false);
+  assert.equal(remaining.speed, 1, 'a model row expiring does not restate the window');
+  assert.equal(remaining.concurrency, 0.05);
+  assert.deepEqual(remaining.devices[0].models, [{ model: 'gemini-3-flash', speed: 10, burn: 6000 }]);
+
+  now = 8200;
+  assert.equal(tracker.getSample().idle, true);
+  assert.equal(tracker.getSample().speed, 1);
+});
+
+test('a matched-counter group reads the plugin rate contract from clocked entries', () => {
+  let now = 0;
+  const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => now, matchedCounters: true });
+  const device = (deviceId, output, durationMs, updatedAt) => ({ deviceId, updatedAt, periods: { today: timing(output, durationMs) } });
+  const select = (...devices) => tokenRateApi.selectLiveTokenRatePeriods({ devices }, 'a', 'client', 'all').entries;
+  tracker.reset(select(device('a', 0, 0, '2026-10-18T00:00:00.000Z'), device('b', 0, 0, '2026-10-18T00:00:00.000Z')));
+
+  now = 100;
+  tracker.observe(select(device('a', 40, 1000, '2026-10-18T00:02:00.000Z'), device('b', 100, 2000, '2026-10-18T00:02:00.000Z')));
+  assert.deepEqual(tracker.getSample(), {
+    speed: 90,
+    burn: 54000,
+    concurrency: 0,
+    sampledAt: 100,
+    expiresAt: 8100,
+    devices: [],
+    deviceCount: 2,
+    revision: 1,
+    idle: false
+  });
+
+  // Collection time plays no part here, so its going backwards is not a baseline boundary.
+  now = 200;
+  tracker.observe(select(device('a', 80, 2000, '2026-10-18T00:01:00.000Z'), device('b', 100, 2000, '2026-10-18T00:01:00.000Z')));
+  assert.equal(tracker.getSample().speed, 90);
+  assert.equal(tracker.getSample().sampledAt, 200);
 });

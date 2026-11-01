@@ -45,6 +45,12 @@ test('WSL SQLite recovery guidance is localized without English fallback', () =>
   }
 });
 
+test('WSL SQLite recovery guidance names Antigravity in every locale', () => {
+  for (const locale of LANGUAGE_OPTIONS.map((option) => option.value).filter((value) => value !== 'auto')) {
+    assert.match(MESSAGES[locale]['settings.collection.wslPanel.sqliteHelp'], /Antigravity/, locale);
+  }
+});
+
 test('Unlimited remains a provider quota value token in every locale', () => {
   for (const locale of LANGUAGE_OPTIONS.map((option) => option.value).filter((value) => value !== 'auto')) {
     assert.equal(MESSAGES[locale]['settings.thirdparty.unlimited'], 'Unlimited', locale);
@@ -96,7 +102,7 @@ test('translate falls back to English and interpolates values', () => {
   assert.equal(translate('zh-TW', 'settings.sync.title'), '多裝置同步');
   assert.equal(translate('zh-TW', 'settings.codex.personalWorkspace'), '個人');
   assert.equal(translate('zh-CN', 'settings.codex.personalWorkspace'), '个人');
-  assert.equal(translate('zh-CN', 'settings.appUpdate.latestWithStatus', { version: '0.2.1', status: '已是最新' }), 'v0.2.1（已是最新）');
+  assert.equal(translate('zh-CN', 'settings.opencode.connected', { linked: 2, total: 3 }), '2/3 已连接');
   const diagnosticsDescription = translate('zh-CN', 'settings.about.diagnostics.description');
   assert.equal(typeof diagnosticsDescription, 'string');
   assert.ok(diagnosticsDescription.trim());
@@ -162,6 +168,15 @@ test('every bundled locale defines every English key', () => {
   for (const locale of Object.keys(MESSAGES).filter((code) => code !== 'en')) {
     const missing = englishKeys.filter((key) => MESSAGES[locale][key] === undefined);
     assert.deepEqual(missing, [], `${locale} should not rely on English fallback`);
+  }
+});
+
+// The fork removed in-app updates; each upstream sync brings this namespace back.
+test('no bundled locale carries in-app update copy', () => {
+  for (const locale of Object.keys(MESSAGES)) {
+    const leftovers = Object.keys(MESSAGES[locale]).filter((key) => key.startsWith('settings.appUpdate.'));
+    assert.deepEqual(leftovers, [], locale);
+    assert.doesNotMatch(MESSAGES[locale]['settings.summary.general'], /·/, `${locale} General summary must not list a removed section`);
   }
 });
 
@@ -244,20 +259,19 @@ test('Claude prepaid balance copy points to its merged provider panel', () => {
   assert.doesNotMatch(translate('ja', 'settings.limits.prepaidBalanceDesc'), /Claudeアカウント/);
 });
 
-test('applyTranslations updates text, title, aria-label, placeholders, and document lang', () => {
+test('applyTranslations updates accessible names without native tooltips', () => {
   const title = fakeElement({ i18n: 'settings.sync.title' });
-  const button = fakeElement({ i18nTitle: 'settings.sync.copySecret' });
+  const button = fakeElement({ i18nAriaLabel: 'settings.sync.copySecret' });
   const bubble = fakeElement({ i18nAriaLabel: 'floatingBubble.expand' });
   const input = fakeElement({ i18nPlaceholder: 'settings.sync.secretPlaceholder' });
-  const paste = fakeElement({ i18nTitle: 'settings.sync.pasteSecret', i18nAriaLabel: 'settings.sync.pasteSecret' });
+  const paste = fakeElement({ i18nAriaLabel: 'settings.sync.pasteSecret' });
   const langOption = fakeElement({ i18n: 'settings.language.zhTW' });
   const documentElement = fakeElement();
   const root = {
     documentElement,
     querySelectorAll(selector) {
       if (selector === '[data-i18n]') return [title, langOption];
-      if (selector === '[data-i18n-title]') return [button, paste];
-      if (selector === '[data-i18n-aria-label]') return [bubble, paste];
+      if (selector === '[data-i18n-aria-label]') return [button, bubble, paste];
       if (selector === '[data-i18n-placeholder]') return [input];
       return [];
     }
@@ -266,8 +280,9 @@ test('applyTranslations updates text, title, aria-label, placeholders, and docum
   applyTranslations(root, 'zh-TW');
 
   assert.equal(title.textContent, '多裝置同步');
-  assert.equal(button.title, '複製密鑰');
-  assert.equal(paste.title, '貼上密鑰');
+  assert.equal(button.getAttribute('aria-label'), '複製密鑰');
+  assert.equal(button.getAttribute('title'), undefined);
+  assert.equal(paste.getAttribute('title'), undefined);
   assert.equal(paste.getAttribute('aria-label'), '貼上密鑰');
   assert.equal(bubble.getAttribute('aria-label'), '顯示 Token Monitor');
   assert.equal(input.placeholder, '選填的共享密鑰');
@@ -307,4 +322,30 @@ test('view switcher actions are localized', () => {
   assert.equal(translate('en', 'views.backHome'), 'Back to Home');
   assert.equal(translate('zh-TW', 'views.backHome'), '返回主頁');
   assert.equal(translate('zh-CN', 'views.backHome'), '返回主页');
+});
+
+
+test('Notch settings and shared labels are present in every bundled locale', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const html = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/index.html'), 'utf8');
+  const notch = html.split('id="notchFeature"')[1].split('id="floatingBubbleOptions"')[0];
+  const keys = [...new Set(['settings.notch.title',
+    'settings.notch.accountTitle', 'settings.notch.summaryModeNote',
+    ...['sessions', 'tray', 'custom'].map(mode => `settings.notch.summaryMode.${mode}Note`),
+    ...[...notch.matchAll(/data-i18n="([^"]+)"/g)].map(match => match[1])])];
+  assert.ok(keys.includes('settings.notch.iconRings'));
+  assert.ok(keys.includes('settings.notch.summaryModeNote'));
+  assert.ok(keys.includes('settings.notch.warnColors'));
+  assert.ok(keys.includes('settings.appearance.macBackdropVibrancy'));
+  for (const locale of LANGUAGE_OPTIONS.map(option => option.value).filter(value => value !== 'auto')) {
+    for (const key of keys) {
+      assert.ok(MESSAGES[locale][key]?.trim(), `${locale}: ${key} must not rely on fallback`);
+      const label = fakeElement({ i18n: key });
+      applyTranslations({ querySelectorAll: selector => selector === '[data-i18n]' ? [label] : [] }, locale);
+      assert.equal(label.textContent, MESSAGES[locale][key]);
+    }
+  }
+  assert.equal(translate('zh-CN', 'settings.notch.iconRings'), '显示额度与采集状态');
+  assert.equal(translate('zh-CN', 'settings.notch.summaryMode.tray'), '与菜单栏相同');
 });

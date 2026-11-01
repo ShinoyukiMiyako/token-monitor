@@ -74,6 +74,7 @@ class FakeBrowserWindow extends EventEmitter {
     FakeBrowserWindow.zOrder.push(this);
   }
   setBounds(bounds) { this.bounds = { ...bounds }; }
+  setSkipTaskbar(flag) { this.zOrderCalls.push(['setSkipTaskbar', flag]); }
   setAlwaysOnTop(flag, level) {
     this.alwaysOnTop = flag;
     this.zOrderCalls.push(['setAlwaysOnTop', flag, level]);
@@ -128,6 +129,14 @@ function sentPayload(win, surface) {
   )).at(-1)?.payload;
 }
 
+// Drive the controller's polling, intent grace and animation frames on one clock.
+function mockDockClock(t) {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
+  return (ms) => {
+    for (let elapsed = 0; elapsed < ms; elapsed += 16) t.mock.timers.tick(Math.min(16, ms - elapsed));
+  };
+}
+
 function createFixture(options = {}) {
   FakeBrowserWindow.instances = [];
   FakeBrowserWindow.zOrder = [];
@@ -161,17 +170,21 @@ function createFixture(options = {}) {
     powerMonitor,
     screen,
     platform: options.platform || 'win32',
+    osRelease: options.osRelease ?? '24.6.0',
     rendererDir: '/renderer',
     preloadPath: '/preload.js',
     getSettings: () => settings,
     nativeGlass: () => options.nativeGlass === true,
     liquidGlass: () => (typeof options.liquidGlass === 'function' ? options.liquidGlass() : options.liquidGlass || null),
     createGlass: options.createGlass,
+    windowsBackdrop: options.windowsBackdrop,
     canRefreshLimits: options.canRefreshLimits,
     onRefreshLimits: options.onRefreshLimits,
+    onWebSurfaceChanged: options.onWebSurfaceChanged,
     prefersReducedMotion: options.prefersReducedMotion || (() => true),
     isFullScreen: options.isFullScreen,
     primaryButtonDown: options.primaryButtonDown,
+    installNonActivatingInput: options.installNonActivatingInput,
     applyShapeMask: (win) => {
       maskWindows.push(win);
       return options.maskAvailable !== false;
@@ -183,6 +196,7 @@ function createFixture(options = {}) {
     onPlacementChange: (placement) => {
       placements.push(placement);
       settings.edgeDockSide = placement.side;
+      settings.edgeDockFloatingX = placement.floatingX;
       settings.edgeDockOffset = placement.offset;
       settings.edgeDockDisplayId = placement.displayId;
     }
@@ -193,7 +207,7 @@ function createFixture(options = {}) {
     { id: 'cursor', kind: 'provider', label: 'Cursor' }
   ]);
   controller.sync();
-  for (const win of FakeBrowserWindow.instances) win.webContents.emit('did-finish-load');
+  if (options.load !== false) for (const win of FakeBrowserWindow.instances) win.webContents.emit('did-finish-load');
   const windowFor = (surface) => FakeBrowserWindow.instances.filter((win) => !win.destroyed && win.surface === surface).at(-1);
   const paintPeek = () => {
     const win = windowFor('peek');
@@ -203,16 +217,43 @@ function createFixture(options = {}) {
   return { controller, hapticCalls, haptics, ipcMain, powerMonitor, maskWindows, placements, screen, settings, windowFor, paintPeek };
 }
 
-test('Windows Edge Dock reasserts topmost after each surface is first shown and rebuilt', (t) => {
+test('Windows Edge Dock installs non-activating input on every surface, including rebuilt windows', (t) => {
+  const installed = [];
+  const fixture = createFixture({ installNonActivatingInput: (win) => installed.push(win) });
+  t.after(() => fixture.controller.stop());
+  assert.deepEqual(installed, FakeBrowserWindow.instances);
+  assert.ok(installed.every((win) => win.options.focusable === false));
+  fixture.controller.sync();
+  assert.equal(installed.length, 3, 'ordinary sync does not reinstall native callbacks');
+  fixture.settings.edgeDockEnabled = false;
+  fixture.controller.sync();
+  fixture.settings.edgeDockEnabled = true;
+  fixture.controller.sync();
+  assert.deepEqual(installed, FakeBrowserWindow.instances);
+  assert.equal(installed.filter((win) => !win.destroyed).length, 3);
+});
+
+test('macOS Edge Dock keeps clicks from activating the app on every surface', (t) => {
+  const installed = [];
+  const fixture = createFixture({ platform: 'darwin', installNonActivatingInput: (win) => installed.push(win) });
+  t.after(() => fixture.controller.stop());
+  assert.deepEqual(installed, FakeBrowserWindow.instances);
+  assert.equal(installed.length, 3);
+});
+
+test('Windows Edge Dock creates toolbar windows and reasserts taskbar exclusion and topmost after showing', (t) => {
   const fixture = createFixture();
   t.after(() => fixture.controller.stop());
   const surfaces = ['peek', 'rail', 'bubble'];
-  const expected = ['showInactive', ['setAlwaysOnTop', true, 'pop-up-menu']];
+  const expected = ['showInactive', ['setSkipTaskbar', true], ['setAlwaysOnTop', true, 'pop-up-menu']];
 
   for (const surface of surfaces) {
     const win = fixture.windowFor(surface);
+    assert.equal(win.options.type, 'toolbar');
+    assert.equal(win.options.skipTaskbar, true);
+    assert.equal(win.options.thickFrame, false);
     assert.equal(win.options.alwaysOnTop, true);
-    assert.deepEqual(win.zOrderCalls, expected, `${surface} reasserts topmost after showing`);
+    assert.deepEqual(win.zOrderCalls, expected, `${surface} reasserts taskbar exclusion and topmost after showing`);
   }
 
   fixture.controller.sync();
@@ -226,72 +267,75 @@ test('Windows Edge Dock reasserts topmost after each surface is first shown and 
     win.webContents.emit('did-finish-load');
   }
   for (const surface of surfaces) {
-    assert.deepEqual(fixture.windowFor(surface).zOrderCalls, expected, `${surface} reasserts topmost after rebuild`);
+    const win = fixture.windowFor(surface);
+    assert.equal(win.options.type, 'toolbar');
+    assert.deepEqual(win.zOrderCalls, expected, `${surface} reasserts taskbar exclusion and topmost after rebuild`);
   }
 });
 
-for (const mode of ['always', 'autoHide', 'alwaysExceptFullScreen']) {
-  test(`Windows resume restores all Dock surfaces without changing ${mode} visibility`, (t) => {
-    t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
-    const fixture = createFixture({
-      settings: { edgeDockMode: mode, edgeDockRefreshEnabled: false },
-      isFullScreen: () => mode === 'alwaysExceptFullScreen'
+for (const event of ['resume', 'unlock-screen']) {
+  for (const mode of ['always', 'autoHide', 'alwaysExceptFullScreen']) {
+    test(`Windows ${event} restores all Dock surfaces without changing ${mode} visibility`, (t) => {
+      t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
+      const fixture = createFixture({
+        settings: { edgeDockMode: mode, edgeDockRefreshEnabled: false },
+        isFullScreen: () => mode === 'alwaysExceptFullScreen'
+      });
+      t.after(() => fixture.controller.stop());
+      if (mode === 'always') {
+        const rail = fixture.windowFor('rail');
+        const bubble = fixture.windowFor('bubble');
+        fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 1 });
+        fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'codex', height: 180 });
+        fixture.screen.point = { x: bubble.bounds.x + 30, y: bubble.bounds.y + 30 };
+      } else {
+        fixture.paintPeek();
+        fixture.screen.point = { x: 600, y: 400 };
+      }
+      const surfaces = ['peek', 'rail', 'bubble'].map(fixture.windowFor);
+      const state = () => surfaces.map((win) => ({
+        bounds: win.getBounds(), opacity: win.opacity, ignoreMouse: win.ignoreMouse,
+        messages: win.webContents.messages.length
+      }));
+      const before = state();
+      const counts = surfaces.map((win) => win.zOrderCalls.length);
+      // Windows can retain WS_EX_TOPMOST while restoring the actual stacking
+      // behind an ordinary window. Recovery must not trust that flag alone.
+      const ordinary = new FakeBrowserWindow({ width: 1200, height: 900 });
+      ordinary.showInactive();
+      fixture.powerMonitor.emit(event);
+      assert.deepEqual(state(), before, 'an open card stays open and hidden surfaces stay transparent');
+      for (const win of surfaces) {
+        assert.equal(win.alwaysOnTop, true);
+        assert.ok(FakeBrowserWindow.zOrder.indexOf(win) > FakeBrowserWindow.zOrder.indexOf(ordinary));
+      }
+      // A later shell restore can overtake the immediate repair.
+      for (const win of surfaces) win.alwaysOnTop = false;
+      ordinary.moveTop();
+      t.mock.timers.tick(500);
+      for (const win of surfaces) {
+        assert.equal(win.alwaysOnTop, true);
+        assert.ok(FakeBrowserWindow.zOrder.indexOf(win) > FakeBrowserWindow.zOrder.indexOf(ordinary));
+      }
+      assert.deepEqual(surfaces.map((win) => win.zOrderCalls.length), counts.map((count) => count + 2));
+      t.mock.timers.tick(5000);
+      assert.deepEqual(surfaces.map((win) => win.zOrderCalls.length), counts.map((count) => count + 2), 'recovery ends after one follow-up');
     });
-    t.after(() => fixture.controller.stop());
-    if (mode === 'always') {
-      const rail = fixture.windowFor('rail');
-      const bubble = fixture.windowFor('bubble');
-      fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 1 });
-      fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'codex', height: 180 });
-      fixture.screen.point = { x: bubble.bounds.x + 30, y: bubble.bounds.y + 30 };
-    } else {
-      fixture.paintPeek();
-      fixture.screen.point = { x: 600, y: 400 };
-    }
-    const surfaces = ['peek', 'rail', 'bubble'].map(fixture.windowFor);
-    const state = () => surfaces.map((win) => ({
-      bounds: win.getBounds(), opacity: win.opacity, ignoreMouse: win.ignoreMouse,
-      messages: win.webContents.messages.length
-    }));
-    const before = state();
-    const counts = surfaces.map((win) => win.zOrderCalls.length);
-    // Simulate the native topmost state being lost after the windows are shown.
-    for (const win of surfaces) win.alwaysOnTop = false;
-    const ordinary = new FakeBrowserWindow({ width: 1200, height: 900 });
-    ordinary.showInactive();
-    fixture.powerMonitor.emit('unlock-screen');
-    assert.deepEqual(surfaces.map((win) => win.zOrderCalls.length), counts, 'Win+L alone does not raise the Dock');
-    fixture.powerMonitor.emit('resume');
-    assert.deepEqual(state(), before, 'an open card stays open and hidden surfaces stay transparent');
-    for (const win of surfaces) {
-      assert.equal(win.alwaysOnTop, true);
-      assert.ok(FakeBrowserWindow.zOrder.indexOf(win) > FakeBrowserWindow.zOrder.indexOf(ordinary));
-    }
-    // A later shell restore can overtake the immediate repair.
-    for (const win of surfaces) win.alwaysOnTop = false;
-    ordinary.moveTop();
-    t.mock.timers.tick(500);
-    for (const win of surfaces) {
-      assert.equal(win.alwaysOnTop, true);
-      assert.ok(FakeBrowserWindow.zOrder.indexOf(win) > FakeBrowserWindow.zOrder.indexOf(ordinary));
-    }
-    assert.deepEqual(surfaces.map((win) => win.zOrderCalls.length), counts.map((count) => count + 2));
-    t.mock.timers.tick(5000);
-    assert.deepEqual(surfaces.map((win) => win.zOrderCalls.length), counts.map((count) => count + 2), 'recovery ends after one follow-up');
-  });
+  }
 }
 
-test('Windows resume coalesces follow-ups and cleans up when the Dock stops or restarts', (t) => {
+test('Windows resume and unlock coalesce follow-ups and clean up when the Dock stops or restarts', (t) => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
   const fixture = createFixture();
   t.after(() => fixture.controller.stop());
   fixture.controller.sync();
   assert.equal(fixture.powerMonitor.listenerCount('resume'), 1);
+  assert.equal(fixture.powerMonitor.listenerCount('unlock-screen'), 1);
   const rail = fixture.windowFor('rail');
   const count = rail.zOrderCalls.length;
   fixture.powerMonitor.emit('resume');
   t.mock.timers.tick(200);
-  fixture.powerMonitor.emit('resume');
+  fixture.powerMonitor.emit('unlock-screen');
   t.mock.timers.tick(300);
   assert.equal(rail.zOrderCalls.length, count + 2, 'the old follow-up was cancelled');
   t.mock.timers.tick(200);
@@ -300,6 +344,7 @@ test('Windows resume coalesces follow-ups and cleans up when the Dock stops or r
   fixture.settings.edgeDockEnabled = false;
   fixture.controller.sync();
   assert.equal(fixture.powerMonitor.listenerCount('resume'), 0);
+  assert.equal(fixture.powerMonitor.listenerCount('unlock-screen'), 0);
   const stoppedCount = rail.zOrderCalls.length;
   fixture.powerMonitor.emit('resume');
   fixture.settings.edgeDockEnabled = true;
@@ -311,6 +356,7 @@ test('Windows resume coalesces follow-ups and cleans up when the Dock stops or r
   assert.equal(rail.zOrderCalls.length, stoppedCount);
   assert.equal(newRail.zOrderCalls.length, newCount, 'stale callbacks do not raise rebuilt windows');
   assert.equal(fixture.powerMonitor.listenerCount('resume'), 1);
+  assert.equal(fixture.powerMonitor.listenerCount('unlock-screen'), 1);
   fixture.powerMonitor.emit('resume');
   assert.equal(newRail.zOrderCalls.length, newCount + 1);
 });
@@ -333,8 +379,133 @@ test('macOS does not install Windows resume recovery', (t) => {
   const count = rail.zOrderCalls.length;
   fixture.powerMonitor.emit('resume');
   assert.equal(fixture.powerMonitor.listenerCount('resume'), 0);
+  assert.equal(fixture.powerMonitor.listenerCount('unlock-screen'), 0);
   assert.equal(rail.zOrderCalls.length, count);
 });
+
+for (const platform of ['win32', 'darwin']) {
+  test(`${platform} card reveal repairs Windows stacking after wake recovery has ended`, (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
+    const fixture = createFixture({ platform, settings: { edgeDockRefreshEnabled: false } });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const bubble = fixture.windowFor('bubble');
+    const open = () => {
+      fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 1 });
+      fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'codex', height: 180 });
+      fixture.screen.point = { x: bubble.bounds.x + 30, y: bubble.bounds.y + 30 };
+    };
+    open();
+    fixture.powerMonitor.emit('resume');
+    t.mock.timers.tick(5000);
+    fixture.ipcMain.emit('edgeDock:dismiss', { sender: bubble.webContents });
+    const ordinary = new FakeBrowserWindow({ width: 1200, height: 900 });
+    ordinary.showInactive();
+    const count = bubble.zOrderCalls.length;
+    assert.equal(bubble.alwaysOnTop, true, 'the flag can stay set while native ordering is wrong');
+    open();
+    assert.equal(bubble.zOrderCalls.length, count + (platform === 'win32' ? 1 : 0));
+    if (platform === 'win32') assert.equal(FakeBrowserWindow.zOrder.at(-1), bubble);
+    assert.equal(bubble.opacity, 1);
+    assert.equal(bubble.ignoreMouse, false);
+    const revealedCount = bubble.zOrderCalls.length;
+    fixture.controller.sync();
+    t.mock.timers.tick(5000);
+    assert.equal(bubble.zOrderCalls.length, revealedCount, 'steady visibility does not keep raising the card');
+    fixture.ipcMain.emit('edgeDock:dismiss', { sender: bubble.webContents });
+    ordinary.moveTop();
+    open();
+    assert.equal(bubble.zOrderCalls.length, revealedCount + (platform === 'win32' ? 1 : 0));
+    if (platform === 'win32') assert.equal(FakeBrowserWindow.zOrder.at(-1), bubble);
+  });
+}
+
+for (const mode of ['always', 'alwaysExceptFullScreen']) {
+  test(`Windows card reveal restores the already-visible ${mode} rail as well`, (t) => {
+    const fixture = createFixture({ settings: { edgeDockMode: mode, edgeDockRefreshEnabled: false } });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const bubble = fixture.windowFor('bubble');
+    const peek = fixture.windowFor('peek');
+    const ordinary = new FakeBrowserWindow({ width: 1200, height: 900 });
+    ordinary.showInactive();
+    const peekCount = peek.zOrderCalls.length;
+    assert.equal(rail.opacity, 1);
+    assert.equal(rail.alwaysOnTop, true);
+
+    fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 1 });
+    fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'codex', height: 180 });
+
+    assert.equal(bubble.opacity, 1);
+    assert.ok(FakeBrowserWindow.zOrder.indexOf(bubble) > FakeBrowserWindow.zOrder.indexOf(ordinary));
+    assert.ok(FakeBrowserWindow.zOrder.indexOf(rail) > FakeBrowserWindow.zOrder.indexOf(ordinary), 'opening a card also restores its rail');
+    assert.ok(FakeBrowserWindow.zOrder.indexOf(bubble) > FakeBrowserWindow.zOrder.indexOf(rail), 'the card stays above the rail');
+    assert.equal(peek.zOrderCalls.length, peekCount, 'the concealed handle is not raised');
+    assert.equal(peek.opacity, 0);
+  });
+}
+
+test('Windows group recovery keeps the painted refresh action above the rail and card', (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
+  const fixture = createFixture({ canRefreshLimits: () => true });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  const bubble = fixture.windowFor('bubble');
+  const peek = fixture.windowFor('peek');
+  fixture.screen.point = { x: rail.bounds.x + 30, y: rail.bounds.y + 45 };
+  t.mock.timers.tick(100);
+  fixture.paintPeek();
+  const ordinary = new FakeBrowserWindow({ width: 1200, height: 900 });
+  ordinary.showInactive();
+  fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 0 });
+  fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'claude', height: 180 });
+  const above = (front, back) => FakeBrowserWindow.zOrder.indexOf(front) > FakeBrowserWindow.zOrder.indexOf(back);
+  assert.ok(above(rail, ordinary));
+  assert.ok(above(bubble, rail));
+  assert.ok(above(peek, bubble));
+  assert.equal(FakeBrowserWindow.atPoint({ x: peek.bounds.x + 16, y: peek.bounds.y + 3 }), peek);
+});
+
+for (const platform of ['win32', 'darwin']) {
+  test(`${platform} entering a visible rail recovers ordering once without a power event`, (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
+    const fixture = createFixture({ platform, settings: { edgeDockMode: 'alwaysExceptFullScreen', edgeDockRefreshEnabled: false } });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const bubble = fixture.windowFor('bubble');
+    const ordinary = new FakeBrowserWindow({ width: 1200, height: 900 });
+    const point = { x: rail.bounds.x + 30, y: rail.bounds.y + 45 };
+    const open = () => {
+      fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 0 });
+      fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'claude', height: 180 });
+    };
+    open();
+    fixture.screen.point = { x: 600, y: 400 };
+    t.mock.timers.tick(100);
+    ordinary.showInactive();
+    bubble.moveTop();
+    const counts = [rail, bubble].map((win) => win.zOrderCalls.length);
+    fixture.screen.point = point;
+    t.mock.timers.tick(100);
+    if (platform === 'win32') {
+      assert.ok(FakeBrowserWindow.zOrder.indexOf(rail) > FakeBrowserWindow.zOrder.indexOf(ordinary));
+      assert.ok(FakeBrowserWindow.zOrder.indexOf(bubble) > FakeBrowserWindow.zOrder.indexOf(rail));
+    }
+    const after = [rail, bubble].map((win) => win.zOrderCalls.length);
+    assert.deepEqual(after, counts.map((count) => count + (platform === 'win32' ? 1 : 0)));
+    t.mock.timers.tick(1000);
+    assert.deepEqual([rail, bubble].map((win) => win.zOrderCalls.length), after, 'steady hover does not keep raising windows');
+
+    fixture.screen.point = { x: bubble.bounds.x + 30, y: bubble.bounds.y + 30 };
+    t.mock.timers.tick(100);
+    ordinary.moveTop();
+    bubble.moveTop();
+    const beforeReturn = rail.zOrderCalls.length;
+    fixture.screen.point = point;
+    t.mock.timers.tick(100);
+    assert.equal(rail.zOrderCalls.length, beforeReturn + (platform === 'win32' ? 1 : 0), 'returning from the card repairs the rail again');
+  });
+}
 
 test('auto-hide haptics distinguish the handle reveal from the first hovered item', async (t) => {
   const fixture = createFixture({ platform: 'darwin', settings: { edgeDockMode: 'autoHide' } });
@@ -500,7 +671,8 @@ test('dragging onto another display moves the dock there and persists its id', a
   await new Promise((resolve) => setTimeout(resolve, 35));
   fixture.ipcMain.emit('edgeDock:dragEnd', { sender: rail.webContents });
 
-  assert.equal(rail.bounds.x, 1800 - 64);
+  assert.equal(rail.bounds.x, 1700 - 32);
+  assert.notEqual(fixture.placements.at(-1).floatingX, null);
   assert.equal(fixture.placements.at(-1).displayId, '2');
   assert.equal(fixture.placements.at(-1).side, 'right');
 });
@@ -630,7 +802,7 @@ test('a drag on a larger dock keeps the grab point under the pointer', async (t)
   assert.equal(fixture.placements.at(-1).offset, expected.offset);
 });
 
-test('Windows Edge Dock keeps every glass setting on the shaped renderer surface', (t) => {
+test('Windows Edge Dock falls back to the shaped renderer when native hosting is unavailable', (t) => {
   const fixture = createFixture({ nativeGlass: true });
   t.after(() => fixture.controller.stop());
   const acrylicWindows = FakeBrowserWindow.instances.slice();
@@ -647,6 +819,91 @@ test('Windows Edge Dock keeps every glass setting on the shaped renderer surface
   assert.deepEqual(accentWindows, acrylicWindows);
   assert.ok(accentWindows.every((win) => win.options.transparent === true));
   assert.ok(accentWindows.every((win) => win.options.backgroundMaterial === undefined));
+});
+
+test('Windows HostBackdrop follows shape, fade, resume and cleanup without using HWND-wide materials', (t) => {
+  const adapters = [];
+  const options = { nativeGlass: true, windowsBackdrop: {
+    attach(win, onMaterial) {
+      const adapter = { win, onMaterial, shapes: [], opacities: [], raises: 0,
+        update(shape) { this.shapes.push(shape); },
+        setOpacity(value) { this.opacities.push(value); },
+        reorder() { this.raises++; },
+        dispose() { this.disposed = true; }
+      };
+      adapters.push(adapter); return adapter;
+    }
+  } };
+  const fixture = createFixture(options);
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  const native = adapters.find((entry) => entry.win === rail);
+  assert.equal(adapters.length, 3);
+  assert.ok(native.shapes.at(-1).commands.some(([op]) => op === 'C'));
+  assert.equal(sentPayload(rail, 'rail').glass, false);
+  native.onMaterial(true);
+  assert.equal(sentPayload(rail, 'rail').glass, true);
+  assert.equal(sentPayload(rail, 'rail').liquidGlass, false);
+  assert.equal(native.opacities.at(-1), rail.opacity);
+  const before = native.shapes.at(-1).key;
+  fixture.settings.edgeDockSide = 'left'; fixture.controller.sync();
+  assert.notEqual(native.shapes.at(-1).key, before);
+  const raises = native.raises;
+  fixture.powerMonitor.emit('resume');
+  assert.ok(native.raises > raises);
+  fixture.settings.windowsBackdrop = 'accent'; fixture.controller.sync();
+  assert.equal(adapters.length, 3, 'main-window material choice does not rebuild HostBackdrop');
+  native.onMaterial(false);
+  assert.equal(sentPayload(rail, 'rail').glass, false);
+  assert.equal(rail.backgroundMaterials.length, 0);
+  options.nativeGlass = false; fixture.controller.sync();
+  assert.ok(adapters.every((entry) => entry.disposed));
+  fixture.windowFor('rail').webContents.emit('did-finish-load');
+  native.onMaterial(true);
+  assert.equal(sentPayload(fixture.windowFor('rail'), 'rail').glass, false, 'ignore obsolete helper callbacks');
+});
+
+test('Windows dock material switches independently and rebuilds native underlays only when needed', (t) => {
+  const adapters = [];
+  const options = { nativeGlass: true, windowsBackdrop: {
+    attach(win, onMaterial) {
+      const adapter = { win, onMaterial, update() {}, setOpacity() {}, reorder() {},
+        dispose() { this.disposed = true; } };
+      adapters.push(adapter);
+      return adapter;
+    }
+  } };
+  const fixture = createFixture(options);
+  t.after(() => fixture.controller.stop());
+  assert.equal(adapters.length, 3, 'existing settings keep native glass');
+  const inheritedRail = fixture.windowFor('rail');
+  fixture.settings.edgeDockWindowsBackdrop = 'inherit';
+  fixture.controller.sync();
+  assert.equal(fixture.windowFor('rail'), inheritedRail, 'explicit inherit preserves the default material');
+  fixture.settings.edgeDockWindowsBackdrop = 'transparent';
+  fixture.controller.sync();
+  assert.ok(adapters.every((adapter) => adapter.disposed));
+  const plain = fixture.windowFor('rail');
+  plain.webContents.emit('did-finish-load');
+  assert.equal(sentPayload(plain, 'rail').glass, false);
+  assert.ok(plain.shapeCalls.at(-1).length > 0, 'transparent mode keeps curved hit regions');
+  fixture.controller.sync();
+  assert.equal(fixture.windowFor('rail'), plain, 'unchanged settings keep the same window');
+  assert.equal(fixture.settings.windowsBackdrop, 'acrylic', 'main-window choice is independent');
+  fixture.settings.edgeDockWindowsBackdrop = 'host-backdrop';
+  fixture.controller.sync();
+  assert.equal(adapters.length, 6, 'native glass can be restored without restarting the app');
+  const rail = fixture.windowFor('rail');
+  const native = adapters.find((adapter) => adapter.win === rail);
+  rail.webContents.emit('did-finish-load');
+  native.onMaterial(true);
+  assert.equal(sentPayload(rail, 'rail').glass, true);
+  options.nativeGlass = false;
+  fixture.controller.sync();
+  assert.equal(fixture.windowFor('rail'), rail, 'an explicit dock style overrides System Glass');
+  fixture.settings.edgeDockWindowsBackdrop = 'inherit';
+  fixture.controller.sync();
+  assert.ok(adapters.every((adapter) => adapter.disposed), 'inherit follows System Glass off');
 });
 
 test('Windows keeps shaped click-through regions without native glass', (t) => {
@@ -743,6 +1000,103 @@ test('switching the glass style rebuilds the dock and releases its Liquid Glass'
   assert.ok(factory.glasses.every((glass) => glass.disposed?.windowClosed !== true));
   assert.ok(factory.glasses.every((glass) => glass.disposed !== null));
 });
+
+test('macOS Transparent drops the dock material while the widget keeps its glass', (t) => {
+  const factory = fakeGlassFactory();
+  const fixture = createFixture({ platform: 'darwin', nativeGlass: true, liquidGlass: { dark: true }, createGlass: factory.create });
+  t.after(() => fixture.controller.stop());
+  const glassy = fixture.windowFor('rail');
+  assert.equal(factory.glasses.length, 2);
+
+  fixture.settings.edgeDockMacBackdrop = 'transparent';
+  fixture.controller.sync();
+  const plain = fixture.windowFor('rail');
+  assert.notEqual(plain, glassy);
+  assert.ok(factory.glasses.every((glass) => glass.disposed !== null));
+  assert.equal(factory.glasses.length, 2, 'no Liquid Glass is built for a transparent dock');
+  assert.ok(['peek', 'rail', 'bubble'].every((surface) => fixture.windowFor(surface).options.vibrancy === undefined));
+  plain.webContents.emit('did-finish-load');
+  assert.equal(sentPayload(plain, 'rail').glass, false);
+
+  fixture.settings.edgeDockMacBackdrop = 'inherit';
+  fixture.controller.sync();
+  assert.equal(factory.glasses.length, 4, 'glass returns without restarting the app');
+});
+
+test('macOS dock styles override System Glass while inherit follows it', (t) => {
+  const factory = fakeGlassFactory();
+  const options = { platform: 'darwin', nativeGlass: false, liquidGlass: { dark: true }, createGlass: factory.create };
+  const fixture = createFixture(options);
+  t.after(() => fixture.controller.stop());
+  assert.equal(factory.glasses.length, 0, 'inherit follows System Glass off');
+
+  fixture.settings.edgeDockMacBackdrop = 'liquid-glass';
+  fixture.controller.sync();
+  assert.equal(factory.glasses.length, 2, 'an explicit style brings its own glass');
+  const rail = fixture.windowFor('rail');
+  rail.webContents.emit('did-finish-load');
+  assert.equal(sentPayload(rail, 'rail').glass, true);
+
+  fixture.settings.edgeDockMacBackdrop = 'inherit';
+  fixture.controller.sync();
+  assert.ok(factory.glasses.every((glass) => glass.disposed !== null));
+});
+
+test('Regular and Clear update the retained dock glass without rebuilding windows', (t) => {
+  const factory = fakeGlassFactory();
+  let wanted = { dark: true, style: 'regular' };
+  const fixture = createFixture({ platform: 'darwin', nativeGlass: true, liquidGlass: () => wanted, createGlass: factory.create });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  for (const [style, tintOpacity] of [['clear', 0.35], ['clear', 0.7], ['regular', 0.12]]) {
+    wanted = { dark: false, style, tintOpacity };
+    fixture.controller.sync();
+    fixture.controller.setAppearance({});
+    assert.equal(fixture.windowFor('rail'), rail);
+    for (const glass of factory.glasses) {
+      assert.equal(glass.updates.at(-1).style, style);
+      assert.equal(glass.updates.at(-1).tintOpacity, tintOpacity);
+    }
+  }
+  assert.equal(factory.glasses.length, 2);
+});
+
+for (const style of ['frosted', 'regular', 'clear']) {
+  test(`${style}: glass previews preserve canonical appearance while hidden, on reveal and after a full settings update`, (t) => {
+    const factory = fakeGlassFactory();
+    const wanted = style === 'frosted' ? null : { dark: true, style, tintOpacity: 0.64 };
+    const fixture = createFixture({ platform: 'darwin', nativeGlass: true, liquidGlass: () => wanted, createGlass: factory.create });
+    t.after(() => fixture.controller.stop());
+    const original = { language: 'zh-TW', currency: 'HKD', currencyRatesEffective: { HKD: 7.8 },
+      subscriptions: [{ id: 'subscription', amount: 20 }], themeColors: { bg: '#123456' },
+      glassOpacity: 68, glassBlur: 32 };
+    fixture.controller.setAppearance(original);
+    const rail = fixture.windowFor('rail'), card = fixture.windowFor('bubble');
+    const windowCount = FakeBrowserWindow.instances.length;
+    rail.visible = card.visible = false;
+    assert.equal(fixture.controller.isRunning(), true);
+    for (const glassOpacity of [17, 0, 84]) {
+      fixture.controller.setAppearance({ glassOpacity, glassBlur: 75, currency: 'USD',
+        subscriptions: [], themeColors: {}, style: 'other', macClearGlassTint: 99 }, { preview: true });
+      for (const [win, surface] of [[rail, 'rail'], [card, 'bubble']]) {
+        assert.deepEqual(sentPayload(win, surface).appearance, { ...original, glassOpacity, glassBlur: 75 });
+      }
+      if (wanted) for (const glass of factory.glasses) {
+        assert.equal(glass.updates.at(-1).style, style);
+        assert.equal(glass.updates.at(-1).tintOpacity, 0.64);
+      }
+    }
+    assert.equal(original.glassOpacity, 68, 'preview must not mutate the canonical snapshot');
+    rail.showInactive(); card.showInactive(); fixture.controller.sync();
+    assert.equal(sentPayload(rail, 'rail').appearance.glassOpacity, 84);
+    assert.equal(sentPayload(card, 'bubble').appearance.currency, 'HKD');
+    assert.equal(FakeBrowserWindow.instances.length, windowCount);
+    const next = { ...original, currency: 'TWD', currencyRatesEffective: { TWD: 32 }, subscriptions: [{ id: 'updated' }] };
+    fixture.controller.setAppearance(next);
+    fixture.controller.setAppearance({ glassOpacity: 25 }, { preview: true });
+    assert.deepEqual(sentPayload(rail, 'rail').appearance, { ...next, glassOpacity: 25 });
+  });
+}
 
 // The rail's entrance is keyed to the reveal rather than to the push, so the page
 // has to be able to tell which payload is the reveal: without that it has neither
@@ -1115,7 +1469,10 @@ test('refresh reuses the peek and retains one Liquid Glass view across role chan
   assert.equal(peek.ignoreMouse, false);
   assert.equal(sentPayload(peek, 'peek').liquidGlass, true);
   assert.equal(peek.bounds.width, EDGE_DOCK_METRICS.refreshSize);
-  assert.deepEqual(rail.bounds, originalRail);
+  // The hidden rail started parked off-screen; the reveal docks it at the edge
+  // with its size and height unchanged.
+  assert.deepEqual({ ...rail.bounds, x: 0 }, { ...originalRail, x: 0 });
+  assert.equal(rail.bounds.x + rail.bounds.width, 1200);
   assert.equal(FakeBrowserWindow.instances.length, 3);
   assert.equal((await handler({ sender: rail.webContents })).ok, false);
   const first = handler({ sender: peek.webContents });
@@ -1380,11 +1737,7 @@ for (const change of ['stop', 'restart', 'remove', 'disable haptics']) {
 for (const mode of ['always', 'alwaysExceptFullScreen']) {
   for (const outcome of ['success', 'failure', 'throw']) {
     test(`${mode} refresh stays visible after pointer leave until ${outcome}`, async (t) => {
-      t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 0 });
-      // Advance through frames so feedback expiry and opacity steps share one clock.
-      const advance = (ms) => {
-        for (let elapsed = 0; elapsed < ms; elapsed += 16) t.mock.timers.tick(Math.min(16, ms - elapsed));
-      };
+      const advance = mockDockClock(t);
       let finish;
       let fail;
       const animated = mode === 'always' && outcome === 'success';
@@ -1426,6 +1779,7 @@ for (const mode of ['always', 'alwaysExceptFullScreen']) {
 }
 
 test('busy visibility yields to dragging and removing the action', async (t) => {
+  const advance = mockDockClock(t);
   let finish;
   const fixture = createFixture({
     canRefreshLimits: () => true,
@@ -1435,12 +1789,12 @@ test('busy visibility yields to dragging and removing the action', async (t) => 
   const peek = fixture.windowFor('peek');
   const rail = fixture.windowFor('rail');
   fixture.screen.point = { x: rail.bounds.x + 32, y: rail.bounds.y + 40 };
-  await new Promise((resolve) => setTimeout(resolve, 105));
+  advance(105);
   fixture.paintPeek();
   const request = fixture.ipcMain.handlers.get('edgeDock:refreshLimits')({ sender: peek.webContents });
   await Promise.resolve();
   fixture.screen.point = { x: 100, y: 100 };
-  await new Promise((resolve) => setTimeout(resolve, 105));
+  advance(105);
   assert.equal(peek.ignoreMouse, false);
   fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetY: 20 });
   assert.equal(peek.ignoreMouse, true);
@@ -1456,6 +1810,7 @@ test('busy visibility yields to dragging and removing the action', async (t) => 
 
 for (const rebuild of ['material', 'restart']) {
   test(`refresh joined after ${rebuild} rebuild keeps the new window busy and holds its result`, async (t) => {
+    const advance = mockDockClock(t);
     let finish;
     let calls = 0;
     let glass = null;
@@ -1470,7 +1825,7 @@ for (const rebuild of ['material', 'restart']) {
     let peek = fixture.windowFor('peek');
     let rail = fixture.windowFor('rail');
     fixture.screen.point = { x: rail.bounds.x + 32, y: rail.bounds.y + 40 };
-    await new Promise((resolve) => setTimeout(resolve, 105));
+    advance(105);
     fixture.paintPeek();
     const handler = fixture.ipcMain.handlers.get('edgeDock:refreshLimits');
     const original = handler({ sender: peek.webContents });
@@ -1484,28 +1839,29 @@ for (const rebuild of ['material', 'restart']) {
     rail = fixture.windowFor('rail');
     assert.notEqual(peek, oldPeek);
     fixture.screen.point = { x: rail.bounds.x + 32, y: rail.bounds.y + 40 };
-    await new Promise((resolve) => setTimeout(resolve, 105));
+    advance(105);
     fixture.paintPeek();
     const joined = handler({ sender: peek.webContents });
     await Promise.resolve();
     assert.equal(calls, 1, 'rejoining does not dispatch another refresh');
     fixture.screen.point = { x: 100, y: 100 };
-    await new Promise((resolve) => setTimeout(resolve, 450));
+    advance(450);
     assert.equal(peek.ignoreMouse, false, 'new busy window remains visible after pointer leave');
     fixture.hapticCalls.length = 0;
     finish({ ok: true });
     assert.deepEqual(await original, { ok: true });
     assert.deepEqual(await joined, { ok: true });
     assert.deepEqual(fixture.hapticCalls, [{ pattern: 'generic', performanceTime: 'default' }]);
-    await new Promise((resolve) => setTimeout(resolve, 450));
+    advance(450);
     assert.equal(peek.ignoreMouse, false, 'the new window holds its result');
-    await new Promise((resolve) => setTimeout(resolve, 800));
+    advance(800);
     assert.equal(peek.ignoreMouse, true, 'the new window hides after the hold');
   });
 }
 
 for (const mode of ['autoHide', 'alwaysExceptFullScreen']) {
   test(`${mode} keeps auto-hide behaviour during refresh in its auto-hide state`, async (t) => {
+    const advance = mockDockClock(t);
     let finish;
     const fixture = createFixture({
       settings: { edgeDockMode: mode }, isFullScreen: () => true,
@@ -1520,10 +1876,544 @@ for (const mode of ['autoHide', 'alwaysExceptFullScreen']) {
     const request = fixture.ipcMain.handlers.get('edgeDock:refreshLimits')({ sender: peek.webContents });
     await Promise.resolve();
     fixture.screen.point = { x: 100, y: 100 };
-    await new Promise((resolve) => setTimeout(resolve, 450));
+    advance(90); // Let the cursor poll observe departure before the hide grace.
+    advance(EDGE_DOCK_TIMING.hideDelayMs - 1);
+    assert.equal(rail.ignoreMouse, false, 'refresh does not bypass the normal leave grace');
+    advance(41);
     assert.equal(rail.ignoreMouse, true, 'leaving still retracts the auto-hide rail while refreshing');
     assert.equal(sentPayload(peek, 'peek').peekMode, 'handle');
     finish({ ok: true });
     assert.deepEqual(await request, { ok: true });
   });
 }
+
+
+test('web surface callbacks skip unready and unchanged renders but preserve lifecycle changes', (t) => {
+  let changes = 0;
+  const fixture = createFixture({ load: false, onWebSurfaceChanged: () => { changes += 1; } });
+  t.after(() => fixture.controller.stop());
+  changes = 0;
+  fixture.controller.setAppearance({ dark: true });
+  assert.equal(changes, 0, 'unready renders do not reconcile web surfaces');
+  for (const win of FakeBrowserWindow.instances) win.webContents.emit('did-finish-load');
+  assert.ok(changes > 0, 'loading reconciles surfaces');
+  changes = 0;
+  fixture.controller.setAppearance({ dark: true });
+  assert.equal(changes, 0, 'identical payload does not reconcile');
+  fixture.controller.setAppearance({ dark: false });
+  assert.ok(changes > 0, 'changed payload reconciles');
+  changes = 0;
+  fixture.settings.edgeDockMode = 'hover';
+  fixture.controller.sync();
+  assert.ok(changes > 0, 'hiding reconciles even without a changed payload');
+  changes = 0;
+  fixture.controller.stop();
+  assert.ok(changes > 0, 'teardown reconciles detached hosts');
+});
+
+function onAnyDisplay(win, displays) {
+  const { x, y, width, height } = win.bounds;
+  return displays.some(({ bounds: d }) => x < d.x + d.width && x + width > d.x && y < d.y + d.height && y + height > d.y);
+}
+
+test('a hidden macOS rail is parked off every display so a Space switch cannot flash it', (t) => {
+  const fixture = createFixture({
+    platform: 'darwin',
+    settings: { edgeDockMode: 'autoHide' },
+    displays: [
+      { id: 1, scaleFactor: 1, bounds: { x: 0, y: 0, width: 1200, height: 900 }, workArea: { x: 0, y: 0, width: 1200, height: 860 } },
+      { id: 2, scaleFactor: 2, bounds: { x: 1200, y: -200, width: 1600, height: 1000 }, workArea: { x: 1200, y: -200, width: 1600, height: 960 } }
+    ]
+  });
+  t.after(() => fixture.controller.stop());
+  const displays = fixture.screen.getAllDisplays();
+  const rail = fixture.windowFor('rail');
+  assert.equal(rail.opacity, 0);
+  assert.equal(onAnyDisplay(rail, displays), false, 'parked from the first load');
+
+  fixture.screen.emit('display-metrics-changed');
+  assert.equal(onAnyDisplay(rail, displays), false, 'a layout pass while hidden keeps it parked');
+
+  // The rail is back in place before it becomes visible at all.
+  const boundsAtFirstOpacity = [];
+  const setOpacity = rail.setOpacity.bind(rail);
+  rail.setOpacity = (value) => {
+    if (value > 0 && boundsAtFirstOpacity.length === 0) boundsAtFirstOpacity.push({ ...rail.bounds });
+    setOpacity(value);
+  };
+  fixture.settings.edgeDockMode = 'always';
+  fixture.controller.sync();
+  assert.equal(rail.opacity, 1);
+  assert.equal(boundsAtFirstOpacity.length, 1);
+  assert.equal(onAnyDisplay({ bounds: boundsAtFirstOpacity[0] }, displays), true);
+  assert.equal(rail.bounds.x + rail.bounds.width, 1200, 'docked to the right edge of its display');
+
+  fixture.settings.edgeDockMode = 'autoHide';
+  fixture.controller.sync();
+  assert.equal(rail.opacity, 0);
+  assert.equal(onAnyDisplay(rail, displays), false, 'parked again once it retracts');
+});
+
+for (const [version, osRelease] of [['12', '21.6.0'], ['13', '22.6.0'], ['14', '23.6.0'], ['15.6.1', '24.6.0'], ['26', '25.0.0'], ['27', '26.0.0']]) {
+  test(`macOS ${version} only parks hidden surfaces when older than macOS 26`, (t) => {
+    const fixture = createFixture({ platform: 'darwin', osRelease, settings: { edgeDockMode: 'autoHide' } });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const bubble = fixture.windowFor('bubble');
+    const shouldPark = Number.parseInt(version, 10) < 26;
+    const assertHidden = () => {
+      for (const win of [rail, bubble]) {
+        assert.equal(win.opacity, 0);
+        assert.equal(onAnyDisplay(win, fixture.screen.getAllDisplays()), !shouldPark, `${win.surface} placement`);
+      }
+    };
+    assertHidden();
+
+    fixture.settings.edgeDockMode = 'always';
+    fixture.controller.sync();
+    assert.equal(rail.opacity, 1);
+    assert.equal(onAnyDisplay(rail, fixture.screen.getAllDisplays()), true);
+    fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 1 });
+    fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'codex', height: 180 });
+    assert.equal(bubble.opacity, 1);
+    assert.equal(onAnyDisplay(bubble, fixture.screen.getAllDisplays()), true);
+    fixture.ipcMain.emit('edgeDock:dismiss', { sender: bubble.webContents });
+    fixture.settings.edgeDockMode = 'autoHide';
+    fixture.controller.sync();
+    assertHidden();
+
+    fixture.screen.displays.push({ id: 2, scaleFactor: 2, bounds: { x: 1200, y: 0, width: 3000, height: 900 }, workArea: { x: 1200, y: 0, width: 3000, height: 860 } });
+    fixture.screen.emit('display-added');
+    assertHidden();
+    fixture.settings.edgeDockSide = 'left';
+    fixture.screen.emit('display-metrics-changed');
+    assertHidden();
+  });
+}
+
+test('a hidden Windows rail stays in place', (t) => {
+  const fixture = createFixture({ platform: 'win32', settings: { edgeDockMode: 'autoHide' } });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  assert.equal(rail.opacity, 0);
+  assert.equal(onAnyDisplay(rail, fixture.screen.getAllDisplays()), true);
+});
+
+test('a display added past the parked surfaces moves them beyond it', (t) => {
+  const fixture = createFixture({ platform: 'darwin', settings: { edgeDockMode: 'autoHide' } });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  const bubble = fixture.windowFor('bubble');
+  assert.equal(bubble.opacity, 0);
+  fixture.screen.displays.push({ id: 2, scaleFactor: 1, bounds: { x: 1200, y: 0, width: 3000, height: 900 }, workArea: { x: 1200, y: 0, width: 3000, height: 860 } });
+  fixture.screen.emit('display-added');
+  const displays = fixture.screen.getAllDisplays();
+  assert.equal(onAnyDisplay(rail, displays), false);
+  assert.equal(onAnyDisplay(bubble, displays), false, 'the hidden card has no cell to place, yet it moves too');
+});
+
+test('a free drop persists both axes, remains visible in auto-hide, and can snap back', (t) => {
+  const advance = mockDockClock(t);
+  const fixture = createFixture({ settings: { edgeDockMode: 'autoHide' } });
+  t.after(() => fixture.controller.stop());
+  fixture.ipcMain.emit('edgeDock:click', { sender: fixture.windowFor('peek').webContents });
+  const rail = fixture.windowFor('rail');
+  fixture.screen.point = { x: 600, y: 300 };
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 20, grabOffsetY: 30 });
+  // Release before the next poll: the final cursor location is still saved.
+  fixture.ipcMain.emit('edgeDock:dragEnd', { sender: rail.webContents });
+  assert.equal(rail.bounds.x, 580);
+  assert.equal(rail.bounds.y, 270);
+  assert.ok(fixture.settings.edgeDockFloatingX > 0);
+  const floatingShape = sentPayload(rail, 'rail').shape.d;
+  fixture.screen.point = { x: 0, y: 0 };
+  advance(1000);
+  assert.equal(rail.opacity, 1);
+  assert.equal(sentPayload(rail, 'rail').always, true);
+  fixture.controller.stop();
+  fixture.controller.sync();
+  for (const win of FakeBrowserWindow.instances.filter(win => !win.destroyed)) win.webContents.emit('did-finish-load');
+  const restored = fixture.windowFor('rail');
+  assert.equal(restored.bounds.x, 580);
+  assert.equal(restored.bounds.y, 270);
+  fixture.screen.point = { x: 1190, y: 400 };
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: restored.webContents }, { grabOffsetX: 20, grabOffsetY: 30 });
+  fixture.ipcMain.emit('edgeDock:dragEnd', { sender: restored.webContents });
+  assert.equal(fixture.settings.edgeDockFloatingX, null);
+  assert.equal(restored.bounds.x, 1136);
+  assert.notEqual(sentPayload(restored, 'rail').shape.d, floatingShape);
+  assert.equal(sentPayload(restored, 'rail').always, false);
+  fixture.screen.point = { x: 600, y: 0 };
+  advance(1000);
+  assert.equal(restored.opacity, 0);
+});
+
+test('floating cards choose the available side and fit a scaled narrow display', (t) => {
+  const fixture = createFixture({ settings: { edgeDockFloatingX: 0.5, edgeDockCustomScale: 1.5, edgeDockSize: 'custom' },
+    displays: [{ id: 1, bounds: { x: -800, y: 0, width: 800, height: 1200 }, workArea: { x: -800, y: 0, width: 800, height: 1160 } }] });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  const bubble = fixture.windowFor('bubble');
+  const open = () => {
+    fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 1 });
+    fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'codex', height: 180 });
+    assert.ok(bubble.bounds.x >= -800);
+    assert.ok(bubble.bounds.x + bubble.bounds.width <= 0);
+  };
+  open();
+  assert.ok(sentPayload(bubble, 'bubble').cardWidth < 280);
+  fixture.settings.edgeDockFloatingX = 0.1;
+  fixture.controller.sync();
+  open();
+  assert.equal(sentPayload(bubble, 'bubble').side, 'left');
+  assert.ok(bubble.bounds.x > rail.bounds.x);
+  fixture.settings.edgeDockFloatingX = 0.9;
+  fixture.controller.sync();
+  open();
+  assert.equal(sentPayload(bubble, 'bubble').side, 'right');
+  assert.ok(bubble.bounds.x < rail.bounds.x);
+});
+
+test('Windows drag frames follow the native cursor between polls and reject stale or foreign frames', (t) => {
+  const advance = mockDockClock(t);
+  let down = true;
+  const fixture = createFixture({ primaryButtonDown: () => down });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  const emitFrame = (win, gestureId) => fixture.ipcMain.emit('edgeDock:dragFrame', { sender: win.webContents }, { gestureId });
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 20, grabOffsetY: 30, gestureId: 7 });
+  const saved = rail.getBounds();
+  advance(4);
+  fixture.screen.point = { x: 700, y: 300 };
+  emitFrame(rail, 6);
+  emitFrame(fixture.windowFor('peek'), 7);
+  assert.deepEqual(rail.getBounds(), saved);
+  emitFrame(rail, 7);
+  assert.equal(rail.bounds.x, 680, 'a frame moves the rail before the 16ms poll');
+  advance(4);
+  fixture.screen.point = { x: 500, y: 400 };
+  emitFrame(rail, 7);
+  assert.equal(rail.bounds.x, 480, 'high refresh displays are not limited to the poll rate');
+  advance(100);
+  down = false;
+  fixture.screen.point = { x: 20, y: 500 };
+  emitFrame(rail, 7);
+  assert.equal(rail.bounds.x, 0);
+  assert.equal(fixture.placements.length, 1, 'native release saves the final position');
+  fixture.screen.point = { x: 900, y: 300 };
+  emitFrame(rail, 7);
+  assert.equal(rail.bounds.x, 0, 'queued frames cannot move a completed gesture');
+  assert.equal(fixture.placements.length, 1);
+});
+
+test('native release finishes a held drag at its final location and acknowledges its gesture', (t) => {
+  const advance = mockDockClock(t);
+  let down = true;
+  const fixture = createFixture({ primaryButtonDown: () => down });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  fixture.screen.point = { x: 700, y: 300 };
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 20, grabOffsetY: 30, gestureId: 7 });
+  advance(100);
+  assert.equal(rail.bounds.x, 680);
+  assert.equal(fixture.placements.length, 0);
+  fixture.screen.point = { x: 500, y: 400 };
+  advance(32);
+  assert.equal(rail.bounds.x, 480);
+  fixture.screen.point = { x: 20, y: 500 };
+  down = false;
+  advance(32);
+  assert.equal(rail.bounds.x, 0);
+  assert.equal(fixture.placements.at(-1).floatingX, null);
+  assert.equal(rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:dragEnded').at(-1).payload.gestureId, 7);
+});
+
+test('detaching morphs the shared silhouette over several frames without rebuilding rail content', (t) => {
+  const advance = mockDockClock(t);
+  const fixture = createFixture({ prefersReducedMotion: () => false });
+  t.after(() => fixture.controller.stop());
+  advance(200);
+  const rail = fixture.windowFor('rail');
+  const attached = sentPayload(rail, 'rail').shape.d;
+  const before = rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:render').length;
+  fixture.screen.point = { x: 600, y: 300 };
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 20, grabOffsetY: 30 });
+  advance(32);
+  const frames = () => rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:shapeFrame');
+  assert.ok(frames().length > 0);
+  const intermediate = frames().at(-1).payload.shape.d;
+  assert.notEqual(intermediate, attached);
+  advance(200);
+  const final = sentPayload(rail, 'rail').shape.d;
+  assert.notEqual(final, intermediate);
+  assert.ok(frames().length >= 5);
+  const renders = rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:render').length - before;
+  assert.ok(renders <= 3, `${renders} content renders for the whole morph`);
+  fixture.ipcMain.emit('edgeDock:dragEnd', { sender: rail.webContents });
+  fixture.screen.point = { x: 1190, y: 300 };
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 20, grabOffsetY: 30 });
+  advance(32);
+  assert.ok(rail.bounds.x > 580 && rail.bounds.x < 1136, 'snap moves through intermediate positions');
+  advance(200);
+  assert.equal(rail.bounds.x, 1136);
+  assert.equal(sentPayload(rail, 'rail').shape.d, attached);
+});
+
+test('stopping a morph cancels its native window updates', (t) => {
+  const advance = mockDockClock(t);
+  const fixture = createFixture({ prefersReducedMotion: () => false });
+  const rail = fixture.windowFor('rail');
+  fixture.screen.point = { x: 600, y: 300 };
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetY: 30 });
+  advance(32);
+  fixture.controller.stop();
+  const messages = rail.webContents.messages.length;
+  advance(300);
+  assert.equal(rail.webContents.messages.length, messages);
+});
+
+for (const initialButtonState of [null, true]) {
+  test(`capture loss with unreadable native state cancels an outside-work-area drag (${initialButtonState})`, (t) => {
+    const advance = mockDockClock(t);
+    let down = initialButtonState;
+    const fixture = createFixture({ primaryButtonDown: () => down });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const savedBounds = { ...rail.bounds };
+    fixture.screen.point = { x: 600, y: 300 };
+    fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 20, grabOffsetY: 30, gestureId: 9 });
+    advance(100);
+    assert.equal(rail.bounds.x, 580);
+    // A menu-bar release produces no further renderer pointerup/pointermove.
+    fixture.screen.point = { x: 600, y: -20 };
+    advance(32);
+    assert.ok(fixture.screen.point.y < rail.bounds.y, 'work-area clamping leaves the cursor outside the rail');
+    fixture.ipcMain.emit('edgeDock:dragCaptureLost', { sender: rail.webContents }, { gestureId: 8 });
+    advance(32);
+    assert.equal(rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:dragEnded').length, 0, 'stale capture loss cannot cancel a newer drag');
+    fixture.ipcMain.emit('edgeDock:dragCaptureLost', { sender: rail.webContents }, { gestureId: 9 });
+    if (down === true) {
+      advance(32);
+      assert.equal(rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:dragEnded').length, 0, 'known held button continues despite capture loss');
+      down = null;
+    }
+    advance(32);
+    assert.deepEqual(rail.bounds, savedBounds, 'cancel restores the last saved placement');
+    assert.equal(fixture.placements.length, 0, 'unknown release must not commit a new placement');
+    assert.deepEqual(rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:dragEnded').at(-1)?.payload, { gestureId: 9, cancelled: true });
+    fixture.screen.point = { x: 300, y: 600 };
+    advance(1000);
+    assert.deepEqual(rail.bounds, savedBounds, 'the rail no longer follows the cursor without renderer events');
+  });
+}
+
+test('cancelling mid-morph restores the renderer shape even when it matches the cached pre-drag payload', (t) => {
+  const advance = mockDockClock(t);
+  const fixture = createFixture({ prefersReducedMotion: () => false, primaryButtonDown: () => null });
+  t.after(() => fixture.controller.stop());
+  advance(200);
+  const rail = fixture.windowFor('rail');
+  const attached = sentPayload(rail, 'rail').shape.d;
+  const paintedShape = () => rail.webContents.messages.filter(entry => ['edgeDock:render', 'edgeDock:shapeFrame'].includes(entry.channel)).at(-1).payload.shape.d;
+  fixture.screen.point = { x: 600, y: 300 };
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 20, grabOffsetY: 30, gestureId: 10 });
+  advance(64);
+  assert.notEqual(paintedShape(), attached, 'the renderer received an intermediate frame');
+  fixture.ipcMain.emit('edgeDock:dragCaptureLost', { sender: rail.webContents }, { gestureId: 10 });
+  assert.equal(paintedShape(), attached, 'cancellation must deliver the restored shape, not retain the last frame');
+  advance(300);
+  assert.equal(paintedShape(), attached, 'a stopped morph cannot repaint an intermediate shape later');
+});
+
+for (const railX of [350, 800]) {
+  test(`floating refresh preserves the bottom-centred design beside an open last-cell card (x=${railX})`, (t) => {
+    const advance = mockDockClock(t);
+    const fixture = createFixture({
+      canRefreshLimits: () => true,
+      settings: { edgeDockFloatingX: (railX - 8) / 1120 },
+      displays: [{ id: 1, bounds: { x: 0, y: 0, width: 1200, height: 800 }, workArea: { x: 0, y: 0, width: 1200, height: 800 } }]
+    });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const bubble = fixture.windowFor('bubble');
+    const refresh = fixture.windowFor('peek');
+    fixture.screen.point = { x: rail.bounds.x + 32, y: rail.bounds.y + 211 };
+    advance(100);
+    fixture.ipcMain.emit('edgeDock:click', { sender: rail.webContents }, { cellIndex: 2 });
+    fixture.ipcMain.emit('edgeDock:bubbleSize', { sender: bubble.webContents }, { cellId: 'cursor', height: 180 });
+    fixture.paintPeek();
+    assert.equal(refresh.ignoreMouse, false, 'refresh is actually shown');
+    assert.equal(bubble.opacity, 1, 'the last-cell card is actually shown');
+    assert.equal(refresh.bounds.x + refresh.bounds.width / 2, rail.bounds.x + rail.bounds.width / 2);
+    assert.equal(refresh.bounds.y, rail.bounds.y + rail.bounds.height - Math.round(EDGE_DOCK_METRICS.shoulder * 0.7) + EDGE_DOCK_METRICS.refreshGap);
+    assert.ok(refresh.bounds.x + refresh.bounds.width <= bubble.bounds.x || bubble.bounds.x + bubble.bounds.width <= refresh.bounds.x, 'bottom refresh and the side-opening card cannot overlap');
+  });
+}
+
+for (const buttonState of [true, false, null]) {
+  test(`renderer pointercancel defers placement to native button state (${buttonState})`, (t) => {
+    const advance = mockDockClock(t);
+    let down = true;
+    const fixture = createFixture({ primaryButtonDown: () => down });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const saved = { ...rail.bounds };
+    const handlers = new Map();
+    const node = { addEventListener: (name, fn) => handlers.set(name, fn), setPointerCapture() {}, classList: { add() {}, remove() {} } };
+    const dock = require('node:fs').readFileSync(require('node:path').join(__dirname, '../../src/electron/renderer/edgeDock/dock.js'), 'utf8');
+    const source = dock.slice(dock.indexOf('let gesture = null;'), dock.indexOf('function indexFromTarget('));
+    const emit = (channel, payload) => fixture.ipcMain.emit(channel, { sender: rail.webContents }, payload);
+    let acknowledge;
+    Function('bridge', 'railNode', 'indexFromTarget', 'DRAG_THRESHOLD_PX', 'state', `${source}; bindRailGestures(railNode);`)(
+      {
+        dragStart: (grabOffsetY, grabOffsetX, gestureId) => emit('edgeDock:dragStart', { grabOffsetY, grabOffsetX, gestureId }),
+        dragEnd: () => emit('edgeDock:dragEnd'),
+        dragCaptureLost: (gestureId) => emit('edgeDock:dragCaptureLost', { gestureId }),
+        onDragEnded: (fn) => { acknowledge = fn; }
+      }, node, () => 0, 5, { payload: { platform: 'darwin' } });
+    const event = { button: 0, buttons: 1, pointerId: 1, screenX: rail.bounds.x + 20, screenY: rail.bounds.y + 30, clientX: 20, clientY: 30 };
+    handlers.get('pointerdown')(event);
+    fixture.screen.point = { x: 600, y: 300 };
+    handlers.get('pointermove')({ ...event, screenX: 600, screenY: 300 });
+    advance(100);
+    assert.notDeepEqual(rail.bounds, saved);
+    down = buttonState;
+    handlers.get('pointercancel')({ ...event, type: 'pointercancel' });
+    handlers.get('lostpointercapture')({ ...event, type: 'lostpointercapture' });
+    assert.equal(fixture.placements.length, 0, 'cancellation itself cannot commit a placement');
+    if (down === true) {
+      advance(100);
+      assert.equal(fixture.placements.length, 0, 'a held native button continues tracking');
+      fixture.screen.point = { x: 700, y: 400 };
+      down = false;
+    }
+    advance(100);
+    const ended = rail.webContents.messages.filter(entry => entry.channel === 'edgeDock:dragEnded').at(-1)?.payload;
+    assert.ok(ended, 'main acknowledges completion without further renderer input');
+    acknowledge(ended);
+    if (buttonState === null) {
+      assert.deepEqual(rail.bounds, saved, 'unreadable native state restores persisted placement');
+      assert.equal(fixture.placements.length, 0);
+      assert.equal(ended.cancelled, true);
+    } else {
+      assert.equal(fixture.placements.length, 1, 'only confirmed native release saves once');
+      assert.equal(rail.bounds.x, buttonState === true ? 680 : 580);
+    }
+    handlers.get('pointerup')({ ...event, type: 'pointerup' });
+    assert.equal(fixture.placements.length, buttonState === null ? 0 : 1, 'acknowledged gesture cannot save again');
+  });
+}
+
+for (const direction of ['detach', 'redock']) {
+  test(`refresh waits for ${direction} morph completion before returning below the rail`, (t) => {
+    const advance = mockDockClock(t);
+    const fixture = createFixture({
+      canRefreshLimits: () => true,
+      prefersReducedMotion: () => false,
+      primaryButtonDown: () => true,
+      settings: { edgeDockFloatingX: direction === 'redock' ? 0.5 : null }
+    });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const refresh = fixture.windowFor('peek');
+    fixture.screen.point = { x: rail.bounds.x + 32, y: rail.bounds.y + 60 };
+    advance(120);
+    fixture.paintPeek();
+    advance(160);
+    assert.equal(refresh.ignoreMouse, false);
+    assert.equal(refresh.opacity, 1, 'start with a fully painted refresh so its fade-out is exercised');
+    fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 32, grabOffsetY: 60, gestureId: 11 });
+    fixture.screen.point = { x: direction === 'redock' ? 1190 : 600, y: 300 };
+    advance(32);
+    fixture.ipcMain.emit('edgeDock:dragEnd', { sender: rail.webContents });
+    advance(32);
+    fixture.paintPeek();
+    assert.equal(refresh.ignoreMouse, true, 'refresh cannot appear at the destination while the rail is still moving');
+    assert.equal(refresh.opacity, 0, 'refresh is fully hidden during the morph');
+    advance(220);
+    fixture.paintPeek();
+    advance(160);
+    assert.equal(refresh.ignoreMouse, false, 'hovered refresh returns after the morph');
+    assert.equal(refresh.opacity, 1);
+    assert.equal(refresh.bounds.x + refresh.bounds.width / 2, rail.bounds.x + rail.bounds.width / 2);
+    assert.equal(refresh.bounds.y, rail.bounds.y + rail.bounds.height - Math.round(EDGE_DOCK_METRICS.shoulder * 0.7) + EDGE_DOCK_METRICS.refreshGap);
+  });
+}
+
+for (const scale of [0.85, 1, 1.25]) {
+  test(`macOS floating rail only captures its painted capsule at scale ${scale}`, (t) => {
+    const advance = mockDockClock(t);
+    const fixture = createFixture({ platform: 'darwin', settings: { edgeDockFloatingX: 0.5, edgeDockSize: 'custom', edgeDockCustomScale: scale } });
+    t.after(() => fixture.controller.stop());
+    const rail = fixture.windowFor('rail');
+    const m = scaledEdgeDockMetrics(scale);
+    const at = (x, y, sender = rail.webContents) => {
+      fixture.screen.point = { x: rail.bounds.x + x, y: rail.bounds.y + y };
+      fixture.ipcMain.emit('edgeDock:pointer', { sender });
+    };
+    assert.equal(rail.ignoreMouse, true, 'a visible floating window initially leaves background input alone');
+    assert.equal(rail.forwardMouse, true, 'forward moves so entering the capsule can capture without waiting for a poll');
+    const transparent = [
+      [rail.bounds.width / 2, m.shoulder / 2],
+      [rail.bounds.width / 2, rail.bounds.height - m.shoulder / 2],
+      [2, m.shoulder + 2], [rail.bounds.width - 2, m.shoulder + 2],
+      [2, rail.bounds.height - m.shoulder - 2], [rail.bounds.width - 2, rail.bounds.height - m.shoulder - 2]
+    ];
+    for (const [x, y] of transparent) {
+      at(rail.bounds.width / 2, rail.bounds.height / 2);
+      assert.equal(rail.ignoreMouse, false, 'the visible body takes input');
+      at(x, y);
+      assert.equal(rail.ignoreMouse, true, `transparent point ${x},${y} passes clicks and wheel through`);
+      assert.equal(rail.forwardMouse, true);
+    }
+    at(rail.bounds.width / 2, rail.bounds.height / 2, fixture.windowFor('bubble').webContents);
+    assert.equal(rail.ignoreMouse, true, 'another surface cannot capture the rail');
+    advance(100);
+    assert.equal(rail.ignoreMouse, false, 'the existing cursor poll also recovers capture');
+    fixture.controller.sync();
+    assert.equal(rail.ignoreMouse, false, 'ordinary settings/render sync preserves painted input');
+    at(rail.bounds.width / 2, m.shoulder / 2);
+    fixture.controller.sync();
+    assert.equal(rail.ignoreMouse, true, 'ordinary settings/render sync cannot recapture transparent input');
+  });
+}
+
+test('macOS floating capture stays active through a drag and resumes silhouette hit testing after cancellation', (t) => {
+  const advance = mockDockClock(t);
+  const fixture = createFixture({ platform: 'darwin', primaryButtonDown: () => null, settings: { edgeDockFloatingX: 0.5 } });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  fixture.screen.point = { x: rail.bounds.x + 32, y: rail.bounds.y + 60 };
+  fixture.ipcMain.emit('edgeDock:pointer', { sender: rail.webContents });
+  assert.equal(rail.ignoreMouse, false);
+  fixture.ipcMain.emit('edgeDock:dragStart', { sender: rail.webContents }, { grabOffsetX: 32, grabOffsetY: 60, gestureId: 31 });
+  fixture.screen.point = { x: 650, y: -20 };
+  advance(32);
+  fixture.ipcMain.emit('edgeDock:pointer', { sender: rail.webContents });
+  assert.equal(rail.ignoreMouse, false, 'drag capture survives a pointer outside the painted rail');
+  fixture.ipcMain.emit('edgeDock:dragCaptureLost', { sender: rail.webContents }, { gestureId: 31 });
+  assert.equal(fixture.placements.length, 0);
+  assert.equal(rail.ignoreMouse, true, 'cancelled drag restores click-through at the saved capsule');
+  fixture.screen.point = { x: rail.bounds.x + 32, y: rail.bounds.y + 60 };
+  fixture.ipcMain.emit('edgeDock:pointer', { sender: rail.webContents });
+  assert.equal(rail.ignoreMouse, false, 'the restored capsule can be clicked again');
+});
+
+test('macOS floating rail retains a held press before the renderer crosses its drag threshold', (t) => {
+  let down = false;
+  const fixture = createFixture({ platform: 'darwin', primaryButtonDown: () => down, settings: { edgeDockFloatingX: 0.5 } });
+  t.after(() => fixture.controller.stop());
+  const rail = fixture.windowFor('rail');
+  const report = (x) => {
+    fixture.screen.point = { x: rail.bounds.x + x, y: rail.bounds.y + 60 };
+    fixture.ipcMain.emit('edgeDock:pointer', { sender: rail.webContents });
+  };
+  report(2);
+  assert.equal(rail.ignoreMouse, false);
+  down = true;
+  report(-2);
+  assert.equal(rail.ignoreMouse, false, 'a 4px move outside the outline must not lose the press before dragStart');
+  down = false;
+  report(-2);
+  assert.equal(rail.ignoreMouse, true, 'release outside returns control to the background');
+});

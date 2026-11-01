@@ -5,6 +5,7 @@
 
 const { staleAfterMsForSyncUpload } = require('../syncUploadInterval');
 const { LIMIT_PROVIDER_IDS, VALID_LIMIT_WINDOW_METRICS } = require('./providers');
+const { isWorkbuddyPlaceholder } = require('../providers/workbuddy/identity');
 
 const DEFAULT_LIMITS_REFRESH_MS = 5 * 60 * 1000;
 const VALID_PROVIDERS = new Set(LIMIT_PROVIDER_IDS);
@@ -601,6 +602,12 @@ function providerAggregateKey(provider) {
   ) {
     return `${provider.provider}:${identity}:device:${provider.sourceDeviceId || ''}`;
   }
+  // Keep the existing Muse Code device observations. The web product follows
+  // the shared cross-device winner selection used by other anonymous providers.
+  if (provider.provider === 'muse') {
+    const sourceKey = `${provider.provider}:${identity}:source:${provider.source || ''}`;
+    return provider.source === 'web' ? sourceKey : `${sourceKey}:device:${provider.sourceDeviceId || ''}`;
+  }
   // One Alibaba Cloud account can hold a Team and a Personal subscription at the
   // same time, with quotas counted separately. Both rows therefore carry the
   // same console-issued account id, so identity alone would make the two plans
@@ -614,14 +621,21 @@ function providerAggregateKey(provider) {
 }
 
 function isConfiguredProvider(provider) {
-  return Boolean(provider.accountKey && provider.status !== 'notConfigured' && provider.status !== 'disabled');
+  return Boolean(provider.accountKey && provider.status !== 'notConfigured' && provider.status !== 'disabled'
+    && !isWorkbuddyPlaceholder(provider));
 }
 
 function providerCollapseKey(provider) {
+  // Known WorkBuddy identities survive missing credentials and refresh-token
+  // rotation. Keep every account separate even while its login is unavailable.
+  if (provider.provider === 'workbuddy' && provider.accountKey) return providerAggregateKey(provider);
   // Antigravity account keys are portable only when a normalized Google email
   // proves the identity. Anonymous RPC fallback keys are local observations,
   // so keep the device scope established by providerAggregateKey().
   if (provider.provider === 'antigravity') return providerAggregateKey(provider);
+  if (provider.provider === 'muse') {
+    return provider.source === 'web' ? `${provider.provider}:source:web` : providerAggregateKey(provider);
+  }
   if (
     (provider.provider === 'claude'
       || provider.provider === 'codex'
@@ -630,6 +644,16 @@ function providerCollapseKey(provider) {
       || provider.provider === 'thirdparty'
       || provider.provider === 'mimo'
       || provider.provider === 'cursor'
+      // Cline keys identify the API key or sign-in account id within each lane.
+      // Keep distinct credential identities from synced devices separate;
+      // matching display emails do not establish a shared identity.
+      || provider.provider === 'cline'
+      // Notion allowances are per user AND workspace. Its verified composite
+      // key is portable; neither a provider-only nor an email collapse is safe.
+      || provider.provider === 'notion'
+      // Manus keys hash the account's user id from its session, so the same
+      // account hashes identically on every device.
+      || provider.provider === 'manus'
       // Volcengine's accountKey comes from the AK/SK and region, so it is the
       // same on every platform. Two keys mean the Coding/Agent plan split, not
       // one account hashed twice.
@@ -955,6 +979,12 @@ function betterProvider(current, candidate) {
   return timestampMs(candidate.updatedAt) >= timestampMs(current.updatedAt) ? candidate : current;
 }
 
+// Muse's two products refresh independently; a fresh CLI observation cannot
+// retire the Web product's last-good quota, or vice versa.
+function providerFreshnessKey(provider) {
+  return provider.provider === 'muse' ? `muse:${provider.source}` : provider.provider;
+}
+
 function aggregateLimits(devices, staleAfterMs = 0, nowMs = Date.now()) {
   const aggregate = { updatedAt: new Date(nowMs).toISOString(), providers: [] };
   const byKey = new Map();
@@ -972,10 +1002,11 @@ function aggregateLimits(devices, staleAfterMs = 0, nowMs = Date.now()) {
         sourceDeviceId: String(device?.deviceId || ''),
         stale: isProviderStale(provider, summary, device, staleAfterMs, nowMs)
       };
-      if (isConfiguredProvider(provider)) providersWithConfiguredAccounts.add(provider.provider);
+      const freshnessKey = providerFreshnessKey(provider);
+      if (isConfiguredProvider(provider)) providersWithConfiguredAccounts.add(freshnessKey);
       if (!candidate.stale) {
-        providersWithFreshObservations.add(provider.provider);
-        if (isConfiguredProvider(provider)) providersWithFreshConfiguredAccounts.add(provider.provider);
+        providersWithFreshObservations.add(freshnessKey);
+        if (isConfiguredProvider(provider)) providersWithFreshConfiguredAccounts.add(freshnessKey);
       }
       const key = providerAggregateKey(candidate);
       if (candidate.provider === 'opencode' && isConfiguredProvider(candidate)) {
@@ -1000,14 +1031,24 @@ function aggregateLimits(devices, staleAfterMs = 0, nowMs = Date.now()) {
   // hashes to different accountKeys (keychain identity vs file path), so byKey
   // keeps them as separate entries; without this pass the renderer's per-provider
   // Map.set() would arbitrarily overwrite the fresh one with the stale one.
+  const hasKnownWorkbuddyAccount = Array.from(byKey.values()).some((candidate) =>
+    candidate.provider === 'workbuddy' && candidate.accountKey && !isWorkbuddyPlaceholder(candidate));
   const byProvider = new Map();
   for (const candidate of byKey.values()) {
-    const hasFreshObservation = providersWithFreshObservations.has(candidate.provider);
-    if (candidate.stale && hasFreshObservation) continue;
+    // A local-app sentinel is an onboarding hint, not an extra account. Real
+    // identities keep their own failure hints even when none has credentials.
+    if (hasKnownWorkbuddyAccount && isWorkbuddyPlaceholder(candidate)) continue;
+    const knownWorkbuddyAccount = candidate.provider === 'workbuddy' && candidate.accountKey
+      && !isWorkbuddyPlaceholder(candidate);
+    const freshnessKey = providerFreshnessKey(candidate);
+    const hasFreshObservation = providersWithFreshObservations.has(freshnessKey);
+    // Fresh siblings cannot establish freshness for a different account. The
+    // first pass already chooses the best observation of each exact identity.
+    if (!knownWorkbuddyAccount && candidate.stale && hasFreshObservation) continue;
     const configuredProviders = hasFreshObservation
       ? providersWithFreshConfiguredAccounts
       : providersWithConfiguredAccounts;
-    if (!isConfiguredProvider(candidate) && configuredProviders.has(candidate.provider)) continue;
+    if (!knownWorkbuddyAccount && !isConfiguredProvider(candidate) && configuredProviders.has(freshnessKey)) continue;
     const collapseKey = providerCollapseKey(candidate);
     byProvider.set(collapseKey, pickBetterProvider(byProvider.get(collapseKey), candidate));
   }

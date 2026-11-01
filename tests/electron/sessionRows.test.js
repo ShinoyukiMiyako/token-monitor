@@ -416,6 +416,247 @@ test('background review sessions collapse into one interactive aggregate row wit
   assert.equal(Object.hasOwn(collapsed[1], 'sessionDetailAvailable'), false);
 });
 
+test('subagents fold under their visible parent while reviews keep the global group', () => {
+  const now = new Date(2026, 9, 11, 12, 30);
+  const session = (id, tokens, minute, extra = {}) => ({ client: 'codex', sessionId: id, totalTokens: tokens,
+    costUsd: tokens / 100, models: { 'gpt-5.6-sol': tokens }, lastUsedAt: localIso(2026, 10, 11, 12, minute), ...extra });
+  const rows = sessionRowsForPeriod({ sessions: {
+    'codex:main': session('main', 100, 5, { title: 'Ship the feature' }),
+    'codex:worker': session('worker', 40, 20, { parentSessionId: 'main', title: 'Explore the parser' }),
+    'codex:nested': session('nested', 10, 25, { parentSessionId: 'worker' }),
+    'codex:review': session('review', 30, 28, { parentSessionId: 'main', sessionKind: 'background-review' }),
+    'codex:orphan': session('orphan', 7, 1, { parentSessionId: 'outside-period' }),
+    'codex:other': session('other', 50, 10)
+  } }, { clientLabels, clientColors, now, subagentLabel: 'Subagent' });
+  const grouped = groupSessionRows(rows, {
+    subagents: { countLabel: count => `${count} subagents` },
+    backgroundReviews: { now }
+  });
+
+  assert.deepEqual(grouped.map(row => row.key), [
+    'session-group:codex-auto-review',
+    'session-group:subagents:codex:main',
+    'session:codex:other',
+    'session:codex:orphan'
+  ]);
+  const group = grouped[1];
+  assert.equal(group.kind, 'summary');
+  assert.equal(group.name, 'Ship the feature');
+  assert.equal(group.sessionGroup, 'subagents:codex:main');
+  assert.equal(group.subagentGroup, true);
+  // Members are disjoint sessions: the group is their plain sum, reviews excluded.
+  assert.equal(group.value, 150);
+  assert.ok(Math.abs(group.cost - 1.5) < 1e-9);
+  assert.equal(group.sortTime, Date.parse(localIso(2026, 10, 11, 12, 25)));
+  assert.equal(group.groupDetail, '2 subagents');
+  assert.match(group.subtitle, /^Codex .* · 2 subagents$/);
+  assert.equal(group.detail, '');
+  assert.deepEqual(group.groupRows.map(row => row.key),
+    ['session:codex:main', 'session:codex:nested', 'session:codex:worker']);
+  assert.match(group.groupRows[2].activity, /^Subagent/);
+  assert.equal(group.groupRows[2].activitySummary, '12:20');
+  assert.equal(group.groupRows[1].activitySummary, '12:25');
+  assert.deepEqual(grouped[0].groupRows.map(row => row.key), ['session:codex:review']);
+  const orphan = grouped[3];
+  assert.equal(orphan.kind, 'session');
+  assert.match(orphan.subtitle, /^Subagent/);
+  const visible = grouped.reduce((sum, row) => sum + row.value, 0);
+  assert.equal(visible, rows.reduce((sum, row) => sum + row.value, 0), 'grouping never changes the list total');
+});
+
+test('a subagent group labels and breaks down every member model, not only the parent', () => {
+  const rows = sessionRowsForPeriod({ sessions: {
+    'codex:main': { client: 'codex', sessionId: 'main', totalTokens: 100, title: 'Ship it',
+      models: { 'gpt-5.6-sol': 60, 'gpt-5.6-mini': 40 } },
+    'codex:child': { client: 'codex', sessionId: 'child', totalTokens: 50, parentSessionId: 'main',
+      models: { 'gpt-5.6-sol': 20, 'gpt-5.6-nano': 30 } },
+    'codex:bare': { client: 'codex', sessionId: 'bare', totalTokens: 10, models: { 'gpt-5.6-sol': 10 } },
+    'codex:bare-child': { client: 'codex', sessionId: 'bare-child', totalTokens: 5, parentSessionId: 'bare',
+      models: { 'gpt-5.6-mini': 5 } }
+  } }, { clientLabels, clientColors });
+  const grouped = groupSessionRows(rows, { subagents: { countLabel: count => `${count} subagents`, unattributedLabel: 'Other' } });
+  const titled = grouped.find(row => row.key === 'session-group:subagents:codex:main');
+  assert.equal(titled.value, 150);
+  assert.equal(titled.modelLabel, '3 models');
+  assert.equal(titled.subtitle, 'Codex · 3 models · 1 subagents');
+  assert.deepEqual(titled.modelTooltipEntries, [
+    ['gpt-5.6-sol', '80', '53%'], ['gpt-5.6-mini', '40', '27%'], ['gpt-5.6-nano', '30', '20%']
+  ]);
+  const untitled = grouped.find(row => row.key === 'session-group:subagents:codex:bare');
+  assert.equal(untitled.name, 'Codex · 2 models', 'an untitled group is named by the group models');
+  assert.deepEqual(untitled.modelTooltipEntries.map(entry => entry[0]), ['gpt-5.6-sol', 'gpt-5.6-mini']);
+  assert.equal(untitled.groupRows[0].modelLabel, 'gpt-5.6-sol', 'members keep their own labels');
+});
+
+test('family activity sums calls and weights cache and speed across continuations and nested cross-client children', () => {
+  const now = new Date(2026, 9, 11, 12, 30);
+  for (const title of ['Ship it', '']) {
+    const session = (client, id, minute, extra) => ({ client, sessionId: id, totalTokens: 2_000,
+      models: { model: 2_000 }, lastUsedAt: localIso(2026, 10, 11, 12, minute), ...extra });
+    const period = { sessions: {
+      'codex:main': session('codex', 'main', 5, { title, t3ThreadId: 'main-thread',
+        messageCount: 10, inputTokens: 100, cacheReadTokens: 900,
+        outputTokens: 100, timedOutputTokens: 100, timedDurationMs: 1_000 }),
+      'codex:continuation': session('codex', 'continuation', 10, { title, t3ThreadId: 'main-thread',
+        messageCount: 2, inputTokens: 100, cacheReadTokens: 100,
+        outputTokens: 100, timedOutputTokens: 100, timedDurationMs: 0 }),
+      'claude:worker': session('claude', 'worker', 20, { parentClient: 'codex', parentSessionId: 'main',
+        messageCount: 3, inputTokens: 100, cacheWriteTokens: 100,
+        outputTokens: 300, timedOutputTokens: 999, timedDurationMs: 9_000 }),
+      'codex:nested': session('codex', 'nested', 25, { parentClient: 'claude', parentSessionId: 'worker',
+        messageCount: 4, inputTokens: 600, outputTokens: 900, timedOutputTokens: 900 }),
+      'codex:review': session('codex', 'review', 28, { parentSessionId: 'main', sessionKind: 'background-review',
+        messageCount: 100, inputTokens: 10_000, outputTokens: 10_000, timedOutputTokens: 10_000, timedDurationMs: 1 })
+    } };
+    const before = JSON.stringify(period);
+    const rows = sessionRowsForPeriod(period, { clientLabels, now });
+    // Repeated presentation input must not count the same accounting key twice.
+    const grouped = groupSessionRows([...rows, rows.find(row => row.key === 'session:claude:worker')]);
+    const group = grouped.find(row => row.subagentGroup);
+    assert.equal(group.value, 8_000);
+    assert.equal(group.subagentCount, 2);
+    assert.equal(group.groupRows.length, 4);
+    assert.equal(group.activitySummary, '12:25 · 19 calls · 50% · 40 tok/s');
+    if (title) assert.equal(group.activity, group.activitySummary);
+    else assert.equal(group.subtitle, `${group.activitySummary} · 2 subagents`);
+    assert.equal(group.groupRows.find(row => row.key === 'session:codex:main').activitySummary,
+      '12:05 · 10 calls · 90% · 100 tok/s');
+    assert.equal(JSON.stringify(period), before);
+  }
+});
+
+test('continuation summaries omit unreported cache and speed rather than inheriting main metrics', () => {
+  const now = new Date(2026, 9, 11, 12, 30);
+  const rows = sessionRowsForPeriod({ sessions: {
+    'codex:one': { client: 'codex', sessionId: 'one', t3ThreadId: 'same', title: 'Run',
+      totalTokens: 100, messageCount: 1, lastUsedAt: localIso(2026, 10, 11, 12, 5) },
+    'codex:two': { client: 'codex', sessionId: 'two', t3ThreadId: 'same', title: 'Run',
+      totalTokens: 100, messageCount: 2, lastUsedAt: localIso(2026, 10, 11, 12, 10),
+      outputTokens: 100, timedOutputTokens: 100, timedDurationMs: 0 }
+  } }, { now });
+  const [group] = groupSessionRows(rows);
+  assert.equal(group.subagentCount, 0);
+  assert.equal(group.activity, '12:10 · 3 calls');
+});
+
+test('native children contribute their own cache schema and keep unavailable token counters out of family rates', () => {
+  const now = new Date(2026, 9, 11, 12, 30);
+  const rows = sessionRowsForPeriod({ sessions: {
+    'codex:main': { client: 'codex', sessionId: 'main', title: 'Run', totalTokens: 100,
+      messageCount: 2, inputTokens: 100, outputTokens: 20, timedOutputTokens: 20, timedDurationMs: 1_000,
+      lastUsedAt: localIso(2026, 10, 11, 12, 5) }
+  } }, { now, nativeSessions: {
+    'reasonix:child': { client: 'reasonix', sessionId: 'child', parentClient: 'codex', parentSessionId: 'main',
+      totalTokens: 200, messageCount: 3, promptTokens: 100, cacheHitTokens: 0, cacheMissTokens: 100,
+      outputTokens: 30, timedOutputTokens: 30, timedDurationMs: 1_000,
+      lastUsedAt: localIso(2026, 10, 11, 12, 10) },
+    'codex:pending': { client: 'codex', sessionId: 'pending', parentSessionId: 'main',
+      tokenDataUnavailable: true, messageCount: 1, outputTokens: 999, timedOutputTokens: 999, timedDurationMs: 1,
+      lastUsedAt: localIso(2026, 10, 11, 12, 15) }
+  } });
+  const [group] = groupSessionRows(rows);
+  assert.equal(group.value, 300);
+  assert.equal(group.activity, '12:15 · 6 calls · 0% · 25 tok/s');
+});
+
+for (const titled of [true, false]) {
+  for (const missingParent of [true, false]) {
+    test(`${titled ? 'titled' : 'untitled'} family ${missingParent ? 'retains its root subagent role when the ancestor is outside the period' : 'does not label an ordinary root as a subagent'}`, () => {
+      const now = new Date(2026, 9, 11, 12, 30);
+      const rows = sessionRowsForPeriod({ sessions: {
+        'codex:b': { client: 'codex', sessionId: 'b', title: titled ? 'Family root' : '',
+          totalTokens: 20, messageCount: 2, models: { 'gpt-6.1-sol': 20 },
+          parentSessionId: missingParent ? 'a' : '', lastUsedAt: localIso(2026, 10, 11, 12, 10) },
+        'codex:c': { client: 'codex', sessionId: 'c', parentSessionId: 'b',
+          totalTokens: 30, messageCount: 3, models: { 'gpt-6.1-sol': 30 },
+          lastUsedAt: localIso(2026, 10, 11, 12, 20) },
+        'codex:review': { client: 'codex', sessionId: 'review', sessionKind: 'background-review', totalTokens: 20 },
+        'cursor:bot': { client: 'cursor', sessionId: 'sand-subagent-bot', totalTokens: 20 }
+      } }, { clientLabels, now, subagentLabel: '子代理' });
+      const root = rows.find(row => row.key === 'session:codex:b');
+      const grouped = groupSessionRows(rows, { subagents: { countLabel: count => `${count} 個子代理` } });
+      const group = grouped.find(row => row.subagentGroup);
+      const activity = `${missingParent ? '子代理 · ' : ''}12:20 · 5 calls`;
+      assert.equal(titled ? group.activity : group.subtitleIdentity, activity);
+      if (!titled) assert.equal(group.subtitle, `${activity} · 1 個子代理`);
+      assert.equal(group.activitySummary, '12:20 · 5 calls', 'expanded members receive metrics without duplicate role labels');
+      assert.equal(group.subagent, root.subagent);
+      assert.equal(group.parentKey, root.parentKey);
+      assert.equal(group.value, 50);
+      assert.equal(group.groupRows.length, 2);
+      assert.equal(titled ? root.activity : root.subtitle, `${missingParent ? '子代理 · ' : ''}12:10 · 2 calls`);
+      assert.equal(grouped.reduce((sum, row) => sum + row.value, 0), 90, 'review and Grok Bot usage stays visible');
+    });
+  }
+}
+
+function delegatedRootFixture({ titled, native, canonicalWithoutParent, relation = 'external', label = '子代理' }) {
+  const now = new Date(2026, 9, 11, 12, 30);
+  const rootId = canonicalWithoutParent ? 'zzz' : 'b';
+  const continuationId = canonicalWithoutParent ? 'aaa' : 'b2';
+  const session = (id, minute, tokens, calls, extra = {}) => ({ client: 'codex', sessionId: id,
+    title: titled ? 'Root conversation' : '', totalTokens: tokens, costUsd: tokens / 100,
+    reportedCostUsd: tokens / 100, messageCount: calls, models: { 'gpt-6.1-sol': tokens },
+    lastUsedAt: localIso(2026, 10, 11, 12, minute), ...extra });
+  const family = {
+    [`codex:${rootId}`]: session(rootId, 10, 20, 2, { t3ThreadId: 'conversation-b',
+      parentSessionId: ['ordinary', 'internal'].includes(relation) ? '' : 'a' }),
+    [`codex:${continuationId}`]: session(continuationId, 15, 30, 3, { t3ThreadId: 'conversation-b',
+      parentSessionId: relation === 'conflicting' ? 'different-ancestor' : relation === 'internal' ? rootId : '' }),
+    'codex:c': session('c', 20, 40, 4, { parentSessionId: rootId })
+  };
+  const period = { sessions: {
+    ...(!native ? family : {}),
+    'codex:review': session('review', 25, 20, 1, { sessionKind: 'background-review' }),
+    'cursor:bot': { client: 'cursor', sessionId: 'sand-subagent-bot', totalTokens: 20 }
+  } };
+  const rows = sessionRowsForPeriod(period, { clientLabels, now, subagentLabel: label,
+    nativeSessions: native ? family : {} });
+  return { rows, rootId, grouped: groupSessionRows(rows) };
+}
+
+for (const native of [false, true]) {
+  for (const titled of [true, false]) {
+    for (const canonicalWithoutParent of [false, true]) {
+      test(`${native ? 'native' : 'accounting'} ${titled ? 'titled' : 'untitled'} delegated root keeps its localized role across ${canonicalWithoutParent ? 'aaa/zzz canonical aliases' : 'a newer unlinked continuation'}`, () => {
+        const { rows, rootId, grouped } = delegatedRootFixture({ native, titled, canonicalWithoutParent,
+          label: 'Delegierter Agent' });
+        const group = grouped.find(row => row.subagentGroup);
+        assert.equal(rows.find(row => row.key === `session:codex:${rootId}`).subagentLabel, 'Delegierter Agent');
+        assert.equal(group.activity || group.subtitleIdentity, 'Delegierter Agent · 12:20 · 9 calls');
+        assert.equal(group.activitySummary, '12:20 · 9 calls');
+        assert.equal(group.value, 90);
+        assert.equal(group.cost, 0.9);
+        assert.equal(group.subagentCount, 1);
+        assert.equal(group.groupRows.length, 3);
+        assert.equal(group.groupRows[0].activitySummary, '12:15 · 3 calls');
+        assert.equal(grouped.reduce((sum, row) => sum + row.value, 0), 130);
+        assert.deepEqual(grouped.filter(row => !row.subagentGroup).map(row => row.sessionGroup).sort(),
+          ['codex-auto-review', 'cursor-grok-bot']);
+      });
+    }
+    for (const relation of ['ordinary', 'internal', 'conflicting']) {
+      test(`${native ? 'native' : 'accounting'} ${titled ? 'titled' : 'untitled'} ${relation} root relationship does not invent a family role`, () => {
+        const { grouped } = delegatedRootFixture({ native, titled, relation, canonicalWithoutParent: true });
+        const group = grouped.find(row => row.subagentGroup);
+        const calls = relation === 'conflicting' ? 6 : 9;
+        assert.equal(group.activity || group.subtitleIdentity, `12:20 · ${calls} calls`);
+        assert.equal(group.subagentLabel, undefined);
+        assert.equal(group.value, relation === 'conflicting' ? 60 : 90);
+        assert.equal(grouped.reduce((sum, row) => sum + row.value, 0), 130);
+      });
+    }
+  }
+}
+
+test('a parent cycle leaves both sessions as their own rows', () => {
+  const rows = sessionRowsForPeriod({ sessions: {
+    'codex:a': { client: 'codex', sessionId: 'a', totalTokens: 1, parentSessionId: 'b' },
+    'codex:b': { client: 'codex', sessionId: 'b', totalTokens: 2, parentSessionId: 'a' }
+  } }, { clientLabels, clientColors });
+  assert.deepEqual(groupSessionRows(rows).map(row => row.key).sort(), ['session:codex:a', 'session:codex:b']);
+});
+
 test('pre-token native Codex reviews join the existing background group without hiding ordinary sessions', () => {
   const now = new Date(2026, 9, 9, 12);
   const rows = sessionRowsForPeriod({ sessions: {
@@ -439,48 +680,102 @@ test('pre-token native Codex reviews join the existing background group without 
   assert.equal(group.cost, 0.1);
 });
 
-test('background review run headings show the model independently of session titles and keep the time', () => {
+// Exercise the adapter with the same row contract consumed by the shared
+// template/update renderer (covered by overflowText and the rendered UI proof).
+function groupMemberRenderer(onOpen = () => {}) {
   const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
   const body = source.slice(source.indexOf('function sessionGroupRunNode('), source.indexOf('function renderSessionGroupDetail('));
-  const sessionRowsApi = require('../../src/electron/renderer/sessionRows');
-  let opened;
-  const createNode = () => {
-    const children = new Map();
-    return {
-      events: {},
-      setAttribute() {},
-      querySelector(selector) {
-        if (!children.has(selector)) children.set(selector, {});
-        return children.get(selector);
-      },
-      addEventListener(type, handler) { this.events[type] = handler; }
-    };
-  };
-  const render = Function('document', 'sessionRowsApi', 't', 'formatNumber', 'formatCost', 'applyBarScale', 'rowWidth', 'openSessionDetail', 'bindHoverMarquee', 'limitWindowsView', `${body}\nreturn sessionGroupRunNode;`)(
-    { createElement: createNode }, sessionRowsApi, () => 'Codex Auto Review', String, String, () => {}, () => 100,
-    (request) => { opened = request; }, () => {}, { setDetailTooltip() {} }
+  const api = require('../../src/electron/renderer/sessionRows');
+  return Function('rowTemplate', 'updateRow', 'sessionRowsApi', 't', 'openSessionDetail',
+    `${body}\nreturn sessionGroupRunNode;`)(
+    data => ({ data, events: {}, classes: new Set(['row']),
+      classList: { add() {} },
+      addEventListener(type, handler) { this.events[type] = handler; },
+      click() { this.events.click?.(); },
+      closest() { return this.interactive ? this : null; }
+    }),
+    (node, data) => { node.data = data; node.interactive = api.sessionRowDetailAvailable(data); },
+    api, key => ({ 'sessions.mainSession': '主會話', 'sessions.subagent': '子代理',
+      'sessions.backgroundReviews': 'Codex Auto Review' })[key] || key, onOpen
   );
-  for (const [models, expectedModel] of [
-    [{ 'gpt-5.6-sol': 30 }, 'gpt-5.6-sol'],
-    [{ 'gpt-5.6-sol': 20, 'gpt-5.6': 10 }, '2 models'],
-    [{}, '']
-  ]) {
+}
+
+test('background review rows retain model/time headings and their return target', () => {
+  let opened;
+  const render = groupMemberRenderer(request => { opened = request; });
+  for (const models of [{ 'gpt-5.6-sol': 30 }, { 'gpt-5.6-sol': 20, 'gpt-5.6': 10 }, {}]) {
     const [row] = sessionRowsForPeriod({ sessions: { 'codex:review': {
       client: 'codex', sessionId: 'review', title: 'Automatic review', sessionKind: 'background-review',
       totalTokens: 30, models, lastUsedAt: new Date().toISOString()
     } } });
     const parent = { kind: 'session-group' };
     const node = render(row, 30, parent);
-    const time = sessionRowsApi.compactSessionTime(row.sortTime);
-    const expectedTitle = [expectedModel, time].filter(Boolean).join(' · ');
-    assert.equal(node.querySelector('.detail-ex-title').textContent, expectedTitle);
-    assert.equal(node.querySelector('.detail-ex-title').title, expectedTitle);
-    assert.equal(node.querySelector('.detail-ex-sub').textContent, 'review');
-    node.events.click();
-    assert.equal(opened.title, expectedTitle);
+    const time = require('../../src/electron/renderer/sessionRows').compactSessionTime(row.sortTime);
+    assert.equal(node.data.name, [row.modelLabel, time].filter(Boolean).join(' · '));
+    node.click();
+    assert.equal(opened.title, node.data.name);
     assert.equal(opened.sessionId, 'review');
     assert.equal(opened.returnTo, parent);
   }
+});
+
+test('subagent members share Sessions metrics without repeating section roles', () => {
+  let opened;
+  const render = groupMemberRenderer(request => { opened = request; });
+  const now = new Date(2026, 9, 11, 12, 30);
+  for (const title of ['Session title', '']) {
+    const rows = sessionRowsForPeriod({ sessions: {
+      'codex:main': { client: 'codex', sessionId: 'main', title, totalTokens: 20,
+        models: { 'gpt-6.1-sol': 20 }, lastUsedAt: now.toISOString(), messageCount: 2 },
+      'codex:child': { client: 'codex', sessionId: 'child', title, parentSessionId: 'main', archived: true,
+        totalTokens: 10, models: { 'gpt-6.1-sol': 10 }, lastUsedAt: now.toISOString(), messageCount: 1 }
+    } }, { clientLabels: { codex: 'Codex' }, subagentLabel: '子代理', archivedLabel: '已封存', now });
+    const main = rows.find(row => row.key === 'session:codex:main');
+    const parent = { kind: 'session-group', summary: { subagentGroup: true, groupRows: [main] } };
+    for (const row of rows) {
+      const node = render(row, 20, parent);
+      assert.equal(node.data.name, row.name);
+      assert.equal(node.data.subtitle, 'Codex · gpt-6.1-sol');
+      assert.equal(node.data.activity, row.activitySummary);
+      for (const field of ['key', 'detail', 'value', 'cost', 'context', 'promptCache', 'activityState']) {
+        assert.deepEqual(node.data[field], row[field], `preserve member ${field}`);
+      }
+      node.events.keydown({ key: 'Enter', target: node, preventDefault() {} });
+      assert.equal(opened.sessionId, row === main ? 'main' : 'child');
+      assert.equal(opened.returnTo, parent);
+    }
+  }
+});
+
+test('all group members pass model tooltips unchanged to the shared row renderer', () => {
+  const render = groupMemberRenderer();
+  for (const group of ['subagents', 'cursor-grok-bot', 'reviews']) {
+    for (const titled of [true, false]) {
+      const entries = [['model-a', '20', '67%'], ['model-b', '10', '33%']];
+      const row = { key: 'session:codex:child', client: 'codex', clientLabel: 'Codex',
+        name: titled ? 'Check the report' : 'Codex · 2 models', titled,
+        subtitle: titled ? 'Codex · 2 models' : '12:30 · 2 calls',
+        activity: titled ? '12:30 · 2 calls' : undefined, activitySummary: '12:30 · 2 calls',
+        modelLabel: '2 models', modelTooltipEntries: entries, detail: 'child', value: 30, cost: 0.1 };
+      const parent = { kind: 'session-group', summary: { subagentGroup: group === 'subagents',
+        sessionGroup: group === 'cursor-grok-bot' ? group : '', groupRows: [] } };
+      const node = render(row, 30, parent);
+      assert.equal(node.data.modelLabel, row.modelLabel);
+      assert.equal(node.data.modelTooltipEntries, entries);
+      assert.equal(node.data.max, 30);
+      assert.equal(node.data.barValue, 30);
+      assert.equal(node.data.subtitle, group === 'subagents' ? 'Codex · 2 models' : row.subtitle);
+    }
+  }
+});
+
+test('Reasonix group members preserve the provider detail identity', () => {
+  let opened;
+  const node = groupMemberRenderer(request => { opened = request; })({
+    key: 'session:reasonix:run-id', client: 'reasonix', sessionDetailAvailable: true, name: 'Run', value: 1
+  }, 1, { summary: { subagentGroup: true } });
+  node.click();
+  assert.equal(opened.sessionId, 'reasonix:run-id');
 });
 
 test('model name alone does not hide an ordinary Codex session in background reviews', () => {
@@ -920,17 +1215,31 @@ test('an archived session is never running and a half-read context is not shown'
 
 test('session rows keep a completed session cache when the recent context expires in every period', () => {
   const at = Date.parse('2026-09-30T09:00:00Z');
-  const session = { client: 'codex', sessionId: 'cache-session', totalTokens: 100, lastUsedAt: new Date(at).toISOString(), turnEnded: true,
-    contextTokens: 60, contextWindow: 100, promptCache: { observedAt: new Date(at).toISOString(), ttlSeconds: 1800 } };
+  const session = { client: 'claude', sessionId: 'cache-session', totalTokens: 100, lastUsedAt: new Date(at).toISOString(), turnEnded: true,
+    contextTokens: 60, contextWindow: 100, promptCache: { observedAt: new Date(at).toISOString(), ttlSeconds: 3600 } };
   for (const period of ['today', 'month', 'allTime']) {
     const before = sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 600_000) })[0];
     assert.equal(before.context.percentUsed, 60, period);
     const after = sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 600_001) })[0];
     assert.equal(after.context, undefined, period);
-    assert.equal(after.promptCache.minutes, 20, period);
+    assert.equal(after.promptCache.minutes, 50, period);
     assert.equal(after.contextSnapshot.contextTokens, 60, period);
     assert.equal(after.contextSnapshot.contextWindow, 100, period);
-    assert.equal(sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 1800_000) })[0].promptCache, null, period);
+    assert.equal(sessionRowsForPeriod({ sessions: { cache: session } }, { now: new Date(at + 3600_000) })[0].promptCache, null, period);
+  }
+});
+
+test('session rows suppress legacy Codex cache countdowns in every period', () => {
+  const at = Date.parse('2026-09-30T09:00:00Z');
+  const session = { client: 'codex', sessionId: 'legacy', totalTokens: 100, lastUsedAt: new Date(at).toISOString(),
+    contextTokens: 60, contextWindow: 100, promptCache: { observedAt: new Date(at).toISOString(), ttlSeconds: 1800 } };
+  for (const period of ['today', 'month', 'allTime']) {
+    const stats = { periods: { [period]: { sessions: { legacy: session } } } };
+    for (const elapsed of [0, 600_001]) {
+      const row = sessionRowsForPeriod(stats.periods[period], { now: new Date(at + elapsed) })[0];
+      assert.equal(row.promptCache, null, period);
+      assert.equal(row.contextSnapshot.contextTokens, 60, period);
+    }
   }
 });
 
@@ -969,7 +1278,6 @@ test('the shared metrics slot restores its meter and tone after cache or empty s
   assert.equal(gauge.title, undefined);
   assert.deepEqual(gauge.entries, []);
 });
-
 
 test('Grok Bot groups all bot conversations by latest activity and conserves totals', () => {
   const now = new Date(2026, 4, 30, 12, 30);
@@ -1037,29 +1345,57 @@ test('a Claude-only day joins a known bot conversation across period snapshots',
   assert.equal(groupSessionRows(sessionRowsForPeriod(today)).length, 2, 'missing evidence never guesses');
 });
 
-test('Grok group run summaries expose usage without an unsupported transcript action', () => {
-  const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
-  const body = source.slice(source.indexOf('function sessionGroupRunNode('), source.indexOf('function renderSessionGroupDetail('));
-  const api = require('../../src/electron/renderer/sessionRows');
-  const children = new Map();
-  const node = { attributes: {}, events: {}, setAttribute(key, value) { this.attributes[key] = value; },
-    querySelector(selector) { if (!children.has(selector)) children.set(selector, {}); return children.get(selector); },
-    addEventListener(type, callback) { this.events[type] = callback; } };
-  const render = Function('document', 'sessionRowsApi', 't', 'formatNumber', 'formatCost', 'applyBarScale', 'rowWidth',
-    'openSessionDetail', 'bindHoverMarquee', 'limitWindowsView', `${body}\nreturn sessionGroupRunNode;`)(
-    { createElement: () => node }, api, key => key, String, (cost, unpriced) => `${cost}:${unpriced || 0}`,
-    () => {}, () => 100, () => assert.fail('Cursor has no transcript detail'), () => {}, {});
+test('Grok group rows expose usage without an unsupported transcript action', () => {
   const [row] = sessionRowsForPeriod({ sessions: { 'cursor:sand-subagent-run': {
     client: 'cursor', sessionId: 'sand-subagent-run', totalTokens: 30, costUsd: 0.5,
     unpricedTokens: 4, models: { 'grok-bot-automation': 30 }, lastUsedAt: new Date().toISOString()
   } } });
-  render(row, 30, { kind: 'session-group', summary: { name: 'Grok Bot', sessionGroup: 'cursor-grok-bot' } });
-  assert.equal(node.querySelector('.detail-ex-title').textContent, row.name);
-  assert.equal(node.querySelector('.detail-ex-sub').textContent, row.subtitle);
-  assert.equal(node.querySelector('.session-group-id').textContent, 'sand-subagent-run');
-  assert.equal(node.querySelector('.detail-ex-value').textContent, '30');
-  assert.equal(node.querySelector('.detail-ex-cost').textContent, '0.5:4');
-  assert.equal(node.querySelector('.detail-chev').textContent, '');
-  assert.deepEqual(node.attributes, {});
+  const node = groupMemberRenderer(() => assert.fail('Cursor has no transcript detail'))(row, 30,
+    { kind: 'session-group', summary: { name: 'Grok Bot', sessionGroup: 'cursor-grok-bot' } });
+  for (const field of ['name', 'subtitle', 'detail', 'value', 'cost', 'unpricedTokens']) {
+    assert.equal(node.data[field], row[field]);
+  }
+  assert.equal(node.interactive, false);
   assert.deepEqual(node.events, {});
+});
+
+test('group sections keep main continuations above children without changing usage or counting runs as agents', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
+  const body = source.slice(source.indexOf('function renderSessionGroupDetail('), source.indexOf('function detailNote('));
+  const node = () => ({ children: [], selectors: new Map(), classList: { add() {}, remove() {} },
+    replaceChildren(...items) { this.children = items; }, append(...items) { this.children.push(...items); },
+    setAttribute() {}, addEventListener() {}, querySelector(selector) {
+      if (!this.selectors.has(selector)) this.selectors.set(selector, {});
+      return this.selectors.get(selector);
+    }
+  });
+  const els = { breakdown: node(), sessionDetail: node(), sessionDetailHead: node() };
+  const render = Function('els', 'document', 't', 'closeSessionDetail', 'bindHoverMarquee',
+    'detailNote', 'formatNumber', 'formatCost', 'sessionGroupRunNode', `${body}\nreturn renderSessionGroupDetail;`)(
+    els, { createElement: node }, key => ({ 'sessions.mainSession': '主會話', 'sessions.subagent': '子代理' })[key] || key,
+    () => {}, () => {}, node, String, String, (row, max) => ({ row, max }));
+  const main = { key: 'main-1', groupRole: 'main', value: 40 };
+  const continuation = { key: 'main-2', groupRole: 'main', value: 30 };
+  const child = { key: 'child-1', groupRole: 'subagent', value: 20 };
+  const childContinuation = { key: 'child-2', groupRole: 'subagent', value: 10 };
+  const rows = [main, child, continuation, childContinuation];
+  const summary = { subagentGroup: true, name: 'Thread', groupRows: rows, subagentCount: 1, value: 100, cost: 2 };
+  render({ summary });
+  let content = els.sessionDetail.children;
+  assert.equal(content[0].querySelector('.session-group-count').textContent, 'dashboard.stat.totalTokens');
+  assert.equal(content[1].textContent, '主會話');
+  assert.equal(content[0].querySelector('.session-group-totals').textContent, '100 · 2');
+  assert.deepEqual(content.filter(item => item.row).map(item => item.row), [main, continuation, child, childContinuation]);
+  assert.equal(content[4].className, 'session-group-section-heading');
+  assert.equal(content[4].textContent, '子代理 · 1', 'count distinct agents, not two child accounting runs');
+  assert.ok(content.filter(item => item.row).every(item => item.max === 40), 'one shared bar scale');
+  assert.equal(content.filter(item => item.row).reduce((sum, item) => sum + item.row.value, 0), 100);
+  assert.deepEqual(summary.groupRows, rows, 'rendering never mutates grouping/order');
+  render({ summary: { ...summary, groupRows: [main, continuation], subagentCount: 0 } });
+  assert.equal(els.sessionDetail.children.filter(item => item.className === 'session-group-section-heading').length, 0);
+  render({ summary: { ...summary, subagentGroup: false, groupDetail: '4 records' } });
+  content = els.sessionDetail.children;
+  assert.equal(content[0].querySelector('.session-group-count').textContent, '4 records');
+  assert.deepEqual(content.filter(item => item.row).map(item => item.row), rows, 'review/bot groups keep their order');
+  assert.equal(content.filter(item => item.className === 'session-group-section-heading').length, 0);
 });

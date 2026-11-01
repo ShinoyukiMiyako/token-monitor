@@ -129,6 +129,19 @@ test('recursiveWatchCandidates honours the env override in both directions', () 
   assert.deepEqual(on.recursive, dirs, 'an explicit 1 opts in even where it is not the default');
 });
 
+// options.env is the scanned source env and never carries this switch, so
+// reading it there would drop an explicit 0 whenever a scoped env is in play.
+test('recursiveWatchCandidates reads its switch from the process, not the scanned env', () => {
+  const dirs = [path.join(os.tmpdir(), 'tm-scoped-env')];
+
+  const off = withRecursiveEnv('0', () => recursiveWatchCandidates(dirs, 'claude', { platform: 'win32', env: {} }));
+  assert.deepEqual(off.recursive, [], 'a scoped env must not lose the explicit 0');
+  assert.deepEqual(off.walked, dirs);
+
+  const on = withRecursiveEnv('1', () => recursiveWatchCandidates(dirs, 'claude', { platform: 'linux', env: {} }));
+  assert.deepEqual(on.recursive, dirs, 'a scoped env must not lose the explicit 1');
+});
+
 test('recursiveWatchCandidates follows the platform default when unset', () => {
   const dirs = [path.join(os.tmpdir(), 'tm-default')];
 

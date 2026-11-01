@@ -1,9 +1,13 @@
 'use strict';
 
-function settingsLimitInvalidationPlan(runtimeChange = {}) {
-  const scopes = Array.isArray(runtimeChange.limitScopes) ? runtimeChange.limitScopes : [];
+function settingsLimitInvalidationPlan(runtimeChange = {}, ensureProvider = '') {
+  const scopes = Array.isArray(runtimeChange.limitScopes) ? [...runtimeChange.limitScopes] : [];
+  if (ensureProvider && !scopes.some((scope) => scope.provider === ensureProvider)) {
+    scopes.push({ provider: ensureProvider });
+  }
   return scopes.map((scope) => ({
-    scope,
+    // Muse's only editable credential belongs to Web; CLI owns its login.
+    scope: scope.provider === 'muse' ? { ...scope, source: 'web' } : scope,
     reason: 'settings-change',
     options: { clear: true }
   }));
@@ -19,6 +23,10 @@ async function runManualDeviceRefresh(runtime, options = {}) {
   if (!runtime) return;
   const limitsTask = Promise.resolve(runtime.refreshLimits({ all: true }, 'manual'));
   limitsTask.catch((error) => options.onLimitsError?.(error));
+  if (options.refreshUsage === false) {
+    await limitsTask.catch(() => {});
+    return;
+  }
   await runtime.tick('manual', {
     forceHistory: options.forceHistory === true,
     // Cursor and Antigravity only move when their sync subprocess runs, and that
