@@ -14,6 +14,9 @@
   const TOKEN_RATE_MAX_DISPLAY_RATE = 1e12;
   const LIVE_TOKEN_RATE_WINDOW_MS = 2 * 60 * 1000;
   const LIVE_TOKEN_RATE_MIN_WINDOW_MS = 30 * 1000;
+  const LIVE_TOKEN_RATE_ACTIVE_MS = 8000;
+  const LIVE_TOKEN_RATE_SCAN_SLACK_MS = 3000;
+  const LIVE_TOKEN_RATE_CLEAR_MS = 3 * 60 * 1000;
 
   function positiveNumber(value) {
     const parsed = Number(value);
@@ -107,7 +110,7 @@
   // preview.
   function createLiveTokenRateTracker({
     now = defaultNow,
-    activeMs = 8000,
+    activeMs = LIVE_TOKEN_RATE_ACTIVE_MS,
     windowMs = LIVE_TOKEN_RATE_WINDOW_MS,
     minWindowMs = LIVE_TOKEN_RATE_MIN_WINDOW_MS
   } = {}) {
@@ -312,6 +315,15 @@
     return { getSample, observe, reset, value };
   }
 
+  // A sample has to outlive the wait for the next scan, or a busy session reads idle between
+  // every pair of them. minScanIntervalMs spaces scan starts, so the slack covers the debounce
+  // and the scan's own run time. The setting reaches five minutes, past the default clear
+  // delay, and the retained reading must still outlast the live one.
+  function liveTokenRateTiming(minScanIntervalMs) {
+    const activeMs = Math.max(LIVE_TOKEN_RATE_ACTIVE_MS, positiveNumber(minScanIntervalMs) + LIVE_TOKEN_RATE_SCAN_SLACK_MS);
+    return { activeMs, clearMs: Math.max(LIVE_TOKEN_RATE_CLEAR_MS, activeMs * 2) };
+  }
+
   // Hub devices publish independently. Taking one delta from the aggregate would make the
   // headline jump between whichever device happened to upload last, and dividing summed
   // tokens by summed model-busy time would be an average rather than fleet throughput. Keep
@@ -320,8 +332,8 @@
   // resource documents rates from matched deltas, not the native surfaces' window throughput.
   function createLiveTokenRateGroupTracker({
     now = defaultNow,
-    activeMs = 8000,
-    clearMs = 180000,
+    activeMs = LIVE_TOKEN_RATE_ACTIVE_MS,
+    clearMs = LIVE_TOKEN_RATE_CLEAR_MS,
     matchedCounters = false
   } = {}) {
     if (typeof now !== 'function') throw new TypeError('now must be a function');
@@ -726,6 +738,7 @@
     createLiveTokenRateTracker,
     createTokenRateBoostController,
     isSharedSyncMode,
+    liveTokenRateTiming,
     liveTokenRateTooltipEntries,
     positiveNumber,
     selectLiveTokenRatePeriods,

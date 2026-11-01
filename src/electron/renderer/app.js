@@ -311,8 +311,6 @@ const TOKEN_MONITOR_WSL_SQLITE_GUIDE_URL = `${TOKEN_MONITOR_REPOSITORY_URL}/blob
 const serviceStatusProviderPreferencesApi = window.TokenMonitorServiceStatusProviderPreferences;
 const SETTINGS_SECTION_IDS = ['general', 'main', 'window', 'appearance', 'tools', 'limits', 'subscriptions', 'sync', 'plugins'];
 const REFRESH_BUTTON_FEEDBACK_MS = 700;
-const LIVE_TOKEN_RATE_ACTIVE_MS = 8000;
-const LIVE_TOKEN_RATE_CLEAR_MS = 3 * 60 * 1000;
 const CODEX_PENDING_ACTIVE_GRACE_MS = 30000;
 const initialFloatingBubble = window.__TOKEN_MONITOR_INITIAL_FLOATING_BUBBLE__ || { collapsed: false, side: null };
 const initialViewState = window.__TOKEN_MONITOR_INITIAL_VIEW_STATE__ || {};
@@ -993,11 +991,15 @@ const tokenRateBoost = tokenRateApi.createTokenRateBoostController({
   prefersReducedMotion,
   onChange: () => renderTokenRate()
 });
-const liveTokenRateTracker = tokenRateApi.createLiveTokenRateGroupTracker({
-  now: () => Date.now(),
-  activeMs: LIVE_TOKEN_RATE_ACTIVE_MS,
-  clearMs: LIVE_TOKEN_RATE_CLEAR_MS
-});
+function liveTokenRateTiming() {
+  return tokenRateApi.liveTokenRateTiming(state.settings?.minScanIntervalMs);
+}
+// A tracker's timing is fixed when it is built and settings arrive after this script runs,
+// so the first observation replaces this one through the source key.
+function createFooterLiveTokenRateTracker() {
+  return tokenRateApi.createLiveTokenRateGroupTracker({ now: () => Date.now(), ...liveTokenRateTiming() });
+}
+let liveTokenRateTracker = createFooterLiveTokenRateTracker();
 const displayLiveTokenRateTrackers = new Map();
 const displayLiveTokenRateContexts = new Map();
 let displayLiveTokenRateExpiryTimer = null;
@@ -1014,7 +1016,8 @@ function liveTokenRateSourceKey(periodSource) {
     state.settings?.deviceId || '',
     state.settings?.clients || '',
     effectiveLiveTokenRateScope(),
-    periodSource
+    periodSource,
+    liveTokenRateTiming().activeMs
   ].join('|');
 }
 
@@ -1098,6 +1101,7 @@ function observeDisplayLiveTokenRates(stats) {
   }
 
   const scopes = new Set(items.map((item) => effectiveDisplayLiveTokenRateScope(item.rateScope)));
+  const timing = liveTokenRateTiming();
   let changed = false;
   for (const scope of scopes) {
     const selection = tokenRateApi.selectLiveTokenRatePeriods(
@@ -1113,23 +1117,17 @@ function observeDisplayLiveTokenRates(stats) {
       state.settings?.deviceId || '',
       state.settings?.clients || '',
       scope,
-      selection.source
+      selection.source,
+      timing.activeMs
     ].join('|');
-    let tracker = displayLiveTokenRateTrackers.get(scope);
-    if (!tracker) {
-      tracker = tokenRateApi.createLiveTokenRateGroupTracker({
-        now: () => Date.now(),
-        activeMs: LIVE_TOKEN_RATE_ACTIVE_MS,
-        clearMs: LIVE_TOKEN_RATE_CLEAR_MS
-      });
-      displayLiveTokenRateTrackers.set(scope, tracker);
-    }
     if (displayLiveTokenRateContexts.get(scope) !== context) {
       displayLiveTokenRateContexts.set(scope, context);
+      const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => Date.now(), ...timing });
       tracker.reset(selection.entries);
+      displayLiveTokenRateTrackers.set(scope, tracker);
       changed = true;
     } else {
-      changed = tracker.observe(selection.entries).changed || changed;
+      changed = displayLiveTokenRateTrackers.get(scope).observe(selection.entries).changed || changed;
     }
   }
   for (const scope of [...displayLiveTokenRateTrackers.keys()]) {
@@ -1173,7 +1171,10 @@ function observeLiveTokenRate(stats) {
   const sourceKey = liveTokenRateSourceKey(selection.source);
   if (sourceKey !== liveTokenRateContext) {
     liveTokenRateContext = sourceKey;
+    liveTokenRateTracker = createFooterLiveTokenRateTracker();
     liveTokenRateTracker.reset(selection.entries);
+    // A new tracker counts its revisions from zero, so its first could match the old one's.
+    liveTokenRateRenderedRevision = 0;
     clearLiveTokenRateTimers();
     renderLiveTokenRate();
     return;

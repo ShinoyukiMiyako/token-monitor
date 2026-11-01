@@ -5756,10 +5756,11 @@ function notchDataFor(visibleStats, cells) {
   }
   for (const scope of scopes) {
     const selection = tokenRateApi.selectLiveTokenRatePeriods(visibleStats, settings.deviceId, settings.hubMode, scope);
-    const context = [mode, settings.hubMode, settings.hubUrl, settings.deviceId, selection.source].join('|');
+    const timing = tokenRateApi.liveTokenRateTiming(settings.minScanIntervalMs);
+    const context = [mode, settings.hubMode, settings.hubUrl, settings.deviceId, selection.source, timing.activeMs].join('|');
     let held = notchRateTrackers.get(scope);
     if (!held || held.context !== context) {
-      held = { context, tracker: tokenRateApi.createLiveTokenRateGroupTracker({ now: Date.now }) };
+      held = { context, tracker: tokenRateApi.createLiveTokenRateGroupTracker({ now: Date.now, ...timing }) };
       held.tracker.reset(selection.entries);
       notchRateTrackers.set(scope, held);
     } else held.tracker.observe(selection.entries);
@@ -5904,8 +5905,6 @@ function edgeDockAppearance(rendererSettings = settingsForRenderer()) {
 
 // The dock's live-rate readout keeps its own tracker, fed from the same stats
 // pushes, so it works whether or not the widget's footer rate is switched on.
-const EDGE_DOCK_RATE_ACTIVE_MS = 8000;
-const EDGE_DOCK_RATE_CLEAR_MS = 3 * 60 * 1000;
 let edgeDockRateTracker = null;
 let edgeDockRateContext = '';
 let edgeDockRateTimer = null;
@@ -5939,19 +5938,17 @@ function edgeDockLiveRateSample(visibleStats) {
   const syncMode = tokenRateApi.isSharedSyncMode(hubMode);
   const scope = syncMode && settings?.liveTokenRateScope !== 'device' ? 'all' : 'device';
   const selection = tokenRateApi.selectLiveTokenRatePeriods(visibleStats, settings?.deviceId, hubMode, scope);
-  const context = [mode, hubMode || '', settings?.hubUrl || '', settings?.deviceId || '', scope, selection.source].join('|');
-  if (!edgeDockRateTracker) {
+  const timing = tokenRateApi.liveTokenRateTiming(settings?.minScanIntervalMs);
+  const context = [mode, hubMode || '', settings?.hubUrl || '', settings?.deviceId || '', scope, selection.source, timing.activeMs].join('|');
+  if (context !== edgeDockRateContext) {
+    edgeDockRateContext = context;
     edgeDockRateTracker = tokenRateApi.createLiveTokenRateGroupTracker({
       // Expiry timers subtract Date.now(), so samples must use epoch time too.
       // The default monotonic clock would produce a negative delay and repeatedly
       // repaint at the timer floor while a sample is retained.
       now: Date.now,
-      activeMs: EDGE_DOCK_RATE_ACTIVE_MS,
-      clearMs: EDGE_DOCK_RATE_CLEAR_MS
+      ...timing
     });
-  }
-  if (context !== edgeDockRateContext) {
-    edgeDockRateContext = context;
     edgeDockRateTracker.reset(selection.entries);
   } else {
     edgeDockRateTracker.observe(selection.entries);
@@ -9354,7 +9351,7 @@ app.whenReady().then(() => {
         businessAdapters: {
           sourceId: () => `${hubModeGeneration}:${mode}:${settings.hubMode}`,
           extras: stats => ({
-            liveRateContext: { hubMode: settings.hubMode, deviceId: settings.deviceId, clients: settings.clients },
+            liveRateContext: { hubMode: settings.hubMode, deviceId: settings.deviceId, clients: settings.clients, minScanIntervalMs: settings.minScanIntervalMs },
             historyRevision: JSON.stringify([settings.historyEnabled !== false, stats?.deviceHistoryRevision || statsHistoryRevision(stats)]),
             subscriptions: effectiveSubscriptions(),
             subscriptionContext: { date: subscriptionDisplay.todayString(), rates: { ...(effectiveRates || resolveEffectiveRates(rateCache?.rates || {}, settings?.currencyRates || {})) } },

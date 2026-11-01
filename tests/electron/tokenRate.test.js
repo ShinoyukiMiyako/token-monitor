@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const vm = require('node:vm');
 
 const rendererDir = path.join(__dirname, '..', '..', 'src', 'electron', 'renderer');
 const app = fs.readFileSync(path.join(rendererDir, 'app.js'), 'utf8');
@@ -389,6 +390,34 @@ test('a full scan leaves the live reading in place instead of clearing it to a d
   assert.equal(retained.speed, 100, 'the dimmed reading survives the final as well');
 });
 
+test('live timing follows the scan interval it waits on', () => {
+  assert.deepEqual(tokenRateApi.liveTokenRateTiming(15000), { activeMs: 18000, clearMs: 180000 });
+  assert.deepEqual(tokenRateApi.liveTokenRateTiming(0), { activeMs: 8000, clearMs: 180000 }, 'no scan floor keeps the debounce-paced lifetime');
+  assert.deepEqual(tokenRateApi.liveTokenRateTiming(undefined), { activeMs: 8000, clearMs: 180000 });
+  assert.deepEqual(tokenRateApi.liveTokenRateTiming(300000), { activeMs: 303000, clearMs: 606000 });
+  assert.doesNotThrow(() => tokenRateApi.createLiveTokenRateGroupTracker(tokenRateApi.liveTokenRateTiming(300000)),
+    'the longest interval the setting accepts still builds a tracker');
+});
+
+test('a session credited on every 15 s scan never reads idle between them', () => {
+  let now = 0;
+  const tracker = tokenRateApi.createLiveTokenRateGroupTracker({ now: () => now, ...tokenRateApi.liveTokenRateTiming(15000) });
+  const entries = (output, durationMs, observedAt) => [{ id: 'device:local', name: 'Local', period: timing(output, durationMs), observedAt }];
+  tracker.reset(entries(0, 0, 0));
+  const scans = 8;
+  // Each scan lands 16.5 s after the last: the floor, the debounce and its own run time.
+  for (let scan = 1; scan <= scans; scan += 1) {
+    now = scan * 16500;
+    tracker.observe(entries(scan * 1650, scan * 16500, now));
+    assert.equal(tracker.getSample().idle, false, `scan ${scan} is live when it lands`);
+    now += 16499;
+    assert.equal(tracker.getSample().idle, false, `scan ${scan} is still live just before the next one`);
+  }
+  assert.equal(tracker.getSample().speed, 100);
+  now = scans * 16500 + 18000;
+  assert.equal(tracker.getSample().idle, true, 'it goes idle once no scan arrives in time');
+});
+
 test('live rate waits for two complete timing snapshots', () => {
   const tracker = tokenRateApi.createLiveTokenRateTracker({ now: () => 100 });
   assert.equal(tracker.observe({ totalTokens: 5000 }, 0), null);
@@ -579,6 +608,70 @@ test('live rate group revisions stay monotonic across scope resets', () => {
   assert.equal(tracker.observe([
     { id: 'device:b', period: { timedTokens: 80, timedOutputTokens: 16, timedDurationMs: 800 } }
   ]).sample.revision, 2);
+});
+
+// The footer functions as app.js defines them, on the real tracker. Only the DOM is stubbed.
+function createFooterHarness() {
+  const liveTokenRateClasses = new Set();
+  const pulses = [];
+  const liveTokenRate = {
+    classList: {
+      add(name) {
+        liveTokenRateClasses.add(name);
+        if (name === 'is-fresh') pulses.push(context.els.liveTokenRateValue.textContent);
+      },
+      remove: (name) => liveTokenRateClasses.delete(name),
+      toggle: (name, on) => (on ? liveTokenRateClasses.add(name) : liveTokenRateClasses.delete(name))
+    },
+    dataset: {},
+    setAttribute() {},
+    querySelectorAll: () => []
+  };
+  const context = {
+    Date: { now: () => context.now },
+    now: 0,
+    clearTimeout() {},
+    setTimeout: () => 1,
+    currentLocale: () => 'en',
+    effectiveCompactTokenUnits: () => 'western',
+    els: { liveTokenRate, liveTokenRateValue: { textContent: '' } },
+    formatCompact: (value) => String(value),
+    limitWindowsView: { setDetailTooltip() {} },
+    modelVendorFor: () => '',
+    state: { mode: 'local', settings: { showLiveTokenRate: true, hubMode: 'local', deviceId: 'desk', minScanIntervalMs: 15000 } },
+    syncLiveTokenRateFooterState() {},
+    t: (key) => key,
+    tokenRateApi
+  };
+  const slice = (from, to) => app.slice(app.indexOf(from), app.indexOf(to));
+  vm.runInNewContext([
+    slice('function liveTokenRateTiming()', 'function displayLiveTokenRateItems('),
+    slice('function scheduleLiveTokenRateExpiry(', 'function syncLiveTokenRateFooterState('),
+    'this.observeLiveTokenRate = observeLiveTokenRate;'
+  ].join('\n'), context);
+  return {
+    pulses,
+    settings: context.state.settings,
+    scan(ms) {
+      context.now = ms;
+      const updatedAt = new Date(ms).toISOString();
+      context.observeLiveTokenRate({ devices: [{ deviceId: 'desk', updatedAt, periods: { today: steady(ms) } }] });
+    }
+  };
+}
+
+test('the first live reading on a replaced footer tracker still pulses', () => {
+  const footer = createFooterHarness();
+  footer.scan(0);
+  footer.scan(15000);
+  assert.deepEqual(footer.pulses, ['50 tok/s'], 'one reading rendered at revision 1 of the old tracker');
+
+  footer.settings.clients = 'claude';
+  footer.scan(30000);
+  footer.scan(45000);
+  assert.deepEqual(footer.pulses, ['50 tok/s', '50 tok/s'], 'revision 1 of the new tracker is a new reading');
+  footer.scan(60000);
+  assert.equal(footer.pulses.length, 3);
 });
 
 test('live rate selects every active hub device or only this device by scope', () => {
@@ -888,10 +981,12 @@ test('the live footer rate is opt-in, accessible, and shares the persisted mode'
   assert.match(app, /els\.liveTokenRate\?\.addEventListener\('click', toggleTokenRateMode\)/);
   assert.match(app, /state\.stats = sessionStatsForDisplay\(allTimeSessions\.attach\(payload\.data\.stats\)\);\s*observeLiveTokenRate\(state\.stats\);/);
   assert.match(app, /observeLiveTokenRate\(nextStats\);\s*allTimeSessions\.invalidate\(\);\s*state\.stats = sessionStatsForDisplay\(allTimeSessions\.attach\(nextStats\)\);/);
-  assert.match(app, /createLiveTokenRateGroupTracker\([\s\S]*activeMs: LIVE_TOKEN_RATE_ACTIVE_MS[\s\S]*\)/);
-  assert.match(app, /const LIVE_TOKEN_RATE_ACTIVE_MS = 8000;/);
-  assert.match(app, /const LIVE_TOKEN_RATE_CLEAR_MS = 3 \* 60 \* 1000;/);
-  assert.match(app, /clearMs: LIVE_TOKEN_RATE_CLEAR_MS/);
+  assert.match(app, /function liveTokenRateTiming\(\) \{\s*return tokenRateApi\.liveTokenRateTiming\(state\.settings\?\.minScanIntervalMs\);/);
+  assert.match(app, /function createFooterLiveTokenRateTracker\(\) \{\s*return tokenRateApi\.createLiveTokenRateGroupTracker\(\{ now: \(\) => Date\.now\(\), \.\.\.liveTokenRateTiming\(\) \}\);/);
+  // The footer tracker is built before settings exist, so the interval has to replace it.
+  assert.match(app, /function liveTokenRateSourceKey\(periodSource\) \{[\s\S]*?liveTokenRateTiming\(\)\.activeMs\s*\]\.join\('\|'\);/);
+  assert.match(app, /liveTokenRateContext = sourceKey;\s*liveTokenRateTracker = createFooterLiveTokenRateTracker\(\);\s*liveTokenRateTracker\.reset\(selection\.entries\);/);
+  assert.match(app, /selection\.source,\s*timing\.activeMs\s*\]\.join\('\|'\);\s*if \(displayLiveTokenRateContexts\.get\(scope\) !== context\) \{\s*displayLiveTokenRateContexts\.set\(scope, context\);\s*const tracker = tokenRateApi\.createLiveTokenRateGroupTracker\(\{ now: \(\) => Date\.now\(\), \.\.\.timing \}\);/);
   assert.match(app, /selectLiveTokenRatePeriods\([\s\S]*stats,[\s\S]*state\.settings\?\.deviceId,[\s\S]*state\.settings\?\.hubMode,[\s\S]*effectiveLiveTokenRateScope\(\)[\s\S]*\)/);
   assert.match(app, /return syncMode && state\.settings\?\.liveTokenRateScope !== 'device' \? 'all' : 'device';/);
   assert.match(app, /function observeLiveTokenRate\(stats\) \{\s*if \(state\.settings\?\.showLiveTokenRate !== true\) return;/);

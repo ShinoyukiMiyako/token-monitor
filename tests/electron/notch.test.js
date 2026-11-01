@@ -2513,6 +2513,38 @@ test('restoring a rate summary starts a new baseline instead of reporting usage 
   assert.equal(context.notchRateTrackers.size, 0);
 });
 
+test('the notch rate stays live for the whole wait on the next scan', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../../src/electron/main.js'), 'utf8');
+  const code = source.slice(source.indexOf('function notchDataFor('), source.indexOf('function toggleDockRateMode('));
+  const rate = trayLayout.createTrayLayoutItem('liveTokenRate');
+  const preferences = { notchSummaryMode: 'custom', deviceId: 'here', minScanIntervalMs: 15000,
+    notchCustomLayout: { version: trayLayout.VERSION, items: [rate] } };
+  let now = 1000;
+  const context = {
+    settings: preferences, mode: 'local', Date: { now: () => now },
+    notchRateTimer: null, notchRateTrackers: new Map(), notchController: { isRunning: () => false },
+    clearTimeout() {}, notchSummaryMode, notchSummaryLayout: summaryLayout, trayLayoutApi: trayLayout,
+    tokenRateApi: require('../../src/electron/renderer/tokenRatePresentation'),
+    buildNotchData: (stats, cells, settings, options) => options.liveTokenRates, compactTokenDisplayOptions: () => ({}), normalizeCurrency: value => value,
+    codexAccountsForRenderer: () => [], codexPresentationPendingAccountId: null,
+    codexPresentationActiveAccountId: null, syncProvenanceActive: () => false
+  };
+  const project = vm.runInNewContext(`${code}; notchDataFor`, context);
+  const reading = (tokens, duration) => project({ periods: { today: {
+    totalTokens: tokens, timedTokens: tokens, timedOutputTokens: tokens, timedDurationMs: duration, sessions: {}
+  } } }, [])[rate.rateScope];
+  assert.equal(reading(0, 0), null);
+  now = 2000;
+  const live = reading(50, 1000);
+  assert.equal(live.idle, false);
+  assert.equal(live.expiresAt, 20000, '18 s on: the 15 s scan floor plus its slack');
+
+  preferences.minScanIntervalMs = 0;
+  assert.equal(reading(50, 1000), null, 'a new interval rebuilds rather than keeps the old lifetime');
+  now = 3000;
+  assert.equal(reading(100, 2000).expiresAt, 11000);
+});
+
 
 test('Notch renderer owns its observers, motion hooks and visible session clock', () => {
   const source = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/notch/renderer.js'), 'utf8');
