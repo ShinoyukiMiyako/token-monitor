@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { createClaudeManagedAccounts, claudeAccountChangeScope } = require('../../src/electron/providers/claude/managedAccounts');
+const { createClaudeManagedAccounts, claudeAccountChangeScope, migrateLegacyClaudeWebAccounts } = require('../../src/electron/providers/claude/managedAccounts');
 const { runLimitInvalidation } = require('../../src/electron/deviceRuntimeCoordinator');
 const { CredentialStore, persistSettingsAndCredentials } = require('../../src/shared/credentialStore');
 const { accountFieldProjection, normalizeAccountPatch } = require('../../src/electron/limits/accountSettings');
@@ -56,6 +56,84 @@ function fixture(t) {
     onChanged: (fn) => { onChanged = fn; },
     save: (id, accountId = 'new', extra = {}) => api.saveAccount({ claudeWebCookie: `sk-ant-${id}`, claudeWebAccountId: accountId, ...extra }) };
 }
+
+function seedLegacyLogins(store, extra = {}) {
+  const document = store.readDocument();
+  document.credentials = { providers: { claude: { ...extra, webAccounts: [
+    { id: 'login-a', cookie: 'sessionKey=sk-ant-a', organizationId: 'org-a', accountKey: 'key-a',
+      accountEmail: 'a@example.com', accountName: 'Workspace a', accountLabel: 'Max 20x' },
+    { id: 'login-b', cookie: 'sessionKey=sk-ant-b', organizationId: '', accountKey: 'key-b',
+      accountEmail: 'b@example.com', accountName: 'Workspace b', accountLabel: 'Max' }
+  ] } } };
+  store.writeDocument(document);
+}
+
+test('saved fork logins become managed accounts the service can read, and the cookie array goes', (t) => {
+  const f = fixture(t);
+  seedLegacyLogins(f.store, { webCookie: 'sessionKey=sk-ant-form' });
+  const persisted = [];
+  const accounts = migrateLegacyClaudeWebAccounts({
+    credentialStore: f.store, accounts: undefined, now: () => 1000,
+    persistAccounts: (next) => persisted.push(next)
+  });
+
+  assert.deepEqual(accounts.map((account) => [account.id, account.organizationId, account.accountKey, account.enabled]), [
+    ['login-a', 'org-a', 'key-a', true], ['login-b', '', 'key-b', true]
+  ]);
+  assert.equal(accounts[0].addedAt, new Date(1000).toISOString());
+  assert.deepEqual(persisted, [accounts]);
+  assert.doesNotMatch(JSON.stringify(accounts), /sk-ant/, 'settings metadata must never carry a cookie');
+
+  const { claude } = f.store.readDocument().credentials.providers;
+  assert.equal(claude.webAccounts, undefined);
+  assert.equal(claude.webCookie, 'sessionKey=sk-ant-form', 'the form login is not part of the array');
+  assert.equal(f.store.readClaudeWebCredential('login-a'), 'sessionKey=sk-ant-a');
+
+  f.setSettings({ ...f.settings(), claudeManagedAccounts: accounts });
+  assert.equal(f.api.resolveCredential(accounts[1]), 'sessionKey=sk-ant-b');
+});
+
+test('a failed settings write keeps the cookie array so the next launch can finish', (t) => {
+  const f = fixture(t);
+  seedLegacyLogins(f.store);
+  assert.throws(() => migrateLegacyClaudeWebAccounts({
+    credentialStore: f.store, accounts: [],
+    persistAccounts: () => { throw new Error('simulated settings failure'); }
+  }), /simulated settings failure/);
+  assert.equal(f.store.readLegacyClaudeWebAccounts().length, 2);
+
+  const accounts = migrateLegacyClaudeWebAccounts({ credentialStore: f.store, accounts: [], persistAccounts: () => {} });
+  assert.deepEqual(accounts.map((account) => account.id), ['login-a', 'login-b']);
+  assert.deepEqual(f.store.readLegacyClaudeWebAccounts(), []);
+});
+
+test('a launch that stopped before removing the array never rolls back a renewed cookie', (t) => {
+  const f = fixture(t);
+  seedLegacyLogins(f.store);
+  const first = migrateLegacyClaudeWebAccounts({ credentialStore: f.store, accounts: [], persistAccounts: () => {} });
+  // Put back what a failed removal leaves behind, with the cookie renewed since.
+  seedLegacyLogins(f.store);
+  assert.equal(f.store.writeClaudeWebCredential('login-a', 'sessionKey=sk-ant-a-renewed'), true);
+
+  const persisted = [];
+  const second = migrateLegacyClaudeWebAccounts({
+    credentialStore: f.store, accounts: first, persistAccounts: (next) => persisted.push(next)
+  });
+  assert.deepEqual(second.map((account) => account.id), ['login-a', 'login-b'], 'no duplicate rows');
+  assert.equal(f.store.readClaudeWebCredential('login-a'), 'sessionKey=sk-ant-a-renewed');
+  assert.deepEqual(f.store.readLegacyClaudeWebAccounts(), []);
+  assert.equal(persisted.length, 1);
+});
+
+test('a store with no legacy logins is left exactly as it was', (t) => {
+  const f = fixture(t);
+  const accounts = [{ id: 'kept', enabled: false }];
+  const result = migrateLegacyClaudeWebAccounts({
+    credentialStore: f.store, accounts,
+    persistAccounts: () => assert.fail('nothing to persist')
+  });
+  assert.equal(result, accounts);
+});
 
 test('managed accounts store metadata separately, reject generic writes and use account-scoped notifications', async (t) => {
   const f = fixture(t);

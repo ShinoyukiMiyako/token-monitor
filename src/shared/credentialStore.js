@@ -345,6 +345,20 @@ class CredentialStore {
     return !this.readClaudeWebCredential(accountId);
   }
 
+  // Fork builds up to v0.69 kept each saved Claude Web login, cookie included,
+  // in one array. Only the migration to managed accounts still reads it.
+  readLegacyClaudeWebAccounts(document = this.readDocument()) {
+    const value = valueAt(document.credentials, ['providers', 'claude', 'webAccounts']);
+    return Array.isArray(value) ? cloneJson(value) : [];
+  }
+
+  removeLegacyClaudeWebAccounts() {
+    const document = this.readDocument();
+    deleteValueAt(document.credentials, ['providers', 'claude', 'webAccounts']);
+    this.writeDocument(document);
+    return this.readLegacyClaudeWebAccounts().length === 0;
+  }
+
   readMimoCredential(id, document = this.readDocument()) {
     const accountId = safeDynamicKey(id);
     if (!accountId) return '';

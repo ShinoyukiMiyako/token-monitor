@@ -187,7 +187,7 @@ const {
   rendererOmittedAccountKeys
 } = require('./limits/accountSettings');
 const { createCredentialCommands } = require('./limits/credentialCommands');
-const { createClaudeManagedAccounts, claudeAccountChangeScope } = require('./providers/claude/managedAccounts');
+const { createClaudeManagedAccounts, claudeAccountChangeScope, migrateLegacyClaudeWebAccounts } = require('./providers/claude/managedAccounts');
 const { copilotLoginErrorMessage, isAllowedVerificationUrl, runCopilotDeviceFlowLogin } = require('../shared/providers/copilot/deviceFlow');
 const {
   codexAuthIdentity,
@@ -2635,6 +2635,21 @@ function migrateLegacyMimoCredentialFiles(accounts) {
   }
 }
 
+// Failing here must stay local: readSettings falls back to defaults on any
+// throw, which would discard every other setting over a retryable migration.
+function migrateLegacyClaudeWebLogins(saved, accounts) {
+  try {
+    return migrateLegacyClaudeWebAccounts({
+      credentialStore: ensureCredentialStore(),
+      accounts,
+      persistAccounts: (next) => writePrivateJsonAtomic(settingsPath, stripCredentialSettings({ ...saved, claudeManagedAccounts: next }))
+    });
+  } catch (error) {
+    reportCredentialStorageError('could not migrate saved Claude Web logins', error);
+    return accounts;
+  }
+}
+
 function readSettings() {
   settingsPath = path.join(app.getPath('userData'), 'settings.json');
   const settingsFileExisted = fs.existsSync(settingsPath);
@@ -2871,6 +2886,7 @@ function readSettings() {
       merged.opencodeProfiles = { default: { cookie: merged.opencodeCookie, enabled: true } };
     }
     migrateLegacyMimoCredentialFiles(merged.mimoManagedAccounts);
+    merged.claudeManagedAccounts = migrateLegacyClaudeWebLogins(saved, merged.claudeManagedAccounts);
     Object.assign(merged, normalizeTrayModeSettings(merged));
     return normalizeWindowBehaviorSettings(merged);
   }

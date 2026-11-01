@@ -205,4 +205,27 @@ function createClaudeManagedAccounts({ getSettings, setSettings, saveSettings, c
     resolveCredential, renew, resolved, legacyAccount, loginStatuses };
 }
 
-module.exports = { createClaudeManagedAccounts, claudeAccountChangeScope };
+// The old array goes last, so a failure at any step leaves every login readable
+// and the next launch finishes the job. An id already listed means an earlier
+// launch stopped before that last step, and its cookie may have been renewed
+// since, so the stored copy wins over the array's.
+function migrateLegacyClaudeWebAccounts({ credentialStore, accounts, persistAccounts, now = Date.now }) {
+  const legacy = credentialStore.readLegacyClaudeWebAccounts();
+  if (legacy.length === 0) return accounts;
+  const current = normalizeClaudeManagedAccounts(accounts);
+  const timestamp = new Date(now()).toISOString();
+  const migrated = legacy.flatMap((entry) => {
+    const metadata = claudeWebAccountMetadata(entry);
+    if (!metadata.id || !entry?.cookie || current.some((account) => account.id === metadata.id)) return [];
+    if (credentialStore.writeClaudeWebCredential(metadata.id, entry.cookie) !== true) {
+      throw new Error('credentialStorageUnavailable');
+    }
+    return [{ ...metadata, enabled: true, addedAt: timestamp, updatedAt: timestamp }];
+  });
+  const next = [...current, ...migrated];
+  persistAccounts(next);
+  if (!credentialStore.removeLegacyClaudeWebAccounts()) throw new Error('credentialStorageUnavailable');
+  return next;
+}
+
+module.exports = { createClaudeManagedAccounts, claudeAccountChangeScope, migrateLegacyClaudeWebAccounts };
