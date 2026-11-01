@@ -34,6 +34,10 @@ test('used mode anchors on remainingPercent so every surface agrees', () => {
 test('non-finite inputs fall back to 0 in both modes', () => {
   assert.equal(limitFillPercent(undefined, undefined, false), 0);
   assert.equal(limitFillPercent(undefined, undefined, true), 0);
+  assert.equal(limitFillPercent(null, null, false), 0);
+  assert.equal(limitFillPercent(null, undefined, true), 0, 'a missing window is an empty track, not a used-up quota');
+  assert.equal(limitFillPercent('', '', true), 0);
+  assert.equal(limitFillPercent(0, undefined, true), 100, 'a real empty pool still reads as fully used');
 });
 
 test('suffix flips with the mode', () => {

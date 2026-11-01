@@ -10,6 +10,10 @@ const { normalizeNotchPluginPages, normalizeNotchBuiltinPages, normalizeNotchPag
 
 const NOTCH_SUMMARY_MODES = Object.freeze(['auto', 'sessions', 'tray', 'custom']);
 
+// Keeps a lone quota's lower row empty, as the tray does. The 'secondary' selector
+// would resolve to any other metered window, such as an unlabeled model pool.
+const NO_WINDOW = 'exact|none|';
+
 // `auto` adapts to what is happening; `sessions` stays quiet between sessions;
 // `tray` mirrors the menu-bar preset; `custom` reads the notch's own layout.
 function notchSummaryMode(settings = {}) {
@@ -49,7 +53,7 @@ function summaryLayout(settings, stats, picks = trayQuotaPicks(stats, settings))
       : picks.length ? [{ pick: picks[0], window: picks[0].primaryWindow }, { pick: picks[0], window: picks[0].secondaryWindow }] : [];
     const sourceFor = ({ pick, window }) => ({
       provider: pick.provider, accountMode: 'specific', accountKey: pick.providerRecord.accountKey || '',
-      window: window ? trayLayout.windowKey(window) : 'secondary',
+      window: window ? trayLayout.windowKey(window) : NO_WINDOW,
       valueMode: settings.showLimitUsed ? 'used' : 'remaining', creditsDisplay: 'percent'
     });
     if (mode === 'limitsAllSessions') {

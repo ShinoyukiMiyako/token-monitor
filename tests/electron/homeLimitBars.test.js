@@ -300,6 +300,25 @@ test('Home Antigravity preserves lone-window labels and omits missing or hidden 
   assert.deepEqual(resolveHomeRows([{ provider: 'antigravity', status: 'ok', windows: [session, weekly] }], settings), []);
 });
 
+test('Home tells Claude weekly pools apart once the account has no five-hour window', () => {
+  const { limitUsageItemId } = require('../../src/shared/limits/usageItems');
+  const session = { kind: 'session', remainingPercent: 60 };
+  const weekly = { kind: 'weekly', remainingPercent: 76 };
+  const fable = { kind: 'weekly', label: 'Fable', remainingPercent: 40 };
+  const hidden = (window) => ({ limitProviderHiddenItems: { claude: [limitUsageItemId(window, 'claude')] } });
+  const labels = (windows, settings = {}) => {
+    const rows = resolveHomeRows([{ provider: 'claude', status: 'ok', windows }], settings);
+    return renderHomeWindows(rows[0].windows, settings, '', 'claude')
+      .map((metric) => metric.children[0].children[0].textContent);
+  };
+
+  assert.deepEqual(labels([weekly, fable]), ['Weekly', 'Fable']);
+  assert.deepEqual(labels([weekly, fable], hidden(weekly)), ['Fable'], 'a lone Fable pool must not read as the account weekly');
+  assert.deepEqual(labels([weekly, fable], hidden(fable)), ['Weekly']);
+  assert.deepEqual(labels([session, weekly, fable]), ['Session', 'Weekly']);
+  assert.deepEqual(labels([session, weekly, fable], hidden(weekly)), ['Session', 'Fable']);
+});
+
 test('Home shows the plan on the account heading in both modes and omits unknown plans', () => {
   for (const homeLimitDisplayMode of ['text', 'bars']) {
     const known = renderHomeWindow({ remainingPercent: 88 }, { homeLimitDisplayMode }, 'Pro 200');

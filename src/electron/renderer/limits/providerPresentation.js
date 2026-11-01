@@ -328,6 +328,13 @@
     if (providerId(providerOrId) === 'zai' && normalizeId(window?.kind) === 'daily') {
       return String(window?.label || '').trim();
     }
+    // Without Session the Fable pool reaches the compact slots, and both pools
+    // are weekly. Home backfills an empty label with the kind, which must fall
+    // through to the localized name.
+    if (providerId(providerOrId) === 'claude' && normalizeId(window?.kind) === 'weekly') {
+      const label = String(window?.label || '').trim();
+      return normalizeId(label) === 'weekly' ? '' : label;
+    }
     if (providerId(providerOrId) !== 'antigravity') return '';
     const labels = (visibleWindows || []).map((candidate) => antigravityQuotaWindow(candidate)?.groupLabel || '');
     const quota = antigravityQuotaWindow(window);

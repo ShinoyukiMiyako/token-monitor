@@ -911,6 +911,17 @@ test('follow-tray bar presets use the original picker and keep the canonical pai
   const lone = { limits: { providers: [{ provider: 'claude', status: 'ok', windows: [{ kind: 'weekly', remainingPercent: 47 }] }] } };
   const rows = buildNotchData(lone, [], { trayContent: 'barsAllSessions', limitProviders: 'claude' }).summary.items.find(item => item.type === 'bars').rows;
   assert.deepEqual(rows.map(row => row.percent), [47, null], 'weekly promoted, empty lower track');
+  const weekly = { kind: 'weekly', remainingPercent: 47 };
+  for (const [name, other] of [
+    ['model pool', { kind: 'weekly', label: 'Fable', remainingPercent: 0 }],
+    ['usage credits', { kind: 'billing', label: 'Usage credits', metric: 'credits', remainingPercent: 65 }]
+  ]) {
+    const noSession = { limits: { providers: [{ provider: 'claude', status: 'ok', windows: [weekly, other] }] } };
+    for (const mode of ['bars', 'barsSession', 'barsWeekly', 'barsAllSessions']) {
+      const bars = buildNotchData(noSession, [], { trayContent: mode, limitProviders: 'claude' }).summary.items.find(item => item.type === 'bars').rows;
+      assert.deepEqual(bars.map(row => row.percent), [47, null], `${mode} must not promote the ${name}`);
+    }
+  }
 });
 
 test('follow-tray bar preset with no valid quota retains the tray token fallback', () => {
